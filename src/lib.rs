@@ -1,5 +1,6 @@
 //! Video decoding pipeline with pluggable backends. No UI dependency.
 
+pub mod backend;
 pub mod clock;
 pub mod convert;
 pub mod decode;
