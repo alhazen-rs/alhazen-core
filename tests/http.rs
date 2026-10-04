@@ -63,3 +63,17 @@ fn server_without_ranges_is_not_seekable_backwards() {
     assert_eq!(&buf, &bytes[100..104]);
     assert!(src.seek(SeekFrom::Start(0)).is_err());
 }
+
+#[cfg(feature = "native")]
+#[test]
+fn player_plays_over_http() {
+    use std::time::{Duration, Instant};
+    use video_core::{Player, PlayerConfig, Source};
+    let url = serve(fixture_bytes(), true);
+    let player = Player::open(Source::parse(&url).unwrap(), PlayerConfig::default()).unwrap();
+    let start = Instant::now();
+    while player.current_frame().is_none() {
+        assert!(start.elapsed() < Duration::from_secs(5));
+        thread::sleep(Duration::from_millis(5));
+    }
+}
