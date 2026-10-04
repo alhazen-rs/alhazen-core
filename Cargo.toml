@@ -1,0 +1,28 @@
+[package]
+name = "video-core"
+description = "Pluggable video decoding pipeline (sources, demuxers, decoders, clock) with no UI dependency"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["native", "http"]
+native = ["dep:rav1d", "dep:re_mp4"]
+http = ["dep:ureq"]
+
+[dependencies]
+thiserror = "2"
+url = "2.5"
+crossbeam-channel = "0.5"
+rayon = "1.12"
+yuv = { version = "0.8.19", features = ["rayon"] }
+log = "0.4"
+libc = "0.2"
+rav1d = { version = "1.1.0", optional = true }
+re_mp4 = { version = "0.5.1", optional = true }
+ureq = { version = "3.4", optional = true }
+
+[dev-dependencies]
+tiny_http = "0.12"
+url = "2.5"
