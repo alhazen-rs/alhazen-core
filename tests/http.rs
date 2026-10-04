@@ -1,0 +1,65 @@
+//! `HttpSource` and player-over-HTTP tests against an in-process server.
+#![cfg(feature = "http")]
+
+use std::io::{Read, Seek, SeekFrom};
+use std::thread;
+
+use video_core::source::{HttpSource, MediaSource};
+
+/// Serves `bytes` forever; honors `Range: bytes=N-` only if `ranges` is true.
+fn serve(bytes: Vec<u8>, ranges: bool) -> String {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let addr = server.server_addr().to_ip().unwrap();
+    thread::spawn(move || {
+        for req in server.incoming_requests() {
+            let start = req
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv("Range"))
+                .and_then(|h| h.value.as_str().strip_prefix("bytes=")?.trim_end_matches('-').parse::<usize>().ok())
+                .filter(|_| ranges)
+                .unwrap_or(0);
+            let body = bytes[start.min(bytes.len())..].to_vec();
+            let mut resp = tiny_http::Response::from_data(body);
+            if ranges {
+                resp.add_header(tiny_http::Header::from_bytes("Accept-Ranges", "bytes").unwrap());
+                let range = format!("bytes {start}-{}/{}", bytes.len() - 1, bytes.len());
+                resp.add_header(tiny_http::Header::from_bytes("Content-Range", range).unwrap());
+                resp = resp.with_status_code(206);
+            }
+            let _ = req.respond(resp);
+        }
+    });
+    format!("http://{addr}/av1.webm")
+}
+
+fn fixture_bytes() -> Vec<u8> {
+    std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/av1.webm")).unwrap()
+}
+
+#[test]
+fn range_server_is_seekable_with_known_length() {
+    let bytes = fixture_bytes();
+    let mut src = HttpSource::open(url::Url::parse(&serve(bytes.clone(), true)).unwrap()).unwrap();
+    assert!(src.is_seekable());
+    assert_eq!(src.byte_len(), Some(bytes.len() as u64));
+    src.seek(SeekFrom::Start(40_000)).unwrap();
+    let mut buf = [0u8; 16];
+    src.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, &bytes[40_000..40_016]);
+    src.seek(SeekFrom::Start(4)).unwrap();
+    src.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, &bytes[4..20]);
+}
+
+#[test]
+fn server_without_ranges_is_not_seekable_backwards() {
+    let bytes = fixture_bytes();
+    let mut src = HttpSource::open(url::Url::parse(&serve(bytes.clone(), false)).unwrap()).unwrap();
+    assert!(!src.is_seekable());
+    src.seek(SeekFrom::Start(100)).unwrap(); // forward: served by reading
+    let mut buf = [0u8; 4];
+    src.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, &bytes[100..104]);
+    assert!(src.seek(SeekFrom::Start(0)).is_err());
+}
