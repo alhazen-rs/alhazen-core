@@ -1,10 +1,12 @@
 //! Containers -> packets.
 
 mod ebml;
+mod matroska;
 
 use std::io::SeekFrom;
 use std::time::Duration;
 
+pub use matroska::MatroskaDemuxer;
 
 use crate::Result;
 use crate::source::MediaSource;
