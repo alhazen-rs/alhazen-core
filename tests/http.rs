@@ -53,14 +53,23 @@ fn range_server_is_seekable_with_known_length() {
 }
 
 #[test]
-fn server_without_ranges_is_not_seekable_backwards() {
-    let bytes = fixture_bytes();
+fn server_without_ranges_rewinds_only_within_cached_head() {
+    // Larger than the 256 KiB head cache.
+    let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
     let mut src = HttpSource::open(url::Url::parse(&serve(bytes.clone(), false)).unwrap()).unwrap();
     assert!(!src.is_seekable());
     src.seek(SeekFrom::Start(100)).unwrap(); // forward: served by reading
     let mut buf = [0u8; 4];
     src.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, &bytes[100..104]);
+    // Rewinding into the cached head works without Range support (container probing needs it).
+    src.seek(SeekFrom::Start(0)).unwrap();
+    src.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, &bytes[0..4]);
+    // Past the cache, backward seeks are impossible.
+    src.seek(SeekFrom::Start(299_000)).unwrap();
+    src.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, &bytes[299_000..299_004]);
     assert!(src.seek(SeekFrom::Start(0)).is_err());
 }
 
@@ -74,6 +83,20 @@ fn player_plays_over_http() {
     let start = Instant::now();
     while player.current_frame().is_none() {
         assert!(start.elapsed() < Duration::from_secs(5));
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn player_plays_from_server_without_ranges() {
+    use std::time::{Duration, Instant};
+    use video_core::{Player, PlayerConfig, Source};
+    let url = serve(fixture_bytes(), false);
+    let player = Player::open(Source::parse(&url).unwrap(), PlayerConfig::default()).unwrap();
+    let start = Instant::now();
+    while player.current_frame().is_none() {
+        assert!(start.elapsed() < Duration::from_secs(5), "no frame from a server without Range support");
         thread::sleep(Duration::from_millis(5));
     }
 }

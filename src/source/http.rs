@@ -11,6 +11,9 @@ const READ_AHEAD: usize = 1 << 20;
 /// Forward seeks up to this far are served by reading and discarding instead of a new request.
 const SKIP_BY_READING: u64 = 256 * 1024;
 const RETRIES: u32 = 3;
+/// The first bytes of the stream are kept so that rewinding into them (container probing)
+/// works even when the server does not support `Range`.
+const HEAD_CACHE: usize = 256 * 1024;
 
 /// A progressive HTTP(S) download using `Range` requests for seeking.
 pub struct HttpSource {
@@ -18,7 +21,12 @@ pub struct HttpSource {
     agent: ureq::Agent,
     len: Option<u64>,
     seekable: bool,
+    /// Logical read position.
     pos: u64,
+    /// Position of `body` in the stream. `pos < body_pos` means reads come from `head`.
+    body_pos: u64,
+    /// Bytes `0..head.len()` of the stream, while they were read contiguously from the start.
+    head: Vec<u8>,
     body: Option<BufReader<ureq::BodyReader<'static>>>,
 }
 
@@ -29,7 +37,16 @@ impl HttpSource {
             .timeout_recv_response(Some(Duration::from_secs(15)))
             .build()
             .new_agent();
-        let mut src = Self { url, agent, len: None, seekable: false, pos: 0, body: None };
+        let mut src = Self {
+            url,
+            agent,
+            len: None,
+            seekable: false,
+            pos: 0,
+            body_pos: 0,
+            head: Vec::new(),
+            body: None,
+        };
         let resp = src.request(0).map_err(|e| Error::Http(e.to_string()))?;
         let status = resp.status().as_u16();
         let header = |name: &str| {
@@ -66,6 +83,7 @@ impl HttpSource {
             }
             match self.request(self.pos) {
                 Ok(resp) if resp.status().as_u16() == 206 || self.pos == 0 => {
+                    self.body_pos = self.pos;
                     self.body = Some(BufReader::with_capacity(READ_AHEAD, resp.into_body().into_reader()));
                     return Ok(());
                 }
@@ -91,6 +109,14 @@ impl Read for HttpSource {
         if buf.is_empty() || self.at_end() {
             return Ok(0);
         }
+        if self.pos < self.body_pos {
+            // Rewound into the cached head of the stream.
+            let start = self.pos as usize;
+            let n = buf.len().min(self.body_pos as usize - start);
+            buf[..n].copy_from_slice(&self.head[start..start + n]);
+            self.pos += n as u64;
+            return Ok(n);
+        }
         for _ in 0..RETRIES {
             if self.body.is_none() {
                 self.connect()?;
@@ -99,7 +125,12 @@ impl Read for HttpSource {
                 // A 0-byte read before the known end means the connection dropped.
                 Ok(0) if !self.at_end() && self.len.is_some() && self.seekable => self.body = None,
                 Ok(n) => {
+                    if self.head.len() as u64 == self.body_pos && self.head.len() < HEAD_CACHE {
+                        let keep = n.min(HEAD_CACHE - self.head.len());
+                        self.head.extend_from_slice(&buf[..keep]);
+                    }
                     self.pos += n as u64;
+                    self.body_pos = self.pos;
                     return Ok(n);
                 }
                 Err(_) if self.seekable => self.body = None,
@@ -123,6 +154,13 @@ impl Seek for HttpSource {
         if target == self.pos {
             return Ok(target);
         }
+        if target <= self.body_pos && self.body_pos <= self.head.len() as u64 {
+            // Everything up to the body position is cached: no request needed.
+            self.pos = target;
+            return Ok(target);
+        }
+        // Past the cache: continue from the body position.
+        self.pos = self.pos.max(self.body_pos);
         let forward = target.saturating_sub(self.pos);
         if target > self.pos && (forward <= SKIP_BY_READING || !self.seekable) && !self.at_end() {
             let copied = io::copy(&mut self.by_ref().take(forward), &mut io::sink())?;
@@ -134,6 +172,7 @@ impl Seek for HttpSource {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "source is not seekable"));
         }
         self.pos = target;
+        self.body_pos = target;
         self.body = None; // reconnect lazily on next read
         Ok(target)
     }
