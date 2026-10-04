@@ -15,6 +15,8 @@ pub struct MatroskaDemuxer {
     streams: Vec<StreamInfo>,
     scale_ns: u64,
     segment_start: u64,
+    /// Absolute end of the Segment, when its size is known. EOF before it means truncation.
+    segment_end: Option<u64>,
     first_cluster: u64,
     /// (cue time in timestamp ticks, absolute cluster offset), sorted by time.
     cues: Vec<(u64, u64)>,
@@ -41,6 +43,7 @@ impl MatroskaDemuxer {
             streams: Vec::new(),
             scale_ns: 1_000_000,
             segment_start: segment.data_start,
+            segment_end: segment.size.map(|size| segment.data_start + size),
             first_cluster: 0,
             cues: Vec::new(),
             cluster_ts: 0,
@@ -273,6 +276,11 @@ impl Demuxer for MatroskaDemuxer {
     fn next_packet(&mut self) -> Result<Option<Packet>> {
         loop {
             let Some(h) = self.r.read_header()? else {
+                if let Some(end) = self.segment_end
+                    && self.r.position() < end
+                {
+                    return Err(demux("file ends before the end of its Segment (truncated?)"));
+                }
                 return Ok(None);
             };
             match h.id {
@@ -353,10 +361,75 @@ impl MatroskaDemuxer {
             if ts > ticks {
                 break;
             }
-            best = (start, ts);
-            self.r.seek_to(h.data_start + size)?;
+            let end = h.data_start + size;
+            // A cluster is a valid seek point only if it holds a video keyframe at or before the
+            // target; otherwise `need_keyframe` would skip forward past the target.
+            if let Some(key_ts) = self.first_video_keyframe(ts, end, ticks)? {
+                best = (start, key_ts);
+            }
+            self.r.seek_to(end)?;
         }
         Ok(best)
+    }
+
+    /// Timestamp of the first video keyframe in the cluster (children up to `end`, cluster
+    /// timestamp `cluster_ts`) if it is at or before `ticks`.
+    fn first_video_keyframe(&mut self, cluster_ts: u64, end: u64, ticks: u64) -> Result<Option<u64>> {
+        let Some(video) = self.video_track else {
+            return Ok(Some(cluster_ts));
+        };
+        // (track, relative timestamp) from the first bytes of a (Simple)Block.
+        let block_head = |head: &[u8]| {
+            let (track, n) = slice_vint(head)?;
+            let rel = i16::from_be_bytes([*head.get(n)?, *head.get(n + 1)?]);
+            Some((track as u32, rel, head.get(n + 2).copied()))
+        };
+        while self.r.position() < end {
+            let h = self.header()?;
+            let size = known(h)?;
+            let (block, keyframe) = match h.id {
+                id::SIMPLE_BLOCK => {
+                    let head = self.r.read_bytes(size.min(11))?;
+                    self.r.skip(size - head.len() as u64)?;
+                    let block = block_head(&head);
+                    let key = block.and_then(|(_, _, flags)| flags).is_some_and(|f| f & 0x80 != 0);
+                    (block, key)
+                }
+                id::BLOCK_GROUP => {
+                    let group_end = h.data_start + size;
+                    let (mut block, mut has_reference) = (None, false);
+                    while self.r.position() < group_end {
+                        let c = self.header()?;
+                        let c_size = known(c)?;
+                        match c.id {
+                            id::BLOCK => {
+                                let head = self.r.read_bytes(c_size.min(11))?;
+                                self.r.skip(c_size - head.len() as u64)?;
+                                block = block_head(&head);
+                            }
+                            id::REFERENCE_BLOCK => {
+                                has_reference = true;
+                                self.r.skip(c_size)?;
+                            }
+                            _ => self.r.skip(c_size)?,
+                        }
+                    }
+                    (block, !has_reference)
+                }
+                _ => {
+                    self.r.skip(size)?;
+                    continue;
+                }
+            };
+            if let Some((track, rel, _)) = block
+                && track == video
+                && keyframe
+            {
+                let ts = (cluster_ts as i64 + rel as i64).max(0) as u64;
+                return Ok((ts <= ticks).then_some(ts));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -458,6 +531,40 @@ mod tests {
             result = d.next_packet().map(|p| p.map(|_| ()));
         }
         assert!(result.is_err(), "truncated file must surface an error, got {result:?}");
+    }
+
+    #[test]
+    fn seek_without_cues_never_lands_after_target_when_gop_spans_clusters() {
+        // Clusters every ~250 ms, keyframes only at 0 and 1000 ms.
+        let mut d = open("tests/fixtures/av1_small_clusters.webm");
+        d.cues.clear();
+        for (target_ms, expect_ms) in [(900, 0), (1500, 1000), (400, 0)] {
+            let landed = d.seek(Duration::from_millis(target_ms)).unwrap();
+            let p = d.next_packet().unwrap().unwrap();
+            assert!(p.keyframe);
+            assert_eq!(p.pts, Duration::from_millis(expect_ms), "seek to {target_ms}ms");
+            assert!(landed <= p.pts, "reported position must not be after the first packet");
+        }
+    }
+
+    #[test]
+    fn truncation_at_element_boundary_is_an_error() {
+        let bytes = std::fs::read("tests/fixtures/av1.webm").unwrap();
+        let mut d = open("tests/fixtures/av1.webm");
+        for _ in 0..40 {
+            d.next_packet().unwrap().unwrap();
+        }
+        let cut = d.r.position() as usize;
+        assert!(cut < bytes.len());
+        let path = std::env::temp_dir().join(format!("vc-boundary-cut-{}.webm", std::process::id()));
+        std::fs::write(&path, &bytes[..cut]).unwrap();
+        let mut d = MatroskaDemuxer::open(Box::new(FileSource::open(&path).unwrap())).unwrap();
+        let mut result = Ok(Some(()));
+        while let Ok(Some(_)) = result {
+            result = d.next_packet().map(|p| p.map(|_| ()));
+        }
+        std::fs::remove_file(&path).ok();
+        assert!(result.is_err(), "file cut at a block boundary must be an error, got {result:?}");
     }
 
     #[test]
