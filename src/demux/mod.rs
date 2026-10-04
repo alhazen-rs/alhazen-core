@@ -2,11 +2,15 @@
 
 mod ebml;
 mod matroska;
+#[cfg(feature = "native")]
+mod mp4;
 
 use std::io::SeekFrom;
 use std::time::Duration;
 
 pub use matroska::MatroskaDemuxer;
+#[cfg(feature = "native")]
+pub use mp4::Mp4Demuxer;
 
 use crate::Result;
 use crate::source::MediaSource;
