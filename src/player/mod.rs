@@ -5,7 +5,7 @@ mod pipeline;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 
@@ -98,6 +98,9 @@ pub fn shared_thread_pool() -> Arc<rayon::ThreadPool> {
     })
     .clone()
 }
+
+/// How long `Drop` waits for pipeline threads before detaching ones blocked in I/O.
+const DROP_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub(crate) enum Command {
     Seek { target: Duration, generation: u64 },
@@ -323,8 +326,19 @@ impl Drop for Player {
         self.shared.shutdown.store(true, Ordering::SeqCst);
         self.shared.queue.close();
         self.commands.take();
+        // Threads poll the shutdown flag every few ms, except while blocked in I/O (e.g. a
+        // stalled HTTP read). Never let that block the caller, which is usually the UI thread:
+        // detach such a thread; it holds only shared state and exits once its read returns.
+        let deadline = Instant::now() + DROP_JOIN_TIMEOUT;
+        while self.threads.iter().any(|t| !t.is_finished()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         for t in self.threads.drain(..) {
-            let _ = t.join();
+            if t.is_finished() {
+                let _ = t.join();
+            } else {
+                log::warn!("detaching {:?}: still blocked in I/O at drop", t.thread().name());
+            }
         }
     }
 }

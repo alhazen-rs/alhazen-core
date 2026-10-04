@@ -35,6 +35,8 @@ impl HttpSource {
         let agent = ureq::Agent::config_builder()
             .timeout_connect(Some(Duration::from_secs(10)))
             .timeout_recv_response(Some(Duration::from_secs(15)))
+            // A body that stops arriving must eventually error so a detached reader thread exits.
+            .timeout_recv_body(Some(Duration::from_secs(30)))
             .build()
             .new_agent();
         let mut src = Self {

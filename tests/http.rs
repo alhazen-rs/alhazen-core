@@ -132,3 +132,48 @@ fn seeking_a_non_seekable_stream_is_refused_without_killing_the_player() {
     player.play();
     assert_eq!(player.state(), PlayerState::Ended);
 }
+
+/// Serves the first `stall_after` bytes of `bytes`, then stops sending without closing.
+fn serve_stalling(bytes: Vec<u8>, stall_after: usize) -> String {
+    struct Stall {
+        data: std::io::Cursor<Vec<u8>>,
+    }
+    impl Read for Stall {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.data.read(buf)?;
+            if n == 0 {
+                thread::sleep(std::time::Duration::from_secs(3600));
+            }
+            Ok(n)
+        }
+    }
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let addr = server.server_addr().to_ip().unwrap();
+    thread::spawn(move || {
+        for req in server.incoming_requests() {
+            let len = bytes.len();
+            let reader = Stall { data: std::io::Cursor::new(bytes[..stall_after].to_vec()) };
+            let resp = tiny_http::Response::new(200.into(), vec![], reader, Some(len), None);
+            thread::spawn(move || {
+                let _ = req.respond(resp);
+            });
+        }
+    });
+    format!("http://{addr}/stall.webm")
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn dropping_player_with_stalled_http_read_returns_promptly() {
+    use std::time::Duration;
+    use video_core::{Player, PlayerConfig, Source};
+    let url = serve_stalling(fixture_bytes(), 30_000);
+    let player = Player::open(Source::parse(&url).unwrap(), PlayerConfig::default()).unwrap();
+    thread::sleep(Duration::from_millis(300)); // let the demux thread block in the stalled read
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        drop(player);
+        let _ = tx.send(());
+    });
+    assert!(rx.recv_timeout(Duration::from_secs(2)).is_ok(), "Player::drop hung on a stalled HTTP read");
+}
