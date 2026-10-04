@@ -151,6 +151,7 @@ pub struct Player {
     events: Receiver<PlayerEvent>,
     threads: Vec<JoinHandle<()>>,
     video_size: (u32, u32),
+    seekable: bool,
 }
 
 impl Player {
@@ -161,6 +162,7 @@ impl Player {
         let order = config.backend_order.as_deref();
 
         let mut src = source.open()?;
+        let seekable = src.is_seekable() && !src.is_live();
         let format = demux::probe(src.as_mut())?.ok_or(Error::UnsupportedContainer)?;
         let demuxer = registry.open_demuxer(&source, format, src, order)?;
         let streams = demuxer.streams().to_vec();
@@ -212,6 +214,7 @@ impl Player {
             events: event_rx,
             threads,
             video_size: (video.width, video.height),
+            seekable,
         };
         if config.autoplay {
             player.play();
@@ -223,6 +226,10 @@ impl Player {
         let s = &self.shared;
         match s.state() {
             PlayerState::Error(_) | PlayerState::Playing | PlayerState::Buffering => return,
+            PlayerState::Ended if !self.seekable => {
+                let _ = s.events.send(PlayerEvent::Warning("cannot restart: source is not seekable".into()));
+                return;
+            }
             PlayerState::Ended => self.seek(Duration::ZERO),
             _ => {}
         }
@@ -253,6 +260,10 @@ impl Player {
         if s.state().is_error() {
             return;
         }
+        if !self.seekable {
+            let _ = s.events.send(PlayerEvent::Warning("seek ignored: source is not seekable".into()));
+            return;
+        }
         let to = self.shared.duration.map_or(to, |d| to.min(d));
         let generation = s.generation.fetch_add(1, Ordering::SeqCst) + 1;
         s.queue.clear(generation);
@@ -275,6 +286,12 @@ impl Player {
     pub fn position(&self) -> Duration {
         let now = self.shared.clock.now();
         self.shared.duration.map_or(now, |d| now.min(d))
+    }
+
+    /// `false` for streams that cannot seek (e.g. HTTP servers without Range support);
+    /// `seek` is then ignored with a `Warning` event.
+    pub fn is_seekable(&self) -> bool {
+        self.seekable
     }
 
     pub fn duration(&self) -> Option<Duration> {

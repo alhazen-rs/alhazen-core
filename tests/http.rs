@@ -100,3 +100,35 @@ fn player_plays_from_server_without_ranges() {
         thread::sleep(Duration::from_millis(5));
     }
 }
+
+#[cfg(feature = "native")]
+#[test]
+fn seeking_a_non_seekable_stream_is_refused_without_killing_the_player() {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use video_core::clock::MockClock;
+    use video_core::{Player, PlayerConfig, PlayerEvent, PlayerState, Source};
+    let url = serve(fixture_bytes(), false);
+    let clock = Arc::new(MockClock::new());
+    let config = PlayerConfig { clock: Some(clock.clone()), ..Default::default() };
+    let player = Player::open(Source::parse(&url).unwrap(), config).unwrap();
+    let events = player.events();
+    assert!(!player.is_seekable());
+
+    player.seek(Duration::from_secs(1));
+    assert_eq!(player.position(), Duration::ZERO, "seek must be a no-op");
+    assert!(!player.state().is_error());
+    assert!(events.try_iter().any(|e| matches!(e, PlayerEvent::Warning(_))));
+
+    // Play to the end; Play again cannot restart (that needs a seek) but must not fail.
+    player.play();
+    let start = Instant::now();
+    while player.state() != PlayerState::Ended {
+        assert!(start.elapsed() < Duration::from_secs(10), "never ended");
+        player.current_frame();
+        clock.advance(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(1));
+    }
+    player.play();
+    assert_eq!(player.state(), PlayerState::Ended);
+}
