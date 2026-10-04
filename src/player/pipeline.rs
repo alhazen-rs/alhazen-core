@@ -291,9 +291,16 @@ impl DecodeLoop {
         }
         let frame = VideoFrame::Cpu { width: f.width, height: f.height, bgra: bgra.into(), pts: f.pts };
         let first = shared.ready_generation.load(Ordering::SeqCst) != self.generation;
-        if first && f.pts > shared.clock.now() {
-            // Seeked before the first frame: start the clock at the first frame instead.
-            shared.clock.set(f.pts);
+        {
+            let _guard = shared.seek_lock.lock().unwrap();
+            if self.generation != shared.generation.load(Ordering::SeqCst) {
+                // Superseded by a newer seek: must not touch the clock or the queue.
+                return !shared.shutdown.load(Ordering::SeqCst);
+            }
+            if first && f.pts > shared.clock.now() {
+                // Seeked before the first frame: start the clock at the first frame instead.
+                shared.clock.set(f.pts);
+            }
         }
         if !shared.queue.push(self.generation, frame) {
             return !shared.shutdown.load(Ordering::SeqCst);
@@ -309,5 +316,76 @@ impl DecodeLoop {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::clock::{Clock, MockClock};
+    use crate::decode::{ColorMatrix, PixelLayout, VideoDecoder};
+    use crate::frame::FrameQueue;
+
+    struct NoDecoder;
+    impl VideoDecoder for NoDecoder {
+        fn send_packet(&mut self, _: &Packet) -> Result<()> {
+            Ok(())
+        }
+        fn receive_frame(&mut self) -> Result<Option<DecodedFrame>> {
+            Ok(None)
+        }
+        fn flush(&mut self) {}
+    }
+
+    fn shared(clock: Arc<MockClock>) -> Shared {
+        Shared {
+            state: Mutex::new(PlayerState::Paused),
+            clock,
+            queue: FrameQueue::new(4),
+            generation: AtomicU64::new(0),
+            ready_generation: AtomicU64::new(u64::MAX),
+            wants_play: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+            last_frame: Mutex::new(None),
+            events: crossbeam_channel::unbounded().0,
+            duration: None,
+            seek_lock: Mutex::new(()),
+        }
+    }
+
+    fn frame(pts: Duration) -> YuvFrame {
+        YuvFrame {
+            width: 2,
+            height: 2,
+            layout: PixelLayout::I420,
+            planes: [vec![16; 4], vec![128], vec![128]],
+            strides: [2, 1, 1],
+            matrix: ColorMatrix::Bt601,
+            full_range: false,
+            pts,
+        }
+    }
+
+    #[test]
+    fn frame_from_superseded_seek_does_not_move_the_clock() {
+        let clock = Arc::new(MockClock::new());
+        let shared = shared(clock.clone());
+        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+        let mut decode = DecodeLoop::new(Box::new(NoDecoder), pool);
+        // Decode thread is still working on seek #1 (to ~10 s)...
+        decode.generation = 1;
+        // ...when seek #2 (to 2 s) happens on the UI thread.
+        shared.generation.store(2, Ordering::SeqCst);
+        shared.queue.clear(2);
+        clock.set(Duration::from_secs(2));
+
+        decode.present(&shared, frame(Duration::from_millis(9_990)));
+
+        assert_eq!(clock.now(), Duration::from_secs(2), "stale frame moved the clock");
+        assert!(shared.queue.is_empty());
+        assert_ne!(shared.ready_generation.load(Ordering::SeqCst), 1);
     }
 }

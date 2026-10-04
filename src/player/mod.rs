@@ -119,6 +119,9 @@ pub(crate) struct Shared {
     pub last_frame: Mutex<Option<VideoFrame>>,
     pub events: Sender<PlayerEvent>,
     pub duration: Option<Duration>,
+    /// Held while a seek bumps the generation and sets the clock, and while the decode thread
+    /// checks its generation before moving the clock, so a superseded frame cannot move it.
+    pub seek_lock: Mutex<()>,
 }
 
 impl Shared {
@@ -198,6 +201,7 @@ impl Player {
             last_frame: Mutex::new(None),
             events: event_tx,
             duration: video.duration,
+            seek_lock: Mutex::new(()),
         });
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let pool = config.thread_pool.clone().unwrap_or_else(shared_thread_pool);
@@ -268,10 +272,12 @@ impl Player {
             return;
         }
         let to = self.shared.duration.map_or(to, |d| to.min(d));
+        let guard = s.seek_lock.lock().unwrap();
         let generation = s.generation.fetch_add(1, Ordering::SeqCst) + 1;
         s.queue.clear(generation);
         s.clock.pause();
         s.clock.set(to);
+        drop(guard);
         if s.wants_play.load(Ordering::SeqCst) {
             s.set_state(PlayerState::Buffering);
         } else {
