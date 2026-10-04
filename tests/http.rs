@@ -134,6 +134,7 @@ fn seeking_a_non_seekable_stream_is_refused_without_killing_the_player() {
 }
 
 /// Serves the first `stall_after` bytes of `bytes`, then stops sending without closing.
+#[cfg(feature = "native")]
 fn serve_stalling(bytes: Vec<u8>, stall_after: usize) -> String {
     struct Stall {
         data: std::io::Cursor<Vec<u8>>,
