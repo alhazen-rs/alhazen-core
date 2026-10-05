@@ -424,8 +424,9 @@ impl DecodeLoop {
                 *shared.video_backend.lock().unwrap() = Some(name);
                 if shared.seekable {
                     // Restart decoding from where playback is: the demuxer goes back to the
-                    // keyframe before it and frames up to here are decoded but not shown.
-                    shared.seek(shared.clock.now());
+                    // keyframe before it and frames up to here are decoded but not shown. A user
+                    // seek since then already restarts decoding, so it is left alone.
+                    shared.seek_to_now_if_current(self.generation);
                 } else {
                     self.waiting_for_keyframe = true;
                 }
@@ -673,6 +674,23 @@ mod tests {
             decode.present(&shared, frame(pts));
             assert!(shared.queue.frame_for(pts).is_some(), "on-time frame {i} skipped");
         }
+    }
+
+    #[test]
+    fn fallback_resync_never_overrides_a_newer_user_seek() {
+        let clock = Arc::new(MockClock::new());
+        let shared = shared(clock.clone());
+        // The decode thread decided to resync while in generation 0...
+        clock.set(Duration::from_secs(5));
+        // ...but the user sought to 60 s first.
+        shared.seek(Duration::from_secs(60));
+        assert!(!shared.seek_to_now_if_current(0), "stale resync must not seek");
+        assert_eq!(clock.now(), Duration::from_secs(60));
+        assert_eq!(shared.generation.load(Ordering::SeqCst), 1);
+        // In the current generation it does seek, to where playback is.
+        assert!(shared.seek_to_now_if_current(1));
+        assert_eq!(shared.generation.load(Ordering::SeqCst), 2);
+        assert_eq!(clock.now(), Duration::from_secs(60));
     }
 
     #[test]

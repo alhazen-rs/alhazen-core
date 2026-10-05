@@ -290,13 +290,25 @@ impl Shared {
         }
     }
 
-    /// Frame-accurate seek; see `Player::seek`. Also used internally (decoder fallback).
+    /// Frame-accurate seek; see `Player::seek`.
     pub fn seek(&self, to: Duration) {
+        self.seek_where(|_| Some(to));
+    }
+
+    /// Seeks to the current playback position, unless a seek has happened since `generation`
+    /// (the decoder fallback's resync must never undo a newer user seek). Returns whether it did.
+    pub fn seek_to_now_if_current(&self, generation: u64) -> bool {
+        self.seek_where(|s| (s.generation.load(Ordering::SeqCst) == generation).then(|| s.clock.now()))
+    }
+
+    /// Seeks to `target(self)`, decided under `seek_lock`; `None` means no seek.
+    fn seek_where(&self, target: impl FnOnce(&Self) -> Option<Duration>) -> bool {
         if self.state().is_error() || !self.seekable {
-            return;
+            return false;
         }
-        let to = self.duration.map_or(to, |d| to.min(d));
         let guard = self.seek_lock.lock().unwrap();
+        let Some(to) = target(self) else { return false };
+        let to = self.duration.map_or(to, |d| to.min(d));
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.queue.clear(generation);
         if let Some(out) = &self.audio_out {
@@ -315,6 +327,7 @@ impl Shared {
             self.set_state(PlayerState::Paused);
         }
         let _ = self.commands.send(Command::Seek { target: to, generation });
+        true
     }
 
     pub fn fail(&self, err: Error) {
