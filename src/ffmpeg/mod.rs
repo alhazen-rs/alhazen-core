@@ -4,6 +4,11 @@
 //! demuxers feed it packets as a Matroska stream on stdin, and it writes raw pictures or samples
 //! to stdout. Which codecs work, whether hardware decoding is used, and the patent licensing of
 //! that binary are properties of the user's ffmpeg installation, not of this crate.
+//!
+//! Supported versions: ffmpeg 4.0 or newer (older ones are rejected). CI tests ffmpeg 6–9 on
+//! Linux, Windows and macOS; for 4.x–5.0 the arguments are adapted (`-vsync` instead of
+//! `-fps_mode`) but not exercised by CI. Codecs are only claimed when `ffmpeg -decoders` lists a
+//! decoder for them, so a minimal build simply claims less.
 
 use std::path::PathBuf;
 
