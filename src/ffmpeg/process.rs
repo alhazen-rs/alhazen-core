@@ -16,6 +16,8 @@ use crate::{Error, Result};
 const STDERR_TAIL: usize = 2048;
 /// Chunks of stdin bytes waiting for the writer thread.
 const INPUT_QUEUE: usize = 32;
+/// How long ffmpeg may stop reading its input (while producing nothing) before it counts as hung.
+const INPUT_STALL: Duration = Duration::from_secs(5);
 
 /// On Windows, run without flashing a console window.
 pub(crate) fn no_window(cmd: &mut Command) {
@@ -93,6 +95,7 @@ impl<T: Send + 'static> FfmpegProcess<T> {
         let Some(input) = &self.input else {
             return Err(Error::Decode("ffmpeg input already closed".into()));
         };
+        let mut deadline = std::time::Instant::now() + INPUT_STALL;
         loop {
             match input.try_send(bytes) {
                 Ok(()) => return Ok(()),
@@ -101,6 +104,11 @@ impl<T: Send + 'static> FfmpegProcess<T> {
             }
             while let Some(out) = self.try_recv() {
                 ready.push_back(out);
+                // Still producing output: not hung, just busy.
+                deadline = std::time::Instant::now() + INPUT_STALL;
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(self.failure("ffmpeg stalled: it stopped reading its input"));
             }
             match input.send_timeout(bytes, Duration::from_millis(10)) {
                 Ok(()) => return Ok(()),

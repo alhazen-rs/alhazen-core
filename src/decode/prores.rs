@@ -57,14 +57,30 @@ fn decode(data: &[u8], pts: Duration) -> Result<YuvFrame> {
         &owned
     };
     let (header, _) = oxideav_prores::frame::parse_frame(data).map_err(err)?;
-    let frame = oxideav_prores::decoder::decode_packet(data, None).map_err(err)?;
     let (w, h) = (header.width as usize, header.height as usize);
+    let interlaced = header.interlace_mode != 0;
+    // oxideav crops its padded planes before returning, which would cut off the 4:4:4 chroma
+    // blocks we have to move back from below the picture in a partial last macroblock row.
+    // Declare a padded height (same macroblock rows) so nothing is cropped away; crop below.
+    let padded_h = match header.chroma_format {
+        ChromaFormat::Y444 => padded_height(h, interlaced),
+        ChromaFormat::Y422 => h,
+    };
+    let patched;
+    let data = if padded_h != h {
+        let mut v = data.to_vec();
+        v[18..20].copy_from_slice(&(padded_h as u16).to_be_bytes()); // frame header vertical_size
+        patched = v;
+        &patched
+    } else {
+        data
+    };
+    let frame = oxideav_prores::decoder::decode_packet(data, None).map_err(err)?;
     let (layout, cw) = match header.chroma_format {
         ChromaFormat::Y422 => (PixelLayout::I422, w.div_ceil(2)),
         ChromaFormat::Y444 => (PixelLayout::I444, w),
     };
     let mut frame = frame;
-    let interlaced = header.interlace_mode != 0;
     let planes = &mut frame.planes;
     if planes.len() < 3 {
         return Err(Error::Decode(format!("prores: expected 3 planes, got {}", planes.len())));
@@ -99,6 +115,19 @@ fn decode(data: &[u8], pts: Duration) -> Result<YuvFrame> {
         full_range: false,
         pts,
     })
+}
+
+/// The height, rounded up to whole macroblocks (16 rows; per field when interlaced), that keeps
+/// the number of macroblock rows — and so the bitstream's layout — unchanged. Returns `height`
+/// itself when no such padding exists (odd interlaced heights whose fields differ in rows).
+fn padded_height(height: usize, interlaced: bool) -> usize {
+    if !interlaced {
+        return height.div_ceil(16) * 16;
+    }
+    let rows = |field: usize| field.div_ceil(16);
+    let padded = height.div_ceil(32) * 32;
+    let same = rows(height.div_ceil(2)) == rows(padded / 2) && rows(height / 2) == rows(padded / 2);
+    if same { padded } else { height }
 }
 
 /// oxideav-prores 0.1.1 writes the second and third 8x8 chroma blocks of each 4:4:4 macroblock
@@ -185,6 +214,15 @@ mod tests {
         }
         fix_444_chroma_block_order(&mut plane, 16, false);
         assert_eq!((plane[0], plane[8], plane[8 * 16], plane[8 * 16 + 8]), (0, 1, 2, 3));
+    }
+
+    #[test]
+    fn padding_keeps_macroblock_rows() {
+        assert_eq!(padded_height(1080, false), 1088);
+        assert_eq!(padded_height(128, false), 128);
+        assert_eq!(padded_height(1080, true), 1088, "540-row fields become 544");
+        assert_eq!(padded_height(120, true), 128);
+        assert_eq!(padded_height(33, true), 33, "fields of 17 and 16 rows cannot share a padding");
     }
 
     #[test]

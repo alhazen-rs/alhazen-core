@@ -60,6 +60,17 @@ fn check(name: &str, layout: PixelLayout, pix_fmt: &str, min_db: f64) {
     let ours: Vec<u8> = native.planes.concat();
     let db = psnr(&ours, &reference);
     assert!(db >= min_db, "{name}: PSNR {db:.1} dB < {min_db} dB");
+    // The bottom rows separately: errors confined to the last macroblock row barely move the
+    // whole-frame figure.
+    let mut offset = 0;
+    for (i, plane) in native.planes.iter().enumerate() {
+        let stride = native.strides[i];
+        let rows = plane.len() / stride;
+        let tail = (rows.saturating_sub(16) * stride)..plane.len();
+        let db = psnr(&plane[tail.clone()], &reference[offset + tail.start..offset + tail.end]);
+        assert!(db >= min_db, "{name}: plane {i} bottom rows PSNR {db:.1} dB < {min_db} dB");
+        offset += plane.len();
+    }
 }
 
 #[test]
@@ -95,4 +106,16 @@ fn prores_4444_matches_ffmpeg() {
 #[test]
 fn prores_4444_interlaced_matches_ffmpeg() {
     check("prores_4444_interlaced.mov", PixelLayout::I444, "yuv444p", 35.0);
+}
+
+/// Heights that are not a multiple of the macroblock size (1080p, 1080i fields): the last
+/// macroblock row is partial.
+#[test]
+fn prores_4444_partial_macroblock_row_matches_ffmpeg() {
+    check("prores_4444_h120.mov", PixelLayout::I444, "yuv444p", 35.0);
+}
+
+#[test]
+fn prores_4444_interlaced_partial_macroblock_row_matches_ffmpeg() {
+    check("prores_4444_h120_interlaced.mov", PixelLayout::I444, "yuv444p", 35.0);
 }

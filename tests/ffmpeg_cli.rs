@@ -262,6 +262,41 @@ fn ffmpeg_killed_mid_stream_is_an_error_not_a_hang() {
     assert!(start.elapsed() < Duration::from_secs(5));
 }
 
+/// An "ffmpeg" that is alive but never reads its input (e.g. a hung GPU driver): sending must
+/// fail after the stall limit instead of blocking the decode thread forever.
+#[cfg(unix)]
+#[test]
+fn ffmpeg_that_stops_reading_is_an_error_not_a_hang() {
+    use std::os::unix::fs::PermissionsExt;
+    use video_core::demux::Packet;
+    if backend().is_none() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("video-core-stuck-ffmpeg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("ffmpeg");
+    std::fs::write(&script, "#!/bin/sh\ncase \"$2\" in -version|-decoders) exec ffmpeg \"$@\";; esac\nexec sleep 60\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let b = FfmpegCliBackend::new(FfmpegConfig { path: Some(script), hwaccel: false, ..Default::default() });
+    let mut stream = video_core::demux::StreamInfo::new(1, StreamKind::Video, video_core::demux::Codec::H264);
+    (stream.width, stream.height) = (320, 240);
+    let mut dec = b.open_video_decoder(&stream, 1).unwrap();
+    let start = Instant::now();
+    let mut result = Ok(());
+    for i in 0..1000u64 {
+        let p = Packet { stream: 1, pts: Duration::from_millis(i * 33), keyframe: i == 0, data: vec![0; 100_000], generation: 0 };
+        result = dec.send_packet(&p);
+        if result.is_err() {
+            break;
+        }
+    }
+    let elapsed = start.elapsed();
+    drop(dec);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(result.is_err(), "a stuck ffmpeg must surface as an error");
+    assert!(elapsed < Duration::from_secs(15), "took {elapsed:?}");
+}
+
 #[test]
 fn native_codecs_are_never_sent_to_ffmpeg() {
     let r = Registry::with_defaults();
