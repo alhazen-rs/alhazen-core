@@ -162,7 +162,7 @@ fn read_f32(mut out: ChildStdout, tx: Sender<Vec<f32>>, frame_bytes: usize) {
         }
         let whole = filled - filled % frame_bytes;
         if whole > 0 {
-            let samples = buf[..whole].chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+            let samples = buf[..whole].as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
             if tx.send(samples).is_err() {
                 return;
             }
