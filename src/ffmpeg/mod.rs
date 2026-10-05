@@ -46,7 +46,7 @@ pub use video::FfmpegVideoDecoder;
 
 #[cfg(feature = "ffmpeg-cli")]
 mod backend {
-    use std::sync::{Arc, OnceLock};
+    use std::sync::{Arc, Mutex};
 
     use super::FfmpegConfig;
     use super::locate::{FfmpegInfo, find};
@@ -59,18 +59,23 @@ mod backend {
     /// Decodes through the user's `ffmpeg` program. Tried after the native decoders.
     pub struct FfmpegCliBackend {
         config: FfmpegConfig,
-        info: OnceLock<Option<Arc<FfmpegInfo>>>,
+        /// The ffmpeg found; looked up again while there is none.
+        info: Mutex<Option<Arc<FfmpegInfo>>>,
     }
 
     impl FfmpegCliBackend {
         pub fn new(config: FfmpegConfig) -> Self {
-            Self { config, info: OnceLock::new() }
+            Self { config, info: Mutex::new(None) }
         }
 
         /// The located ffmpeg, probed on first use (never on the open path of natively
-        /// decodable media).
+        /// decodable media) and again later while none has been found.
         pub fn ffmpeg(&self) -> Option<Arc<FfmpegInfo>> {
-            self.info.get_or_init(|| find(self.config.path.as_deref())).clone()
+            let mut info = self.info.lock().unwrap();
+            if info.is_none() {
+                *info = find(self.config.path.as_deref());
+            }
+            info.clone()
         }
 
         fn supports(&self, stream: &StreamInfo, kind: StreamKind) -> bool {

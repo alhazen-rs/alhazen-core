@@ -58,20 +58,23 @@ pub fn find(explicit: Option<&Path>) -> Option<Arc<FfmpegInfo>> {
     candidates(explicit).iter().find_map(|p| probe(p))
 }
 
-/// Runs `path -version` / `path -decoders` once per process; `None` if it is missing, fails, or is
-/// older than [`MIN_VERSION`].
+/// Runs `path -version` / `path -decoders` once per process for a usable ffmpeg; `None` if it is
+/// missing, fails, or is older than [`MIN_VERSION`]. Failures are not remembered, so an ffmpeg
+/// installed while the app runs is found by the next lookup.
 pub fn probe(path: &Path) -> Option<Arc<FfmpegInfo>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<Arc<FfmpegInfo>>>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<FfmpegInfo>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     if let Some(hit) = cache.lock().unwrap().get(path) {
-        return hit.clone();
+        return Some(hit.clone());
     }
     let info = probe_uncached(path);
     match &info {
         Some(i) => log::info!("ffmpeg {:?} at {} with {} decoders", i.version, path.display(), i.decoders.len()),
         None => log::info!("no usable ffmpeg at {}", path.display()),
     }
-    cache.lock().unwrap().insert(path.to_owned(), info.clone());
+    if let Some(i) = &info {
+        cache.lock().unwrap().insert(path.to_owned(), i.clone());
+    }
     info
 }
 

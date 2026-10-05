@@ -235,6 +235,28 @@ fn first_frame_arrives_before_end_of_input() {
     panic!("no frame before end of input");
 }
 
+/// ffmpeg installed while the app runs is found on the next lookup (a failed lookup is not
+/// remembered).
+#[cfg(unix)]
+#[test]
+fn ffmpeg_installed_later_is_found() {
+    use std::os::unix::fs::PermissionsExt;
+    if backend().is_none() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("video-core-late-ffmpeg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("ffmpeg");
+    let b = FfmpegCliBackend::new(FfmpegConfig { path: Some(script.clone()), hwaccel: false, ..Default::default() });
+    let h264 = video_core::demux::StreamInfo::new(1, StreamKind::Video, video_core::demux::Codec::H264);
+    assert!(!b.supports_video(&h264), "not installed yet");
+    std::fs::write(&script, "#!/bin/sh\nexec ffmpeg \"$@\"\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let found = b.supports_video(&h264);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(found, "installed now");
+}
+
 #[test]
 fn missing_ffmpeg_means_unsupported_codec_not_a_hang() {
     let config = PlayerConfig {
