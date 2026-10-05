@@ -34,6 +34,8 @@ impl Mp4Demuxer {
         let size = src.byte_len().ok_or(Error::Unsupported("MP4 from a source of unknown length"))?;
         let mp4 = re_mp4::Mp4::read(BufReader::new(&mut src), size)
             .map_err(|e| Error::Demux(format!("mp4: {e}")))?;
+        // re_mp4 keeps only three fields of the AAC config; read the real bytes ourselves.
+        let moov = read_moov(src.as_mut(), size).unwrap_or_default();
 
         let mut streams = Vec::new();
         let mut samples = Vec::new();
@@ -58,10 +60,12 @@ impl Mp4Demuxer {
                 info.codec = Codec::Aac;
                 info.sample_rate = mp4a.samplerate.value() as u32;
                 info.channels = mp4a.channelcount;
-                if let Some(esds) = &mp4a.esds {
-                    let d = &esds.es_desc.dec_config.dec_specific;
-                    info.extradata = Some(audio_specific_config(d.profile, d.freq_index, d.chan_conf));
-                }
+                info.extradata = raw_audio_specific_config(&moov, track.track_id).or_else(|| {
+                    mp4a.esds.as_ref().map(|esds| {
+                        let d = &esds.es_desc.dec_config.dec_specific;
+                        audio_specific_config(d.profile, d.freq_index, d.chan_conf)
+                    })
+                });
             }
             streams.push(info);
             samples.extend(track.samples.iter().map(|s| SampleRef {
@@ -120,6 +124,121 @@ fn interleave_by_time(mut samples: Vec<SampleRef>) -> Vec<SampleRef> {
     samples
 }
 
+/// The whole `moov` box (top-level boxes are walked by header, `mdat` is never read).
+fn read_moov(src: &mut dyn MediaSource, size: u64) -> Option<Vec<u8>> {
+    let mut pos = 0u64;
+    while pos + 8 <= size {
+        src.seek(SeekFrom::Start(pos)).ok()?;
+        let mut head = [0u8; 16];
+        src.read_exact(&mut head[..8]).ok()?;
+        let mut len = u32::from_be_bytes(head[..4].try_into().ok()?) as u64;
+        let mut header = 8;
+        if len == 1 {
+            src.read_exact(&mut head[8..16]).ok()?;
+            len = u64::from_be_bytes(head[8..16].try_into().ok()?);
+            header = 16;
+        } else if len == 0 {
+            len = size - pos;
+        }
+        if len < header {
+            return None;
+        }
+        if &head[4..8] == b"moov" {
+            let body = len - header;
+            if body > 256 << 20 {
+                return None;
+            }
+            let mut moov = vec![0u8; body as usize];
+            src.read_exact(&mut moov).ok()?;
+            return Some(moov);
+        }
+        pos += len;
+    }
+    None
+}
+
+/// Child boxes of `data` as (type, payload).
+fn boxes(data: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
+    let mut pos = 0;
+    std::iter::from_fn(move || {
+        let head = data.get(pos..pos + 8)?;
+        let len = u32::from_be_bytes(head[..4].try_into().ok()?) as usize;
+        let (start, end) = match len {
+            1 => {
+                let big = u64::from_be_bytes(data.get(pos + 8..pos + 16)?.try_into().ok()?) as usize;
+                (pos + 16, pos.checked_add(big)?)
+            }
+            0 => (pos + 8, data.len()),
+            n if n >= 8 => (pos + 8, pos + n),
+            _ => return None,
+        };
+        let payload = data.get(start..end)?;
+        let kind = &head[4..8];
+        pos = end;
+        Some((kind, payload))
+    })
+}
+
+fn child<'a>(data: &'a [u8], kind: &[u8]) -> Option<&'a [u8]> {
+    boxes(data).find(|(k, _)| *k == kind).map(|(_, p)| p)
+}
+
+/// The raw AudioSpecificConfig of `track_id`'s `mp4a` sample entry.
+fn raw_audio_specific_config(moov: &[u8], track_id: u32) -> Option<Vec<u8>> {
+    let trak = boxes(moov).filter(|(k, _)| *k == b"trak").map(|(_, p)| p).find(|trak| {
+        child(trak, b"tkhd").and_then(|tkhd| {
+            let at = if tkhd.first() == Some(&1) { 20 } else { 12 };
+            Some(u32::from_be_bytes(tkhd.get(at..at + 4)?.try_into().ok()?))
+        }) == Some(track_id)
+    })?;
+    let stsd = child(child(child(child(trak, b"mdia")?, b"minf")?, b"stbl")?, b"stsd")?;
+    // stsd: version/flags + entry count, then sample entries.
+    let mp4a = child(stsd.get(8..)?, b"mp4a")?;
+    // AudioSampleEntry: 28 bytes of fields before its child boxes.
+    parse_esds_asc(child(mp4a.get(28..)?, b"esds")?)
+}
+
+/// The DecSpecificInfo (AudioSpecificConfig) bytes inside an `esds` payload (ISO 14496-1).
+fn parse_esds_asc(esds: &[u8]) -> Option<Vec<u8>> {
+    /// Tag and expandable length (1–4 bytes, high bit = more) at `pos`; returns (tag, len, body start).
+    fn descriptor(d: &[u8], pos: usize) -> Option<(u8, usize, usize)> {
+        let tag = *d.get(pos)?;
+        let mut len = 0usize;
+        let mut i = pos + 1;
+        for _ in 0..4 {
+            let b = *d.get(i)?;
+            i += 1;
+            len = (len << 7) | (b & 0x7F) as usize;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        d.get(i..i + len)?;
+        Some((tag, len, i))
+    }
+    let (tag, _, mut pos) = descriptor(esds, 4)?; // after version/flags
+    if tag != 0x03 {
+        return None;
+    }
+    let flags = *esds.get(pos + 2)?;
+    pos += 3; // ES_ID + flags
+    if flags & 0x80 != 0 {
+        pos += 2; // dependsOn_ES_ID
+    }
+    if flags & 0x40 != 0 {
+        pos += 1 + *esds.get(pos)? as usize; // URL
+    }
+    if flags & 0x20 != 0 {
+        pos += 2; // OCR_ES_Id
+    }
+    let (tag, _, pos) = descriptor(esds, pos)?;
+    if tag != 0x04 {
+        return None;
+    }
+    let (tag, len, start) = descriptor(esds, pos + 13)?; // after the fixed DecoderConfig fields
+    (tag == 0x05).then(|| esds[start..start + len].to_vec())
+}
+
 /// Rebuilds the 2-byte AAC AudioSpecificConfig (object type, frequency index, channel config).
 fn audio_specific_config(profile: u8, freq_index: u8, chan_conf: u8) -> Vec<u8> {
     let v = ((profile as u16 & 0x1F) << 11) | ((freq_index as u16 & 0x0F) << 7) | ((chan_conf as u16 & 0x0F) << 3);
@@ -161,7 +280,9 @@ mod tests {
         let a = d.streams().iter().find(|s| s.kind == StreamKind::Audio).unwrap();
         assert_eq!(a.codec, Codec::Aac);
         assert_eq!((a.sample_rate, a.channels), (44_100, 1));
-        assert_eq!(a.extradata.as_deref(), Some(&[0x12, 0x08][..]), "AAC-LC, 44.1 kHz, mono");
+        // The file's own AudioSpecificConfig: AAC-LC, 44.1 kHz, mono, plus the explicit
+        // "no SBR" extension (0x2B7 sync) that ffmpeg writes.
+        assert_eq!(a.extradata.as_deref(), Some(&[0x12, 0x08, 0x56, 0xE5, 0x00][..]));
     }
 
     #[test]
@@ -190,5 +311,30 @@ mod tests {
         let ordered = interleave_by_time(vec![s(1, 0, 0), s(1, 10, 40), s(1, 20, 80), s(2, 100, 0), s(2, 110, 20), s(2, 120, 60)]);
         let order: Vec<(u32, u128)> = ordered.iter().map(|x| (x.stream, x.dts.as_millis())).collect();
         assert_eq!(order, [(1, 0), (2, 0), (2, 20), (1, 40), (2, 60), (1, 80)]);
+    }
+
+    #[test]
+    fn esds_parser_returns_the_raw_audio_specific_config() {
+        // Real payload from aac_only.m4a (4-byte expandable lengths, as ffmpeg writes them).
+        let real = [
+            0, 0, 0, 0, 0x03, 0x80, 0x80, 0x80, 0x25, 0x00, 0x01, 0x00, 0x04, 0x80, 0x80, 0x80, 0x17, 0x40, 0x15, 0, 0, 0,
+            0, 0, 0xFD, 0xCD, 0, 0, 0xFD, 0xCD, 0x05, 0x80, 0x80, 0x80, 0x05, 0x12, 0x08, 0x56, 0xE5, 0x00, 0x06, 0x80,
+            0x80, 0x80, 0x01, 0x02,
+        ];
+        assert_eq!(parse_esds_asc(&real), Some(vec![0x12, 0x08, 0x56, 0xE5, 0x00]));
+        // Explicit sample rate (frequency index 15 + 24-bit rate), 1-byte lengths, URL flag set.
+        let asc = [0x17, 0x80, 0x5D, 0xC0, 0x08];
+        let mut esds = vec![0, 0, 0, 0, 0x03, 0];
+        let es = {
+            let mut es = vec![0x00, 0x01, 0x40, 3, b'a', b'b', b'c']; // ES_ID, flags (URL), url
+            es.extend([0x04, 13 + 2 + asc.len() as u8, 0x40, 0x15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            es.extend([0x05, asc.len() as u8]);
+            es.extend(asc);
+            es
+        };
+        esds[5] = es.len() as u8;
+        esds.extend(es);
+        assert_eq!(parse_esds_asc(&esds), Some(asc.to_vec()));
+        assert_eq!(parse_esds_asc(&[0, 0, 0, 0, 0x03, 0x05, 0x00]), None, "truncated");
     }
 }

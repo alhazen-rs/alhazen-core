@@ -171,7 +171,7 @@ pub(crate) mod tests {
         let (info, bufs) = decode_file("tests/fixtures/aac_only.m4a", |s| {
             Ok(Box::new(crate::decode::AacAudioDecoder::new(s)?))
         });
-        assert_eq!(info.extradata.as_deref(), Some(&[0x12, 0x08][..]), "AAC-LC, 44.1 kHz, mono");
+        assert_eq!(info.extradata.as_deref(), Some(&[0x12, 0x08, 0x56, 0xE5, 0x00][..]), "AAC-LC, 44.1 kHz, mono");
         assert!(bufs.iter().all(|b| b.rate == 44_100 && b.channels == 1));
         let frames = total_frames(&bufs);
         assert!((86_000..=92_500).contains(&frames), "frames = {frames}");
