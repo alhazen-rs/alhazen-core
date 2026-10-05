@@ -19,6 +19,8 @@ struct State {
     channels: u16,
     /// Output sample format: 0 = f32, else integer PCM bits per sample (16, 24, 32).
     int_bits: u32,
+    /// The last pull renegotiated the output type (a second one in a row is an error, not a loop).
+    renegotiated: bool,
 }
 
 pub struct MfAudioDecoder {
@@ -72,60 +74,20 @@ impl MfAudioDecoder {
                     t.SetBlob(&MF_MT_USER_DATA, &data).map_err(err("codec data"))?;
                 }
                 mft.SetInputType(0, &t, 0).map_err(err("input type"))?;
-                // Float if offered (most decoders), else integer PCM (the Dolby decoders).
-                let (mut float, mut pcm, mut offered) = (None, None, Vec::new());
-                for i in 0.. {
-                    let o = match mft.GetOutputAvailableType(0, i) {
-                        Ok(o) => o,
-                        Err(e) => {
-                            if i == 0 {
-                                offered.push(format!("none ({e})"));
-                            }
-                            break;
-                        }
-                    };
-                    let sub = o.GetGUID(&MF_MT_SUBTYPE).unwrap_or_default();
-                    offered.push(format!("{sub:?}/{}bit", o.GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE).unwrap_or(0)));
-                    if sub == MFAudioFormat_Float && float.is_none() {
-                        float = Some(o);
-                    } else if sub == MFAudioFormat_PCM
-                        && pcm.is_none()
-                        && matches!(o.GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE).unwrap_or(0), 16 | 24 | 32)
-                    {
-                        pcm = Some(o);
-                    }
-                }
-                let (out, int_bits) = match (float, pcm) {
-                    (Some(o), _) => (o, 0),
-                    (None, Some(o)) => {
-                        let bits = o.GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE).map_err(err("bits"))?;
-                        (o, bits)
-                    }
-                    (None, None) => {
-                        return Err(Error::Decode(format!(
-                            "{name} offers no float or PCM output (offers: {})",
-                            offered.join(", ")
-                        )));
-                    }
-                };
-                mft.SetOutputType(0, &out, 0).map_err(err("output type"))?;
-                (
-                    out.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND).map_err(err("output rate"))?,
-                    out.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).map_err(err("output channels"))? as u16,
-                    int_bits,
-                )
+                negotiate_output(&mft, &name)?
             };
             mft::begin_streaming(&mft)?;
             log::info!("Media Foundation {:?}: {name}", self.codec);
-            self.state = Some(State { mft, name, rate, channels, int_bits });
+            self.state = Some(State { mft, name, rate, channels, int_bits, renegotiated: false });
         }
         Ok(self.state.as_mut().unwrap())
     }
 
     fn pull_one(&mut self) -> Result<bool> {
-        let Some(s) = self.state.as_ref() else { return Ok(false) };
+        let Some(s) = self.state.as_mut() else { return Ok(false) };
         match mft::process_output(&s.mft)? {
             Output::Sample(sample) => {
+                s.renegotiated = false;
                 // SAFETY: COM call on a live sample.
                 let pts = mft::from_mf_time(unsafe { sample.GetSampleTime() }.unwrap_or(0));
                 let bytes = mft::sample_bytes(&sample)?;
@@ -138,7 +100,16 @@ impl MfAudioDecoder {
                 self.ready.push_back(AudioBuffer { rate: s.rate, channels: s.channels, samples, pts });
                 Ok(true)
             }
-            Output::NeedMoreInput | Output::StreamChange => Ok(false),
+            Output::NeedMoreInput => Ok(false),
+            Output::StreamChange => {
+                if s.renegotiated {
+                    return Err(Error::Decode(format!("{} keeps rejecting its output type", s.name)));
+                }
+                s.renegotiated = true;
+                (s.rate, s.channels, s.int_bits) = negotiate_output(&s.mft, &s.name)?;
+                // Progress: the caller pulls again with the new type.
+                Ok(true)
+            }
         }
     }
 }
@@ -164,9 +135,7 @@ impl AudioDecoder for MfAudioDecoder {
     }
 
     fn receive_samples(&mut self) -> Result<Option<AudioBuffer>> {
-        if self.ready.is_empty() {
-            self.pull_one()?;
-        }
+        while self.ready.is_empty() && self.pull_one()? {}
         Ok(self.ready.pop_front())
     }
 
@@ -182,6 +151,55 @@ impl AudioDecoder for MfAudioDecoder {
             mft::flush(&s.mft);
             let _ = mft::begin_streaming(&s.mft);
         }
+    }
+}
+
+/// Picks and sets the output type: float if offered (most decoders), else integer PCM (the Dolby
+/// decoders). Returns (rate, channels, integer bits or 0 for float).
+fn negotiate_output(mft: &IMFTransform, name: &str) -> Result<(u32, u16, u32)> {
+    // SAFETY: COM calls on a live transform.
+    unsafe {
+        let (mut float, mut pcm, mut offered) = (None, None, Vec::new());
+        for i in 0.. {
+            let o = match mft.GetOutputAvailableType(0, i) {
+                Ok(o) => o,
+                Err(e) => {
+                    if i == 0 {
+                        offered.push(format!("none ({e})"));
+                    }
+                    break;
+                }
+            };
+            let sub = o.GetGUID(&MF_MT_SUBTYPE).unwrap_or_default();
+            offered.push(format!("{sub:?}/{}bit", o.GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE).unwrap_or(0)));
+            if sub == MFAudioFormat_Float && float.is_none() {
+                float = Some(o);
+            } else if sub == MFAudioFormat_PCM
+                && pcm.is_none()
+                && matches!(o.GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE).unwrap_or(0), 16 | 24 | 32)
+            {
+                pcm = Some(o);
+            }
+        }
+        let (out, int_bits) = match (float, pcm) {
+            (Some(o), _) => (o, 0),
+            (None, Some(o)) => {
+                let bits = o.GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE).map_err(err("bits"))?;
+                (o, bits)
+            }
+            (None, None) => {
+                return Err(Error::Decode(format!(
+                    "{name} offers no float or PCM output (offers: {})",
+                    offered.join(", ")
+                )));
+            }
+        };
+        mft.SetOutputType(0, &out, 0).map_err(err("output type"))?;
+        Ok((
+            out.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND).map_err(err("output rate"))?,
+            out.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).map_err(err("output channels"))? as u16,
+            int_bits,
+        ))
     }
 }
 

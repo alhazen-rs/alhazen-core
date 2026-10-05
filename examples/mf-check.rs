@@ -80,22 +80,25 @@ fn main() {
                 Ok((format!("soft {}", dec.description().unwrap_or_default()), count))
             }
         };
+        let track = if kind == StreamKind::Video { "video" } else { "audio" };
+        // Printed before decoding so a decoder that hangs or crashes the process is named.
+        print!("{file:<18} {track:<6} ");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
         let start = Instant::now();
         let result = run();
         let ms = start.elapsed().as_millis();
-        let track = if kind == StreamKind::Video { "video" } else { "audio" };
         match result {
             Ok((decoder, count)) => {
                 let ok = count.abs_diff(expect) <= tolerance;
                 failed += !ok as u32;
-                println!("{file:<18} {track:<6} {decoder:<53} {count:>8} {ms:>8}  {}", if ok { "PASS" } else { "FAIL" });
+                println!("{decoder:<53} {count:>8} {ms:>8}  {}", if ok { "PASS" } else { "FAIL" });
             }
             Err(e) if e.contains("no Media Foundation decoder") => {
-                println!("{file:<18} {track:<6} {:<53} {:>8} {ms:>8}  SKIP (decoder not installed)", "-", "-");
+                println!("{:<53} {:>8} {ms:>8}  SKIP (decoder not installed)", "-", "-");
             }
             Err(e) => {
                 failed += 1;
-                println!("{file:<18} {track:<6} {:<53} {:>8} {ms:>8}  FAIL: {e}", "-", "-");
+                println!("{:<53} {:>8} {ms:>8}  FAIL: {e}", "-", "-");
             }
         }
     }

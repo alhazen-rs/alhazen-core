@@ -70,7 +70,7 @@ pub fn from_mf_time(t: i64) -> Duration {
 pub enum Output {
     Sample(IMFSample),
     NeedMoreInput,
-    /// The output format changed (e.g. resolution): renegotiate, then call again.
+    /// The output format changed (e.g. resolution) or was dropped: renegotiate, then call again.
     StreamChange,
 }
 
@@ -98,7 +98,11 @@ pub fn process_output(mft: &IMFTransform) -> Result<Output> {
         match r {
             Ok(()) => sample.map(Output::Sample).ok_or_else(|| Error::Decode("Media Foundation gave no sample".into())),
             Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(Output::NeedMoreInput),
-            Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => Ok(Output::StreamChange),
+            // The Dolby decoders drop their output type once they have parsed the stream and
+            // answer TYPE_NOT_SET instead of STREAM_CHANGE: both mean "pick an output type again".
+            Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE || e.code() == MF_E_TRANSFORM_TYPE_NOT_SET => {
+                Ok(Output::StreamChange)
+            }
             Err(e) => Err(err("decode")(e)),
         }
     }
