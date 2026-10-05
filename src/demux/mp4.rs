@@ -46,15 +46,22 @@ impl Mp4Demuxer {
                 .map(|s| Codec::from_mp4_codec_string(&s))
                 .unwrap_or_else(|| Codec::Other("unknown".into()));
             let timescale = track.timescale.max(1);
-            streams.push(StreamInfo {
-                id: track.track_id,
-                kind,
-                codec,
-                width: track.width as u32,
-                height: track.height as u32,
-                duration: Some(ticks(track.duration as i64, timescale)),
-                extradata: track.raw_codec_config(&mp4),
-            });
+            let mut info = StreamInfo::new(track.track_id, kind, codec);
+            info.width = track.width as u32;
+            info.height = track.height as u32;
+            info.duration = Some(ticks(track.duration as i64, timescale));
+            info.extradata = track.raw_codec_config(&mp4);
+            if let re_mp4::StsdBoxContent::Mp4a(mp4a) = &track.trak(&mp4).mdia.minf.stbl.stsd.contents {
+                // re_mp4 gives no codec string for mp4a; the sample entry itself means AAC.
+                info.codec = Codec::Aac;
+                info.sample_rate = mp4a.samplerate.value() as u32;
+                info.channels = mp4a.channelcount;
+                if let Some(esds) = &mp4a.esds {
+                    let d = &esds.es_desc.dec_config.dec_specific;
+                    info.extradata = Some(audio_specific_config(d.profile, d.freq_index, d.chan_conf));
+                }
+            }
+            streams.push(info);
             samples.extend(track.samples.iter().map(|s| SampleRef {
                 stream: track.track_id,
                 offset: s.offset,
@@ -102,6 +109,12 @@ impl Demuxer for Mp4Demuxer {
     }
 }
 
+/// Rebuilds the 2-byte AAC AudioSpecificConfig (object type, frequency index, channel config).
+fn audio_specific_config(profile: u8, freq_index: u8, chan_conf: u8) -> Vec<u8> {
+    let v = ((profile as u16 & 0x1F) << 11) | ((freq_index as u16 & 0x0F) << 7) | ((chan_conf as u16 & 0x0F) << 3);
+    v.to_be_bytes().to_vec()
+}
+
 fn ticks(t: i64, timescale: u64) -> Duration {
     let t = t.max(0) as u128;
     Duration::from_nanos((t * 1_000_000_000 / timescale as u128) as u64)
@@ -129,6 +142,15 @@ mod tests {
         }
         assert_eq!(n, 60);
         assert_eq!(first, Some(true));
+    }
+
+    #[test]
+    fn reads_aac_audio_track() {
+        let d = Mp4Demuxer::open(Box::new(FileSource::open("tests/fixtures/aac_only.m4a").unwrap())).unwrap();
+        let a = d.streams().iter().find(|s| s.kind == StreamKind::Audio).unwrap();
+        assert_eq!(a.codec, Codec::Aac);
+        assert_eq!((a.sample_rate, a.channels), (44_100, 1));
+        assert_eq!(a.extradata.as_deref(), Some(&[0x12, 0x08][..]), "AAC-LC, 44.1 kHz, mono");
     }
 
     #[test]

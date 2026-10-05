@@ -1,5 +1,6 @@
 //! WebM / Matroska demuxer with Cues-based keyframe seeking.
 
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use super::ebml::{EbmlReader, Header, id};
@@ -24,6 +25,10 @@ pub struct MatroskaDemuxer {
     /// After a seek, drop video packets until the first keyframe.
     need_keyframe: bool,
     video_track: Option<u32>,
+    /// Frames split out of a laced block, returned before reading further.
+    pending: VecDeque<Packet>,
+    /// Per-track DefaultDuration, used to timestamp laced frames after the first.
+    default_durations: HashMap<u32, Duration>,
 }
 
 impl MatroskaDemuxer {
@@ -49,6 +54,8 @@ impl MatroskaDemuxer {
             cluster_ts: 0,
             need_keyframe: false,
             video_track: None,
+            pending: VecDeque::new(),
+            default_durations: HashMap::new(),
         };
         let mut cues_pos = None;
         let mut duration_ticks = None;
@@ -140,15 +147,8 @@ impl MatroskaDemuxer {
                 continue;
             }
             let entry_end = entry.data_start + known(entry)?;
-            let mut info = StreamInfo {
-                id: 0,
-                kind: StreamKind::Other,
-                codec: Codec::Other(String::new()),
-                width: 0,
-                height: 0,
-                duration: None,
-                extradata: None,
-            };
+            let mut info = StreamInfo::new(0, StreamKind::Other, Codec::Other(String::new()));
+            let mut default_duration = None;
             while self.r.position() < entry_end {
                 let c = self.header()?;
                 let size = known(c)?;
@@ -163,6 +163,21 @@ impl MatroskaDemuxer {
                     }
                     id::CODEC_ID => info.codec = Codec::from_matroska_id(&self.r.read_string(size)?),
                     id::CODEC_PRIVATE => info.extradata = Some(self.r.read_bytes(size)?),
+                    id::FLAG_DEFAULT => info.default = self.r.read_uint(size)? != 0,
+                    id::CODEC_DELAY => info.codec_delay = Duration::from_nanos(self.r.read_uint(size)?),
+                    id::SEEK_PRE_ROLL => info.seek_preroll = Duration::from_nanos(self.r.read_uint(size)?),
+                    id::DEFAULT_DURATION => default_duration = Some(Duration::from_nanos(self.r.read_uint(size)?)),
+                    id::AUDIO => {
+                        let audio_end = c.data_start + size;
+                        while self.r.position() < audio_end {
+                            let a = self.header()?;
+                            match a.id {
+                                id::SAMPLING_FREQUENCY => info.sample_rate = self.r.read_float(known(a)?)? as u32,
+                                id::CHANNELS => info.channels = self.r.read_uint(known(a)?)? as u16,
+                                _ => self.r.skip(known(a)?)?,
+                            }
+                        }
+                    }
                     id::VIDEO => {
                         let video_end = c.data_start + size;
                         while self.r.position() < video_end {
@@ -178,6 +193,12 @@ impl MatroskaDemuxer {
                 }
             }
             if info.id != 0 {
+                if info.kind == StreamKind::Audio && info.channels == 0 {
+                    info.channels = 1; // Matroska default
+                }
+                if let Some(d) = default_duration {
+                    self.default_durations.insert(info.id, d);
+                }
                 self.streams.push(info);
             }
         }
@@ -236,35 +257,48 @@ impl MatroskaDemuxer {
         Duration::from_nanos((ticks.max(0) as u64).saturating_mul(self.scale_ns))
     }
 
-    /// Parses a (Simple)Block payload into a packet; `None` for skipped blocks.
-    fn block_to_packet(&mut self, data: Vec<u8>, keyframe_hint: Option<bool>) -> Option<Packet> {
-        let (track, n) = slice_vint(&data)?;
+    /// Parses a (Simple)Block into packets (several when laced), queued in `pending`.
+    fn queue_block(&mut self, data: Vec<u8>, keyframe_hint: Option<bool>) {
+        let Some((track, n)) = slice_vint(&data) else { return };
         let header_len = n + 3;
         if data.len() < header_len {
-            return None;
+            return;
         }
         let rel = i16::from_be_bytes([data[n], data[n + 1]]);
         let flags = data[n + 2];
         let track = track as u32;
         if !self.streams.iter().any(|s| s.id == track) {
-            return None;
-        }
-        if (flags >> 1) & 0b11 != 0 {
-            // Laced blocks are only used for audio; lacing support arrives with audio in phase 2.
-            log::debug!("skipping laced block on track {track}");
-            return None;
+            return;
         }
         let keyframe = keyframe_hint.unwrap_or(flags & 0x80 != 0);
         if self.need_keyframe && Some(track) == self.video_track {
             if !keyframe {
-                return None;
+                return;
             }
             self.need_keyframe = false;
         }
         let pts = self.ticks_to_duration(self.cluster_ts as i64 + rel as i64);
-        let mut payload = data;
-        payload.drain(..header_len);
-        Some(Packet { stream: track, pts, keyframe, data: payload, generation: 0 })
+        let lacing = (flags >> 1) & 0b11;
+        if lacing == 0 {
+            let mut payload = data;
+            payload.drain(..header_len);
+            self.pending.push_back(Packet { stream: track, pts, keyframe, data: payload, generation: 0 });
+            return;
+        }
+        let Some(frames) = split_laced(lacing, &data[header_len..]) else {
+            log::warn!("dropping malformed laced block on track {track}");
+            return;
+        };
+        let step = self.default_durations.get(&track).copied().unwrap_or_default();
+        for (i, frame) in frames.into_iter().enumerate() {
+            self.pending.push_back(Packet {
+                stream: track,
+                pts: pts + step * i as u32,
+                keyframe,
+                data: frame.to_vec(),
+                generation: 0,
+            });
+        }
     }
 }
 
@@ -275,6 +309,9 @@ impl Demuxer for MatroskaDemuxer {
 
     fn next_packet(&mut self) -> Result<Option<Packet>> {
         loop {
+            if let Some(p) = self.pending.pop_front() {
+                return Ok(Some(p));
+            }
             let Some(h) = self.r.read_header()? else {
                 if let Some(end) = self.segment_end
                     && self.r.position() < end
@@ -289,9 +326,7 @@ impl Demuxer for MatroskaDemuxer {
                 id::TIMESTAMP => self.cluster_ts = self.r.read_uint(known(h)?)?,
                 id::SIMPLE_BLOCK => {
                     let data = self.r.read_bytes(known(h)?)?;
-                    if let Some(p) = self.block_to_packet(data, None) {
-                        return Ok(Some(p));
-                    }
+                    self.queue_block(data, None);
                 }
                 id::BLOCK_GROUP => {
                     let end = h.data_start + known(h)?;
@@ -307,10 +342,8 @@ impl Demuxer for MatroskaDemuxer {
                             _ => self.r.skip(known(c)?)?,
                         }
                     }
-                    if let Some(data) = block
-                        && let Some(p) = self.block_to_packet(data, Some(!has_reference))
-                    {
-                        return Ok(Some(p));
+                    if let Some(data) = block {
+                        self.queue_block(data, Some(!has_reference));
                     }
                 }
                 _ => self.r.skip(known(h)?)?,
@@ -329,6 +362,7 @@ impl Demuxer for MatroskaDemuxer {
             None => self.scan_clusters(ticks)?,
         };
         self.r.seek_to(pos)?;
+        self.pending.clear();
         self.cluster_ts = ts;
         self.need_keyframe = true;
         Ok(self.ticks_to_duration(ts as i64))
@@ -439,6 +473,67 @@ fn known(h: Header) -> Result<u64> {
 
 fn demux(msg: &str) -> Error {
     Error::Demux(msg.to_owned())
+}
+
+/// Splits Xiph-laced data (frame count byte, sizes, frames), e.g. Vorbis CodecPrivate.
+#[cfg(feature = "native")]
+pub(crate) fn split_xiph_lacing(data: &[u8]) -> Option<Vec<&[u8]>> {
+    split_laced(1, data)
+}
+
+/// Splits a laced block payload (starting at the frame-count byte) into frames.
+/// `lacing`: 1 = Xiph, 2 = fixed-size, 3 = EBML.
+fn split_laced(lacing: u8, payload: &[u8]) -> Option<Vec<&[u8]>> {
+    let count = *payload.first()? as usize + 1;
+    let mut pos = 1;
+    let mut sizes = Vec::with_capacity(count);
+    match lacing {
+        1 => {
+            for _ in 0..count - 1 {
+                let mut size = 0usize;
+                loop {
+                    let b = *payload.get(pos)?;
+                    pos += 1;
+                    size += b as usize;
+                    if b != 255 {
+                        break;
+                    }
+                }
+                sizes.push(size);
+            }
+        }
+        2 => {
+            let rest = payload.len() - pos;
+            if !rest.is_multiple_of(count) {
+                return None;
+            }
+            sizes = vec![rest / count; count - 1];
+        }
+        3 => {
+            let (first, n) = slice_vint(payload.get(pos..)?)?;
+            pos += n;
+            let mut size = first as i64;
+            sizes.push(size as usize);
+            for _ in 1..count - 1 {
+                let (raw, n) = slice_vint(payload.get(pos..)?)?;
+                pos += n;
+                let bias = (1i64 << (7 * n - 1)) - 1;
+                size += raw as i64 - bias;
+                if size < 0 {
+                    return None;
+                }
+                sizes.push(size as usize);
+            }
+        }
+        _ => return None,
+    }
+    let mut frames = Vec::with_capacity(count);
+    for size in sizes {
+        frames.push(payload.get(pos..pos + size)?);
+        pos += size;
+    }
+    frames.push(payload.get(pos..)?);
+    Some(frames)
 }
 
 /// EBML size-style vint from a byte slice (marker bit stripped). Returns (value, length).
@@ -565,6 +660,59 @@ mod tests {
         }
         std::fs::remove_file(&path).ok();
         assert!(result.is_err(), "file cut at a block boundary must be an error, got {result:?}");
+    }
+
+    #[test]
+    fn reads_audio_track_fields() {
+        let d = open("tests/fixtures/opus_only.webm");
+        let a = d.streams().iter().find(|s| s.kind == StreamKind::Audio).unwrap();
+        assert_eq!(a.codec, Codec::Opus);
+        assert_eq!((a.sample_rate, a.channels), (48_000, 1));
+        assert_eq!(a.codec_delay, Duration::from_nanos(6_500_000));
+        assert_eq!(a.seek_preroll, Duration::from_millis(80));
+        assert!(!a.default, "ffmpeg writes FlagDefault=0; parsed value must override the default of true");
+        let d = open("tests/fixtures/av1_vorbis.webm");
+        let a = d.streams().iter().find(|s| s.kind == StreamKind::Audio).unwrap();
+        assert_eq!((a.codec.clone(), a.sample_rate, a.channels), (Codec::Vorbis, 44_100, 1));
+        assert!(a.extradata.as_ref().is_some_and(|x| x.len() > 100), "Vorbis headers in CodecPrivate");
+    }
+
+    #[test]
+    fn audio_packets_are_delivered() {
+        let mut d = open("tests/fixtures/av1_with_audio.webm");
+        let audio = d.streams().iter().find(|s| s.kind == StreamKind::Audio).unwrap().id;
+        let mut n = 0;
+        let mut last = Duration::ZERO;
+        while let Some(p) = d.next_packet().unwrap() {
+            if p.stream == audio {
+                assert!(p.pts >= last);
+                last = p.pts;
+                n += 1;
+            }
+        }
+        assert!(n >= 99, "2 s of 20 ms Opus packets, got {n}");
+    }
+
+    #[test]
+    fn splits_xiph_fixed_and_ebml_lacing() {
+        // 3 frames of sizes 2, 300, 1 (Xiph: 300 = 255 + 45).
+        let mut xiph = vec![2, 2, 255, 45];
+        xiph.extend([1u8; 2]);
+        xiph.extend([2u8; 300]);
+        xiph.extend([3u8; 1]);
+        let f = split_laced(1, &xiph).unwrap();
+        assert_eq!(f.iter().map(|x| x.len()).collect::<Vec<_>>(), [2, 300, 1]);
+        assert_eq!((f[0][0], f[1][0], f[2][0]), (1, 2, 3));
+        // Fixed: 3 frames of 4 bytes.
+        let mut fixed = vec![2];
+        fixed.extend([9u8; 12]);
+        assert_eq!(split_laced(2, &fixed).unwrap().iter().map(|x| x.len()).collect::<Vec<_>>(), [4, 4, 4]);
+        assert!(split_laced(2, &[2, 1, 2, 3, 4]).is_none(), "12 bytes not divisible by 3 -> None");
+        // EBML: sizes 10, 7 (diff -3), last = rest (5). First size vint 0x8A, diff -3 as 1-byte signed vint: 0x80 | (63-3).
+        let mut ebml = vec![2, 0x8A, 0x80 | 60];
+        ebml.extend([0u8; 10 + 7 + 5]);
+        assert_eq!(split_laced(3, &ebml).unwrap().iter().map(|x| x.len()).collect::<Vec<_>>(), [10, 7, 5]);
+        assert!(split_laced(1, &[5, 1]).is_none(), "truncated sizes -> None");
     }
 
     #[test]

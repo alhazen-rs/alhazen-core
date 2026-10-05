@@ -10,6 +10,8 @@ use std::time::Duration;
 
 pub use matroska::MatroskaDemuxer;
 #[cfg(feature = "native")]
+pub(crate) use matroska::split_xiph_lacing;
+#[cfg(feature = "native")]
 pub use mp4::Mp4Demuxer;
 
 use crate::Result;
@@ -88,6 +90,35 @@ pub struct StreamInfo {
     pub duration: Option<Duration>,
     /// Codec-specific setup data (Matroska CodecPrivate / MP4 sample entry config).
     pub extradata: Option<Vec<u8>>,
+    /// Container "default track" flag (true when the container has no such flag).
+    pub default: bool,
+    /// Audio only: samples per second and channel count (0 when unknown).
+    pub sample_rate: u32,
+    pub channels: u16,
+    /// Audio only: decoder delay to discard at the start (Matroska CodecDelay).
+    pub codec_delay: Duration,
+    /// Audio only: how much earlier decoding must start for a seek to be clean (SeekPreRoll).
+    pub seek_preroll: Duration,
+}
+
+impl StreamInfo {
+    /// A stream with every optional field empty.
+    pub fn new(id: u32, kind: StreamKind, codec: Codec) -> Self {
+        Self {
+            id,
+            kind,
+            codec,
+            width: 0,
+            height: 0,
+            duration: None,
+            extradata: None,
+            default: true,
+            sample_rate: 0,
+            channels: 0,
+            codec_delay: Duration::ZERO,
+            seek_preroll: Duration::ZERO,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

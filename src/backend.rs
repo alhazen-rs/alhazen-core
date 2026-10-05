@@ -160,15 +160,7 @@ mod tests {
     }
 
     fn vp9() -> StreamInfo {
-        StreamInfo {
-            id: 1,
-            kind: StreamKind::Video,
-            codec: Codec::Vp9,
-            width: 0,
-            height: 0,
-            duration: None,
-            extradata: None,
-        }
+        StreamInfo::new(1, StreamKind::Video, Codec::Vp9)
     }
 
     #[test]
