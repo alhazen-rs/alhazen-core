@@ -1,0 +1,13 @@
+gpui-native-video-player
+Copyright 2026 Mohamed A.
+
+This product includes software from gpui-native-video-player
+(the video-core and gpui-video crates), licensed under the Apache License,
+Version 2.0.
+
+Under section 4(d) of the Apache License, if you distribute a work that
+includes this software, in source or binary form, you must include a
+readable copy of this NOTICE: in a NOTICE text file shipped with it, in its
+documentation, or in a display the software generates (for example an
+"About" or "Licenses" screen), wherever such third-party notices normally
+appear.
