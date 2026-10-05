@@ -8,8 +8,8 @@ rust-version.workspace = true
 
 [features]
 default = ["native", "http", "audio-output"]
-# Pure-Rust, permissively licensed decoders: AV1 (rav1d), Opus, Vorbis; MP4 demuxing.
-native = ["dep:rav1d", "dep:re_mp4", "dep:opus-pure", "dep:lewton"]
+# Pure-Rust, permissively licensed decoders: AV1 (rav1d), VP9 (vp9-mt), Opus, Vorbis; MP4 demuxing.
+native = ["dep:rav1d", "dep:vp9-mt", "dep:re_mp4", "dep:opus-pure", "dep:lewton"]
 # AAC-LC via Symphonia. Symphonia is MPL-2.0 (file-level copyleft): apps may stay closed-source,
 # but changes to Symphonia's own files must be shared. Off by default for that reason.
 native-aac = ["dep:symphonia-codec-aac", "dep:symphonia-core"]
@@ -26,6 +26,7 @@ yuv = { version = "0.8.19", features = ["rayon"] }
 log = "0.4"
 libc = "0.2"
 rav1d = { version = "1.1.0", optional = true }
+vp9-mt = { workspace = true, optional = true }
 re_mp4 = { version = "0.5.1", optional = true }
 ureq = { version = "3.4", optional = true }
 opus-pure = { version = "0.2.2", optional = true }
@@ -37,5 +38,6 @@ symphonia-codec-aac = { version = "0.6.1", optional = true }
 symphonia-core = { version = "0.6.1", optional = true }
 
 [dev-dependencies]
+md-5 = "0.10"
 tiny_http = "0.12"
 url = "2.5"

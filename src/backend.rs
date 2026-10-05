@@ -128,7 +128,7 @@ impl Registry {
     }
 }
 
-/// Pure-Rust backend: Matroska/WebM + MP4 demuxing, AV1 decoding via rav1d.
+/// Pure-Rust backend: Matroska/WebM + MP4 demuxing; AV1 (rav1d) and VP9 (vp9-mt) decoding.
 #[cfg(feature = "native")]
 pub struct NativeBackend;
 
@@ -150,10 +150,16 @@ impl Backend for NativeBackend {
         })
     }
     fn supports_video(&self, stream: &StreamInfo) -> bool {
-        stream.codec == crate::demux::Codec::Av1
+        use crate::demux::Codec;
+        matches!(stream.codec, Codec::Av1 | Codec::Vp9)
     }
-    fn open_video_decoder(&self, _stream: &StreamInfo, threads: usize) -> Result<Box<dyn VideoDecoder>> {
-        Ok(Box::new(crate::decode::Av1Decoder::new(threads)?))
+    fn open_video_decoder(&self, stream: &StreamInfo, threads: usize) -> Result<Box<dyn VideoDecoder>> {
+        use crate::demux::Codec;
+        Ok(match stream.codec {
+            Codec::Av1 => Box::new(crate::decode::Av1Decoder::new(threads)?),
+            Codec::Vp9 => Box::new(crate::decode::Vp9Decoder::new(threads)),
+            _ => return Err(Error::Unsupported("video codec")),
+        })
     }
     fn supports_audio(&self, stream: &StreamInfo) -> bool {
         use crate::demux::Codec;
@@ -228,11 +234,18 @@ mod tests {
 
     #[cfg(feature = "native")]
     #[test]
-    fn native_backend_does_not_claim_vp9() {
+    fn native_backend_does_not_claim_h264() {
         let r = Registry::with_defaults();
+        let h264 = StreamInfo::new(1, StreamKind::Video, Codec::H264);
         assert!(matches!(
-            r.open_video_decoder(&vp9(), 1, None),
+            r.open_video_decoder(&h264, 1, None),
             Err(Error::UnsupportedCodec { tried_backends, .. }) if tried_backends.is_empty()
         ));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn native_backend_opens_vp9() {
+        assert!(Registry::with_defaults().open_video_decoder(&vp9(), 1, None).is_ok());
     }
 }

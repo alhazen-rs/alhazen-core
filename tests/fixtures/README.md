@@ -60,3 +60,28 @@ python3 make_laced.py vorbis_only.webm laced_vorbis.webm
   laces Vorbis this way; `make_laced.py` reproduces it without mkvtoolnix. ffmpeg demuxes it back
   into the same 88 packets as `vorbis_only.webm`.
 
+
+## Phase 3 fixtures (VP9, VP8, ProRes; ffmpeg-only codecs)
+
+Requires ffmpeg with `libvpx`, `libx264` and `libx265`. Run with bash (zsh does not word-split `$V`).
+
+```bash
+V="-f lavfi -i testsrc2=size=320x240:rate=30"
+ffmpeg -v error -y $V -t 2 -pix_fmt yuv420p -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -g 30 -crf 50 -b:v 0 vp9_profile0.webm
+ffmpeg -v error -y $V -t 2 -pix_fmt yuv420p10le -profile:v 2 -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -g 30 -crf 50 -b:v 0 vp9_10bit.webm
+ffmpeg -v error -y -f lavfi -i testsrc2=size=1024x576:rate=30 -t 0.34 -pix_fmt yuv420p -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -tile-columns 2 -crf 55 -b:v 0 vp9_tiles4.webm
+ffmpeg -v error -y $V -t 2 -pix_fmt yuv420p -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -g 30 -crf 50 -b:v 0 -movflags +faststart vp9.mp4
+ffmpeg -v error -y $V -t 2 -pix_fmt yuv420p -c:v libvpx -deadline realtime -cpu-used 8 -g 30 -crf 50 -b:v 200k vp8.webm
+ffmpeg -v error -y -f lavfi -i testsrc2=size=192x128:rate=30 -t 0.2 -c:v prores_ks -profile:v 3 -pix_fmt yuv422p10le prores_hq.mov
+ffmpeg -v error -y -f lavfi -i testsrc2=size=192x128:rate=30 -t 0.2 -c:v prores_ks -profile:v 4 -pix_fmt yuv444p10le prores_4444.mov
+ffmpeg -v error -y -f lavfi -i testsrc2=size=192x128:rate=30 -t 0.1 -vf setfield=tff -c:v prores_ks -profile:v 4 -pix_fmt yuv444p10le -flags +ildct+ilme prores_4444_interlaced.mov
+ffmpeg -v error -y $V -f lavfi -i sine=frequency=440:sample_rate=44100 -t 1 -pix_fmt yuv420p -c:v libx264 -preset ultrafast -crf 40 -g 30 -c:a aac -b:a 48k -movflags +faststart h264_aac.mp4
+ffmpeg -v error -y $V -t 1 -pix_fmt yuv420p -c:v libx265 -preset ultrafast -crf 40 -g 30 -x265-params log-level=none hevc.mkv
+ffmpeg -v error -y -i vp9_tiles4.webm -c copy -f ivf ../../../vp9-mt/tests/data/tiles4.ivf
+```
+
+- VP9/VP8 fixtures: 320×240, 60 frames at 30 fps, keyframes at 0 and 1000 ms (`vp9_10bit.webm` is Profile 2)
+- `vp9_tiles4.webm`: 1024×576, 11 frames, 4 tile columns on the key frame
+- ProRes: 192×128, 6 frames (`prores_hq.mov` `apch` 4:2:2; `prores_4444*.mov` `ap4h` 4:4:4; the
+  interlaced one is 3 frames, top field first)
+- `h264_aac.mp4` (H.264 + AAC-LC 44.1 kHz) and `hevc.mkv`: 1 s, decodable only through ffmpeg

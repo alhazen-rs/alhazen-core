@@ -10,9 +10,13 @@ mod av1;
 #[cfg(feature = "native")]
 mod opus;
 #[cfg(feature = "native")]
+mod planar;
+#[cfg(feature = "native")]
 mod opus_multistream;
 #[cfg(feature = "native")]
 mod vorbis;
+#[cfg(feature = "native")]
+mod vp9;
 
 use std::time::Duration;
 
@@ -25,6 +29,8 @@ pub use av1::Av1Decoder;
 pub use opus::OpusAudioDecoder;
 #[cfg(feature = "native")]
 pub use vorbis::VorbisAudioDecoder;
+#[cfg(feature = "native")]
+pub use vp9::Vp9Decoder;
 
 use crate::Result;
 use crate::demux::Packet;
