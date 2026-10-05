@@ -283,7 +283,8 @@ mod tests {
     #[cfg(feature = "native")]
     #[test]
     fn native_backend_does_not_claim_h264() {
-        let r = Registry::with_ffmpeg(&crate::FfmpegConfig { enabled: false, ..Default::default() });
+        // Native only: platform decoders (Media Foundation) and ffmpeg may claim H.264.
+        let r = Registry::empty_with_native();
         let h264 = StreamInfo::new(1, StreamKind::Video, Codec::H264);
         assert!(matches!(
             r.open_video_decoder(&h264, 1, None),
