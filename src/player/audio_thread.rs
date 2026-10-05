@@ -56,6 +56,9 @@ pub(super) struct AudioLoop {
     /// Buffers are trimmed or preceded by silence to match it, so gaps, overlaps and skipped
     /// packets never shift audio against video.
     expected: Duration,
+    /// Timestamp of the previous buffer. Frames of one laced Matroska block without a
+    /// DefaultDuration all carry the block's timestamp; they continue the timeline as-is.
+    last_pts: Option<Duration>,
     /// Frames pushed into the ring so far (the ring's sequence numbers).
     pushed: u64,
     errors: u32,
@@ -70,6 +73,7 @@ impl AudioLoop {
             resampler: None,
             generation: 0,
             expected: Duration::ZERO,
+            last_pts: None,
             pushed: 0,
             errors: 0,
         }
@@ -97,6 +101,7 @@ impl AudioLoop {
                     }
                     self.generation = generation;
                     self.expected = target;
+                    self.last_pts = None;
                     self.errors = 0;
                     // Everything pushed so far predates the seek.
                     self.out.discard_until.store(self.pushed, Ordering::SeqCst);
@@ -151,7 +156,11 @@ impl AudioLoop {
         let ch = self.out.channels;
         let rate = buf.rate.max(1);
         let mut samples = remix(&buf.samples, buf.channels, ch);
-        let start = match align(self.expected, buf.pts, buf.frames(), rate) {
+        let same_block = self.last_pts == Some(buf.pts);
+        self.last_pts = Some(buf.pts);
+        let alignment = if same_block { Align::Keep } else { align(self.expected, buf.pts, buf.frames(), rate) };
+        let start = match alignment {
+            Align::Keep if same_block => self.expected,
             Align::Skip => return true,
             Align::Keep => buf.pts,
             Align::Drop(n) => {

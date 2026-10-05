@@ -247,3 +247,19 @@ fn device_loss_warns_disables_audio_and_still_ends() {
         "a Warning must say audio was lost"
     );
 }
+
+#[test]
+fn laced_vorbis_without_default_duration_plays_completely() {
+    // Frames inside a laced block share one timestamp; they must play back to back, not be
+    // dropped as overlaps.
+    let (player, null) = open("laced_vorbis.webm");
+    player.play();
+    let mut loud = 0;
+    until("end", 20, || {
+        if peak(&play_ms(&null, 20)) > 0.05 {
+            loud += 1;
+        }
+        (player.state() == PlayerState::Ended).then_some(())
+    });
+    assert!((90..=105).contains(&loud), "{loud} loud 20 ms chunks for 2 s of tone");
+}

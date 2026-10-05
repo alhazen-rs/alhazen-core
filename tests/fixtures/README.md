@@ -47,3 +47,16 @@ ffmpeg -v error -y -f lavfi -t 2 -i testsrc2=size=320x240:rate=30 -f lavfi -t 1 
   Vorbis 0.000/576, 0.013/1024, 0.036/1024, 0.060/1024 (presentation time = Matroska block time − CodecDelay)
 - `av1_short_audio.webm`: 2 s of video but only 1 s of audio
 - Note for zsh: write filter strings literally (or `${VAR}`); `$VAR:s…` is a zsh modifier
+
+## Lacing fixtures
+
+```bash
+ffmpeg -v error -y -f lavfi -t 2 -i 'sine=frequency=440:sample_rate=44100' -t 2 -c:a libvorbis -q:a 2 vorbis_only.webm
+python3 make_laced.py vorbis_only.webm laced_vorbis.webm
+```
+
+- `laced_vorbis.webm`: every 3 Vorbis frames Xiph-laced into one SimpleBlock (29 laced blocks), no
+  DefaultDuration (frames in a block share its timestamp), unknown-size Segment, no Cues. mkvmerge
+  laces Vorbis this way; `make_laced.py` reproduces it without mkvtoolnix. ffmpeg demuxes it back
+  into the same 88 packets as `vorbis_only.webm`.
+

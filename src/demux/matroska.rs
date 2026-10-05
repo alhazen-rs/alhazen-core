@@ -720,4 +720,20 @@ mod tests {
         let src = Box::new(FileSource::open("tests/fixtures/not_video.bin").unwrap());
         assert!(MatroskaDemuxer::open(src).is_err());
     }
+
+    #[test]
+    fn laced_file_yields_the_same_packets_as_unlaced() {
+        // laced_vorbis.webm is vorbis_only.webm with every 3 blocks Xiph-laced (make_laced.py).
+        let payloads = |path: &str| {
+            let mut d = open(path);
+            let mut out = vec![];
+            while let Some(p) = d.next_packet().unwrap() {
+                out.push(p.data);
+            }
+            out
+        };
+        let (plain, laced) = (payloads("tests/fixtures/vorbis_only.webm"), payloads("tests/fixtures/laced_vorbis.webm"));
+        assert_eq!(laced.len(), plain.len());
+        assert!(laced == plain, "laced frames must split back into the original packets");
+    }
 }
