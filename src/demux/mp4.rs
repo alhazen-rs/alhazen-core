@@ -3,7 +3,7 @@
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::time::Duration;
 
-use super::{Codec, Demuxer, Packet, StreamInfo, StreamKind};
+use super::{Codec, Demuxer, Packet, PcmFormat, StreamInfo, StreamKind};
 use crate::source::MediaSource;
 use crate::{Error, Result};
 
@@ -76,15 +76,41 @@ impl Mp4Demuxer {
                 info.codec = Codec::ProRes;
                 info.kind = StreamKind::Video;
             }
-            streams.push(info);
-            samples.extend(track.samples.iter().map(|s| SampleRef {
+            if matches!(info.codec, Codec::Other(_))
+                && let Some((fourcc, entry)) = sample_entry(&moov, track.track_id)
+                && let Some((format, channels, rate)) = pcm_entry(fourcc, entry)
+            {
+                info.codec = Codec::Pcm(format);
+                info.kind = StreamKind::Audio;
+                (info.channels, info.sample_rate) = (channels, rate);
+            }
+            // Tracks re_mp4 has no codec for still have a handler type: an audio track we cannot
+            // decode should be reported as such, not silently ignored.
+            if info.kind == StreamKind::Other {
+                info.kind = match handler_type(&moov, track.track_id) {
+                    Some(b"soun") => StreamKind::Audio,
+                    Some(b"vide") => StreamKind::Video,
+                    _ => StreamKind::Other,
+                };
+            }
+            let track_samples = track.samples.iter().map(|s| SampleRef {
                 stream: track.track_id,
                 offset: s.offset,
                 size: s.size,
                 pts: ticks(s.composition_timestamp, s.timescale.max(1)),
                 dts: ticks(s.decode_timestamp, s.timescale.max(1)),
                 keyframe: s.is_sync,
-            }));
+            });
+            match info.codec {
+                // QuickTime stores PCM as one "sample" per audio frame (6 bytes for 24-bit stereo):
+                // merge contiguous ones into packets of up to PCM_PACKET_FRAMES frames.
+                Codec::Pcm(f) => {
+                    let frame = (f.bits as u64 / 8 * info.channels as u64).max(1);
+                    samples.extend(merge_contiguous(track_samples, frame * PCM_PACKET_FRAMES));
+                }
+                _ => samples.extend(track_samples),
+            }
+            streams.push(info);
         }
         let samples = interleave_by_time(samples);
         let video_track = streams.iter().find(|s| s.kind == StreamKind::Video).map(|s| s.id);
@@ -123,6 +149,25 @@ impl Demuxer for Mp4Demuxer {
         self.cursor = index;
         Ok(self.samples.get(index).map(|s| s.pts).unwrap_or_default())
     }
+}
+
+/// Audio frames per merged PCM packet.
+const PCM_PACKET_FRAMES: u64 = 2048;
+
+/// Merges runs of samples stored back to back into samples of at most `max_bytes`.
+fn merge_contiguous(samples: impl Iterator<Item = SampleRef>, max_bytes: u64) -> Vec<SampleRef> {
+    let mut out: Vec<SampleRef> = Vec::new();
+    for s in samples {
+        if let Some(last) = out.last_mut()
+            && last.offset + last.size == s.offset
+            && last.size + s.size <= max_bytes
+        {
+            last.size += s.size;
+            continue;
+        }
+        out.push(s);
+    }
+    out
 }
 
 /// All samples of all tracks in decode-time order. Files usually store tracks interleaved, but
@@ -194,14 +239,80 @@ fn child<'a>(data: &'a [u8], kind: &[u8]) -> Option<&'a [u8]> {
 
 /// The sample entries (payload of `stsd` after version/flags and entry count) of `track_id`.
 fn sample_entries(moov: &[u8], track_id: u32) -> Option<&[u8]> {
-    let trak = boxes(moov).filter(|(k, _)| *k == b"trak").map(|(_, p)| p).find(|trak| {
+    let trak = trak(moov, track_id)?;
+    let stsd = child(child(child(child(trak, b"mdia")?, b"minf")?, b"stbl")?, b"stsd")?;
+    stsd.get(8..)
+}
+
+/// The `trak` box of `track_id`.
+fn trak(moov: &[u8], track_id: u32) -> Option<&[u8]> {
+    boxes(moov).filter(|(k, _)| *k == b"trak").map(|(_, p)| p).find(|trak| {
         child(trak, b"tkhd").and_then(|tkhd| {
             let at = if tkhd.first() == Some(&1) { 20 } else { 12 };
             Some(u32::from_be_bytes(tkhd.get(at..at + 4)?.try_into().ok()?))
         }) == Some(track_id)
-    })?;
-    let stsd = child(child(child(child(trak, b"mdia")?, b"minf")?, b"stbl")?, b"stsd")?;
-    stsd.get(8..)
+    })
+}
+
+/// `track_id`'s handler type (`vide`, `soun`, …) from `mdia/hdlr`.
+fn handler_type(moov: &[u8], track_id: u32) -> Option<&[u8; 4]> {
+    let hdlr = child(child(trak(moov, track_id)?, b"mdia")?, b"hdlr")?;
+    hdlr.get(8..12)?.try_into().ok()
+}
+
+/// `track_id`'s first sample entry as (FourCC, payload).
+fn sample_entry(moov: &[u8], track_id: u32) -> Option<(&[u8], &[u8])> {
+    boxes(sample_entries(moov, track_id)?).next()
+}
+
+/// PCM format, channels and rate of a QuickTime/ISO sound sample entry, if it is PCM.
+fn pcm_entry(fourcc: &[u8], e: &[u8]) -> Option<(PcmFormat, u16, u32)> {
+    let u16_at = |at: usize| Some(u16::from_be_bytes(e.get(at..at + 2)?.try_into().ok()?));
+    let u32_at = |at: usize| Some(u32::from_be_bytes(e.get(at..at + 4)?.try_into().ok()?));
+    // SoundDescription: reserved(6) data_ref(2) version(2) revision(2) vendor(4) channels(2)
+    // sample_size(2) compression_id(2) packet_size(2) sample_rate(16.16); v1 adds 16 bytes,
+    // v2 replaces rate/channels with its own fields (QuickTime File Format, "Sound Sample Descriptions").
+    let version = u16_at(8)?;
+    let (mut channels, sample_size, mut rate) = (u16_at(16)?, u16_at(18)?, u32_at(24)? >> 16);
+    let children = match version {
+        0 => 28,
+        1 => 44,
+        2 => 64,
+        _ => return None,
+    };
+    let kids = e.get(children..).unwrap_or_default();
+    // QuickTime: big-endian unless `wave/enda` says otherwise (as Final Cut / ffmpeg write `in24`).
+    let little = child(kids, b"wave").and_then(|w| child(w, b"enda")).and_then(|v| v.get(..2)).is_some_and(|v| v != [0, 0]);
+    let format = match fourcc {
+        b"sowt" => PcmFormat::int(sample_size.max(16), false, true),
+        b"twos" => PcmFormat::int(sample_size.max(8), true, true),
+        b"raw " => PcmFormat::int(8, false, false),
+        b"in24" => PcmFormat::int(24, !little, true),
+        b"in32" => PcmFormat::int(32, !little, true),
+        b"fl32" => PcmFormat::float(32, !little),
+        b"fl64" => PcmFormat::float(64, !little),
+        b"lpcm" if version == 2 => {
+            rate = f64::from_bits(u64::from_be_bytes(e.get(32..40)?.try_into().ok()?)) as u32;
+            channels = u32_at(40)? as u16;
+            let (bits, flags) = (u32_at(48)? as u16, u32_at(52)?);
+            match flags & 1 != 0 {
+                true => PcmFormat::float(bits, flags & 2 != 0),
+                false => PcmFormat::int(bits, flags & 2 != 0, flags & 4 != 0 || bits > 8),
+            }
+        }
+        // ISO/IEC 23003-5: `pcmC` = version/flags(4), format_flags (bit 0: little endian), sample size.
+        b"ipcm" | b"fpcm" => {
+            let pcmc = child(kids, b"pcmC")?;
+            let (flags, bits) = (*pcmc.get(4)?, *pcmc.get(5)? as u16);
+            match fourcc == b"fpcm" {
+                true => PcmFormat::float(bits, flags & 1 == 0),
+                false => PcmFormat::int(bits, flags & 1 == 0, true),
+            }
+        }
+        _ => return None,
+    };
+    let supported = if format.float { matches!(format.bits, 32 | 64) } else { matches!(format.bits, 8 | 16 | 24 | 32) };
+    (supported && channels > 0 && rate > 0).then_some((format, channels, rate))
 }
 
 /// The FourCC of `track_id`'s first sample entry (e.g. `apch`).

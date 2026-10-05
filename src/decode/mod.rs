@@ -10,6 +10,8 @@ mod av1;
 #[cfg(feature = "native")]
 mod opus;
 #[cfg(feature = "native")]
+mod pcm;
+#[cfg(feature = "native")]
 mod planar;
 #[cfg(feature = "native")]
 mod prores;
@@ -33,6 +35,8 @@ pub use av1::Av1Decoder;
 pub use opus::OpusAudioDecoder;
 #[cfg(feature = "native")]
 pub use vorbis::VorbisAudioDecoder;
+#[cfg(feature = "native")]
+pub use pcm::PcmAudioDecoder;
 #[cfg(feature = "native")]
 pub use prores::ProResDecoder;
 #[cfg(feature = "native")]

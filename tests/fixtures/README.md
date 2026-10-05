@@ -91,3 +91,20 @@ ffmpeg -v error -y -i vp9_tiles4.webm -c copy -f ivf ../../../vp9-mt/tests/data/
 - `h264_aac.mp4` (H.264 + AAC-LC 44.1 kHz) and `hevc.mkv`: 1 s, decodable only through ffmpeg
 - `hevc_open_gop.mkv`: 2 s, open GOP (CRA keyframes at 0 and 1 s, 4 B-frames): decoding from the
   1 s keyframe makes ffmpeg skip the leading frames
+
+## PCM fixtures
+
+```bash
+A="-f lavfi -i sine=frequency=440:sample_rate=48000 -t 0.25 -ac 2"
+for spec in "pcm_s24le mov" "pcm_s24be mov" "pcm_s16le mov" "pcm_s16be mov" "pcm_f32le mov" "pcm_u8 mov" \
+            "pcm_s16le mp4" "pcm_s16le mkv" "pcm_s24be mkv" "pcm_f32le mkv" "pcm_u8 mkv"; do
+  set -- $spec; ffmpeg -v error -y $A -c:a $1 $1.$2
+done
+ffmpeg -v error -y -f lavfi -i testsrc2=size=128x96:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 -t 0.4 -ac 2 -c:v prores_ks -profile:v 0 -pix_fmt yuv422p10le -c:a pcm_s24le prores_pcm.mov
+```
+
+- 0.25 s, 48 kHz stereo, 440 Hz at 1/8 amplitude spread at −3 dB (peak 0.0884)
+- MOV sample entries: `in24` (with `wave/enda` = little endian for `pcm_s24le`, without for big
+  endian), `sowt`, `twos`, `fl32` (+`enda`), `raw `; MP4 `ipcm` (+`pcmC`); Matroska `A_PCM/INT/LIT`,
+  `A_PCM/INT/BIG`, `A_PCM/FLOAT/IEEE`, 8-bit unsigned `A_PCM/INT/LIT`
+- `prores_pcm.mov`: ProRes Proxy video with 24-bit PCM audio, like camera/editor exports

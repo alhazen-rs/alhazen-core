@@ -26,6 +26,7 @@ pub mod id {
     pub const AUDIO: u32 = 0xE1;
     pub const SAMPLING_FREQUENCY: u32 = 0xB5;
     pub const CHANNELS: u32 = 0x9F;
+    pub const BIT_DEPTH: u32 = 0x6264;
     pub const CODEC_DELAY: u32 = 0x56AA;
     pub const SEEK_PRE_ROLL: u32 = 0x56BB;
     pub const FLAG_DEFAULT: u32 = 0x88;

@@ -121,6 +121,7 @@ mod backend {
             Codec::Opus => &["opus", "libopus"],
             Codec::Vorbis => &["vorbis", "libvorbis"],
             Codec::Aac => &["aac", "aac_fixed", "libfdk_aac"],
+            Codec::Pcm(_) => &[],
             Codec::Other(id) => match id.as_str() {
                 "V_MPEG1" => &["mpeg1video"],
                 "V_MPEG2" => &["mpeg2video"],

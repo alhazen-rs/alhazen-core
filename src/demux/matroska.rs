@@ -149,6 +149,7 @@ impl MatroskaDemuxer {
             let entry_end = entry.data_start + known(entry)?;
             let mut info = StreamInfo::new(0, StreamKind::Other, Codec::Other(String::new()));
             let mut default_duration = None;
+            let mut bit_depth = 0u16;
             while self.r.position() < entry_end {
                 let c = self.header()?;
                 let size = known(c)?;
@@ -174,6 +175,7 @@ impl MatroskaDemuxer {
                             match a.id {
                                 id::SAMPLING_FREQUENCY => info.sample_rate = self.r.read_float(known(a)?)? as u32,
                                 id::CHANNELS => info.channels = self.r.read_uint(known(a)?)? as u16,
+                                id::BIT_DEPTH => bit_depth = self.r.read_uint(known(a)?)? as u16,
                                 _ => self.r.skip(known(a)?)?,
                             }
                         }
@@ -195,6 +197,11 @@ impl MatroskaDemuxer {
             if info.id != 0 {
                 if info.kind == StreamKind::Audio && info.channels == 0 {
                     info.channels = 1; // Matroska default
+                }
+                if let Codec::Pcm(f) = &mut info.codec {
+                    f.bits = bit_depth;
+                    // Matroska: "8-bit PCM is unsigned" (A_PCM/INT/LIT).
+                    f.signed = f.float || bit_depth != 8;
                 }
                 if let Some(d) = default_duration {
                     self.default_durations.insert(info.id, d);

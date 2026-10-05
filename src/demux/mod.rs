@@ -36,7 +36,29 @@ pub enum Codec {
     Opus,
     Vorbis,
     Aac,
+    /// Uncompressed PCM audio.
+    Pcm(PcmFormat),
     Other(String),
+}
+
+/// Layout of uncompressed PCM samples. `bits == 0` means "not stated yet" (Matroska carries the
+/// depth in a separate element).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PcmFormat {
+    pub bits: u16,
+    pub float: bool,
+    pub big_endian: bool,
+    /// Integer samples only: two's complement (else offset binary, as 8-bit WAV/QuickTime `raw `).
+    pub signed: bool,
+}
+
+impl PcmFormat {
+    pub const fn int(bits: u16, big_endian: bool, signed: bool) -> Self {
+        Self { bits, float: false, big_endian, signed }
+    }
+    pub const fn float(bits: u16, big_endian: bool) -> Self {
+        Self { bits, float: true, big_endian, signed: true }
+    }
 }
 
 impl Codec {
@@ -51,6 +73,10 @@ impl Codec {
             "V_PRORES" => Codec::ProRes,
             "A_OPUS" => Codec::Opus,
             "A_VORBIS" => Codec::Vorbis,
+            // Bit depth comes from the track's BitDepth element; Matroska 8-bit PCM is unsigned.
+            "A_PCM/INT/LIT" => Codec::Pcm(PcmFormat::int(0, false, true)),
+            "A_PCM/INT/BIG" => Codec::Pcm(PcmFormat::int(0, true, true)),
+            "A_PCM/FLOAT/IEEE" => Codec::Pcm(PcmFormat::float(0, false)),
             id if id.starts_with("A_AAC") => Codec::Aac,
             other => Codec::Other(other.to_owned()),
         }
@@ -77,6 +103,10 @@ impl std::fmt::Display for Codec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Codec::Other(s) => f.write_str(s),
+            Codec::Pcm(p) => {
+                let kind = if p.float { "f" } else if p.signed { "s" } else { "u" };
+                write!(f, "PCM {kind}{}{}", p.bits, if p.big_endian { "be" } else { "le" })
+            }
             known => write!(f, "{known:?}"),
         }
     }
