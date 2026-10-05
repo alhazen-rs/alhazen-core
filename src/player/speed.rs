@@ -14,6 +14,10 @@ const MIN_SAMPLES: usize = 8;
 /// Late-frame drops in this many consecutive windows of `DROP_WINDOW` also mean too slow.
 const DROP_WINDOWS: u32 = 3;
 const DROP_WINDOW: Duration = Duration::from_millis(500);
+/// Frames reaching the queue this late (behind the playback clock), continuously for `SUSTAIN`,
+/// also mean too slow — whatever the cause (a threaded decoder's cost hides inside its own
+/// threads, so per-call cost alone can look fine while the picture falls behind the sound).
+pub(super) const LATE_LIMIT: Duration = Duration::from_millis(100);
 
 pub(super) struct SpeedMonitor {
     /// (when, decode+convert cost, pts) per decoded frame, oldest first.
@@ -23,11 +27,20 @@ pub(super) struct SpeedMonitor {
     drop_streak: u32,
     /// The decoder was behind at every sample of the current drop window.
     behind_in_window: bool,
+    /// Since when every frame has reached the queue more than `LATE_LIMIT` late.
+    late_since: Option<Instant>,
 }
 
 impl SpeedMonitor {
     pub fn new() -> Self {
-        Self { samples: VecDeque::new(), slow_since: None, drop_window: None, drop_streak: 0, behind_in_window: true }
+        Self {
+            samples: VecDeque::new(),
+            slow_since: None,
+            drop_window: None,
+            drop_streak: 0,
+            behind_in_window: true,
+            late_since: None,
+        }
     }
 
     /// Forgets everything: after a seek, a pause, or while buffering.
@@ -59,6 +72,15 @@ impl SpeedMonitor {
         }
     }
 
+    /// How late (behind the playback clock) the latest frame reached the queue.
+    pub fn record_lateness(&mut self, now: Instant, late: Duration) {
+        if late > LATE_LIMIT {
+            self.late_since.get_or_insert(now);
+        } else {
+            self.late_since = None;
+        }
+    }
+
     /// Average decode+convert cost and frame interval over the window, once there is enough data.
     fn averages(&self) -> Option<(Duration, Duration)> {
         if self.samples.len() < MIN_SAMPLES {
@@ -74,6 +96,9 @@ impl SpeedMonitor {
     /// Whether decoding has been too slow for long enough to switch.
     pub fn too_slow(&mut self, now: Instant) -> bool {
         if self.drop_streak >= DROP_WINDOWS {
+            return true;
+        }
+        if self.late_since.is_some_and(|since| now.duration_since(since) >= SUSTAIN) {
             return true;
         }
         match self.averages() {
@@ -158,6 +183,39 @@ mod tests {
             m.record_drops(t + DROP_WINDOW * w, 30 * w as u64, false);
         }
         assert!(!m.too_slow(t + DROP_WINDOW * 10));
+    }
+
+    #[test]
+    fn frames_arriving_late_for_the_sustain_time_switch() {
+        // Cheap decoder calls (threaded decoder) but every frame reaches the queue 300 ms late.
+        let mut m = SpeedMonitor::new();
+        let t = Instant::now();
+        let mut at = None;
+        for i in 0..120u64 {
+            let now = t + Duration::from_millis(i * 16);
+            m.record_frame(now, Duration::from_millis(1), Duration::from_millis(i * 16));
+            m.record_lateness(now, Duration::from_millis(300));
+            if m.too_slow(now) {
+                at = Some(now - t);
+                break;
+            }
+        }
+        let at = at.expect("switch");
+        assert!(at >= SUSTAIN && at < SUSTAIN + Duration::from_millis(100), "switched at {at:?}");
+    }
+
+    #[test]
+    fn a_short_late_spell_does_not_switch() {
+        let mut m = SpeedMonitor::new();
+        let t = Instant::now();
+        for i in 0..400u64 {
+            let now = t + Duration::from_millis(i * 16);
+            // Late for 1 s (e.g. after a hiccup), then on time again.
+            let late = if i < 60 { 300 } else { 5 };
+            m.record_frame(now, Duration::from_millis(1), Duration::from_millis(i * 16));
+            m.record_lateness(now, Duration::from_millis(late));
+            assert!(!m.too_slow(now), "switched at frame {i}");
+        }
     }
 
     #[test]

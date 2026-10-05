@@ -390,6 +390,7 @@ impl DecodeLoop {
         }
         let now = Instant::now();
         self.monitor.record_frame(now, cost, pts);
+        self.monitor.record_lateness(now, shared.clock.now().saturating_sub(pts));
         // At most one frame waiting: the renderer is eating frames as fast as we make them.
         let behind = shared.queue.len() <= 1;
         self.monitor.record_drops(now, shared.queue.dropped(), behind);
@@ -546,6 +547,66 @@ mod tests {
             full_range: false,
             pts,
         }
+    }
+
+    /// A backend that opens `NoDecoder` for anything: the fallback target in tests.
+    struct Spare;
+    impl crate::backend::Backend for Spare {
+        fn name(&self) -> &'static str {
+            "spare"
+        }
+        fn priority(&self) -> i32 {
+            0
+        }
+        fn supports_container(&self, _: crate::demux::ContainerFormat) -> bool {
+            false
+        }
+        fn open_demuxer(
+            &self,
+            _: crate::demux::ContainerFormat,
+            _: Box<dyn crate::source::MediaSource>,
+        ) -> Result<Box<dyn Demuxer>> {
+            unreachable!()
+        }
+        fn supports_video(&self, _: &StreamInfo) -> bool {
+            true
+        }
+        fn open_video_decoder(&self, _: &StreamInfo, _: usize) -> Result<Box<dyn VideoDecoder>> {
+            Ok(Box::new(NoDecoder))
+        }
+    }
+
+    #[test]
+    fn frames_staying_behind_the_clock_switch_backend_even_when_cheap() {
+        // Decode cost is negligible and nothing is dropped (one frame consumed per frame made),
+        // but every frame reaches the queue 300 ms behind the playback clock.
+        let clock = Arc::new(MockClock::new());
+        let shared = shared(clock.clone());
+        *shared.state.lock().unwrap() = PlayerState::Playing;
+        shared.ready_generation.store(0, Ordering::SeqCst);
+        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+        let mut registry = Registry::empty();
+        registry.register(Arc::new(Spare));
+        let mut decode = DecodeLoop::new(Box::new(NoDecoder), pool);
+        decode.fallback = Some(Fallback {
+            registry: Arc::new(registry),
+            stream: StreamInfo::new(1, crate::demux::StreamKind::Video, crate::demux::Codec::Av1),
+            threads: 1,
+            order: None,
+            current: "slow",
+        });
+        let start = Instant::now();
+        let mut pts = Duration::ZERO;
+        while decode.fallback.is_some() {
+            assert!(start.elapsed() < Duration::from_secs(4), "never switched");
+            clock.set(pts + Duration::from_millis(300));
+            decode.present(&shared, frame(pts));
+            shared.queue.frame_for(clock.now());
+            pts += Duration::from_millis(16);
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        assert_eq!(*shared.video_backend.lock().unwrap(), Some("spare"));
+        assert_eq!(shared.queue.dropped(), 0, "the drop rule did not do it");
     }
 
     #[test]

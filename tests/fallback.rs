@@ -13,10 +13,13 @@ use video_core::demux::{Codec, ContainerFormat, Demuxer, Packet, StreamInfo};
 use video_core::source::MediaSource;
 use video_core::{Player, PlayerConfig, PlayerEvent, PlayerState, Result, Source};
 
-/// AV1 through rav1d, made `delay` slower per frame.
+/// AV1 through rav1d, made `delay` slower per frame, plus a one-off `stall` before the second
+/// frame (playback has started by then).
 struct Slowed {
     inner: Av1Decoder,
     delay: Duration,
+    stall: Option<Duration>,
+    frames: u32,
 }
 
 impl VideoDecoder for Slowed {
@@ -26,7 +29,9 @@ impl VideoDecoder for Slowed {
     fn receive_frame(&mut self) -> Result<Option<DecodedFrame>> {
         let f = self.inner.receive_frame()?;
         if f.is_some() {
-            std::thread::sleep(self.delay);
+            self.frames += 1;
+            let stall = if self.frames == 2 { self.stall.take().unwrap_or_default() } else { Duration::ZERO };
+            std::thread::sleep(self.delay + stall);
         }
         Ok(f)
     }
@@ -41,6 +46,8 @@ struct Av1Backend {
     priority: i32,
     delay: Duration,
     opened: Arc<AtomicUsize>,
+    /// One-off stall before the second frame.
+    lag: Option<Duration>,
 }
 
 impl Backend for Av1Backend {
@@ -61,25 +68,29 @@ impl Backend for Av1Backend {
     }
     fn open_video_decoder(&self, _: &StreamInfo, threads: usize) -> Result<Box<dyn VideoDecoder>> {
         self.opened.fetch_add(1, Ordering::SeqCst);
-        Ok(Box::new(Slowed { inner: Av1Decoder::new(threads)?, delay: self.delay }))
+        Ok(Box::new(Slowed { inner: Av1Decoder::new(threads)?, delay: self.delay, stall: self.lag, frames: 0 }))
     }
 }
 
-fn registry(slow: &Arc<AtomicUsize>, fast: &Arc<AtomicUsize>) -> Arc<Registry> {
+fn registry(slow: &Arc<AtomicUsize>, fast: &Arc<AtomicUsize>, lag: Option<Duration>) -> Arc<Registry> {
     let mut r = Registry::empty();
     // Native only demuxes here: the two AV1 backends outrank it.
     r.register(Arc::new(NativeBackend));
-    r.register(Arc::new(Av1Backend { name: "slow", priority: 20, delay: Duration::from_millis(50), opened: slow.clone() }));
-    r.register(Arc::new(Av1Backend { name: "fast", priority: 10, delay: Duration::ZERO, opened: fast.clone() }));
+    r.register(Arc::new(Av1Backend { name: "slow", priority: 20, delay: if lag.is_some() { Duration::from_millis(25) } else { Duration::from_millis(50) }, opened: slow.clone(), lag }));
+    r.register(Arc::new(Av1Backend { name: "fast", priority: 10, delay: Duration::ZERO, opened: fast.clone(), lag: None }));
     Arc::new(r)
 }
 
 fn open(auto_fallback: bool) -> (Player, Arc<MockClock>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    open_with(auto_fallback, None)
+}
+
+fn open_with(auto_fallback: bool, lag: Option<Duration>) -> (Player, Arc<MockClock>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let (slow, fast) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let clock = Arc::new(MockClock::new());
     let config = PlayerConfig {
         decoder_threads: 1,
-        registry: Some(registry(&slow, &fast)),
+        registry: Some(registry(&slow, &fast, lag)),
         clock: Some(clock.clone()),
         audio_output: AudioOutputConfig::Disabled,
         auto_fallback,
@@ -132,4 +143,16 @@ fn auto_fallback_off_keeps_the_slow_decoder() {
     let (player, clock, slow, fast) = open(false);
     play_until_end(&player, &clock, |_| {});
     assert_eq!((slow.load(Ordering::SeqCst), fast.load(Ordering::SeqCst)), (1, 0));
+}
+
+/// A decoder fast enough on average (25 ms per 33 ms frame) that fell behind once (an 800 ms
+/// stall after playback started) is replaced. (Which rule fires here depends on timing; the
+/// lateness rule alone is pinned by `pipeline::tests::frames_staying_behind_the_clock_…`.)
+#[test]
+fn decoder_that_fell_behind_is_replaced() {
+    let (player, clock, slow, fast) = open_with(true, Some(Duration::from_millis(800)));
+    let events = player.events();
+    play_until_end(&player, &clock, |_| {});
+    assert_eq!((slow.load(Ordering::SeqCst), fast.load(Ordering::SeqCst)), (1, 1));
+    assert!(events.try_iter().any(|e| matches!(e, PlayerEvent::Warning(w) if w.contains("switching to fast"))));
 }
