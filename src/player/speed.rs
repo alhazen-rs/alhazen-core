@@ -21,11 +21,13 @@ pub(super) struct SpeedMonitor {
     slow_since: Option<Instant>,
     drop_window: Option<(Instant, u64)>,
     drop_streak: u32,
+    /// The decoder was behind at every sample of the current drop window.
+    behind_in_window: bool,
 }
 
 impl SpeedMonitor {
     pub fn new() -> Self {
-        Self { samples: VecDeque::new(), slow_since: None, drop_window: None, drop_streak: 0 }
+        Self { samples: VecDeque::new(), slow_since: None, drop_window: None, drop_streak: 0, behind_in_window: true }
     }
 
     /// Forgets everything: after a seek, a pause, or while buffering.
@@ -40,12 +42,20 @@ impl SpeedMonitor {
         }
     }
 
-    /// `dropped` is the renderer's running count of frames discarded as late.
-    pub fn record_drops(&mut self, now: Instant, dropped: u64) {
+    /// `dropped` is the renderer's running count of frames discarded as late. `decoder_behind`
+    /// says the frame queue was (nearly) empty: only then are drops the decoder's fault. A fast
+    /// decoder keeps the queue full, and drops then just mean the display refreshes slower than
+    /// the video's frame rate (120 fps on a 60 Hz screen) — no reason to switch.
+    pub fn record_drops(&mut self, now: Instant, dropped: u64, decoder_behind: bool) {
         let (start, at_start) = *self.drop_window.get_or_insert((now, dropped));
+        if !decoder_behind {
+            self.behind_in_window = false;
+        }
         if now.duration_since(start) >= DROP_WINDOW {
-            self.drop_streak = if dropped > at_start { self.drop_streak + 1 } else { 0 };
+            let counts = dropped > at_start && self.behind_in_window;
+            self.drop_streak = if counts { self.drop_streak + 1 } else { 0 };
             self.drop_window = Some((now, dropped));
+            self.behind_in_window = true;
         }
     }
 
@@ -134,9 +144,20 @@ mod tests {
         for w in 0..=3u64 {
             assert!(!m.too_slow(t + DROP_WINDOW * w as u32) || w == 3);
             dropped += 2;
-            m.record_drops(t + DROP_WINDOW * w as u32, dropped);
+            m.record_drops(t + DROP_WINDOW * w as u32, dropped, true);
         }
         assert!(m.too_slow(t + DROP_WINDOW * 3));
+    }
+
+    #[test]
+    fn drops_with_a_full_queue_are_the_display_not_the_decoder() {
+        // 120 fps on a 60 Hz screen: every other frame is skipped, but the decoder keeps up.
+        let mut m = SpeedMonitor::new();
+        let t = Instant::now();
+        for w in 0..10u32 {
+            m.record_drops(t + DROP_WINDOW * w, 30 * w as u64, false);
+        }
+        assert!(!m.too_slow(t + DROP_WINDOW * 10));
     }
 
     #[test]
@@ -144,7 +165,7 @@ mod tests {
         let mut m = SpeedMonitor::new();
         let t = Instant::now();
         for (w, dropped) in [(0u32, 0u64), (1, 2), (2, 4), (3, 4), (4, 6), (5, 8)].into_iter() {
-            m.record_drops(t + DROP_WINDOW * w, dropped);
+            m.record_drops(t + DROP_WINDOW * w, dropped, true);
         }
         assert!(!m.too_slow(t + DROP_WINDOW * 5));
     }

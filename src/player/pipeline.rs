@@ -390,7 +390,9 @@ impl DecodeLoop {
         }
         let now = Instant::now();
         self.monitor.record_frame(now, cost, pts);
-        self.monitor.record_drops(now, shared.queue.dropped());
+        // At most one frame waiting: the renderer is eating frames as fast as we make them.
+        let behind = shared.queue.len() <= 1;
+        self.monitor.record_drops(now, shared.queue.dropped(), behind);
         if self.monitor.too_slow(now) {
             self.switch_backend(shared);
         }
