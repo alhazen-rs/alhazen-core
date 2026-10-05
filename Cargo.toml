@@ -7,7 +7,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["native", "http", "audio-output"]
+default = ["native", "http", "audio-output", "ffmpeg-cli"]
 # Pure-Rust, permissively licensed decoders: AV1 (rav1d), VP9 (vp9-mt), VP8 (oximedia-codec),
 # ProRes (oxideav-prores), Opus, Vorbis; MP4/MOV demuxing.
 native = ["dep:rav1d", "dep:vp9-mt", "dep:oximedia-codec", "dep:oxideav-prores", "dep:re_mp4", "dep:opus-pure", "dep:lewton"]
@@ -15,6 +15,9 @@ native = ["dep:rav1d", "dep:vp9-mt", "dep:oximedia-codec", "dep:oxideav-prores",
 # but changes to Symphonia's own files must be shared. Off by default for that reason.
 native-aac = ["dep:symphonia-codec-aac", "dep:symphonia-core"]
 http = ["dep:ureq"]
+# Decode through the user's own `ffmpeg` program (found at runtime; nothing is linked). Used only
+# for codecs no native decoder handles, or when native decoding is too slow (auto fallback).
+ffmpeg-cli = []
 # Sound output through cpal. On Linux this needs ALSA development files (libasound2-dev).
 audio-output = ["dep:cpal"]
 

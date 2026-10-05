@@ -34,12 +34,23 @@ impl Registry {
         Self::default()
     }
 
-    /// Every backend compiled in through Cargo features.
+    /// Every backend compiled in through Cargo features, ffmpeg found the default way.
     pub fn with_defaults() -> Self {
-        #[cfg_attr(not(feature = "native"), allow(unused_mut))]
+        Self::with_ffmpeg(&crate::FfmpegConfig::default())
+    }
+
+    /// Every backend compiled in through Cargo features, with this ffmpeg configuration.
+    pub fn with_ffmpeg(ffmpeg: &crate::FfmpegConfig) -> Self {
+        #[cfg_attr(not(any(feature = "native", feature = "ffmpeg-cli")), allow(unused_mut))]
         let mut r = Self::empty();
         #[cfg(feature = "native")]
         r.register(Arc::new(NativeBackend));
+        #[cfg(feature = "ffmpeg-cli")]
+        if ffmpeg.enabled {
+            r.register(Arc::new(crate::ffmpeg::FfmpegCliBackend::new(ffmpeg.clone())));
+        }
+        #[cfg(not(feature = "ffmpeg-cli"))]
+        let _ = ffmpeg;
         r
     }
 
@@ -238,7 +249,7 @@ mod tests {
     #[cfg(feature = "native")]
     #[test]
     fn native_backend_does_not_claim_h264() {
-        let r = Registry::with_defaults();
+        let r = Registry::with_ffmpeg(&crate::FfmpegConfig { enabled: false, ..Default::default() });
         let h264 = StreamInfo::new(1, StreamKind::Video, Codec::H264);
         assert!(matches!(
             r.open_video_decoder(&h264, 1, None),

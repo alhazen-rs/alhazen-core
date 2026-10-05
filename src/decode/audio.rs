@@ -31,6 +31,8 @@ pub trait AudioDecoder: Send {
     fn receive_samples(&mut self) -> Result<Option<AudioBuffer>>;
     /// Drops all buffered state; called on seek.
     fn flush(&mut self);
+    /// No more packets until the next `flush`; see `VideoDecoder::send_eof`.
+    fn send_eof(&mut self) {}
 }
 
 #[cfg(all(test, feature = "native"))]

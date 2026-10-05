@@ -7,11 +7,13 @@ pub mod convert;
 pub mod decode;
 pub mod demux;
 mod error;
+pub mod ffmpeg;
 pub mod frame;
 mod player;
 pub mod source;
 
 pub use error::{Error, Result};
+pub use ffmpeg::FfmpegConfig;
 pub use frame::VideoFrame;
 pub use player::{Player, PlayerConfig, PlayerEvent, PlayerState, shared_thread_pool};
 pub use source::Source;

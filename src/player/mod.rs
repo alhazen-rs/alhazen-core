@@ -70,6 +70,8 @@ pub struct PlayerConfig {
     pub clock: Option<Arc<dyn Clock>>,
     /// Where audio goes. With an output, audio is the master clock and `clock` is not used.
     pub audio_output: AudioOutputConfig,
+    /// How the `ffmpeg-cli` backend finds ffmpeg (ignored when `registry` is set).
+    pub ffmpeg: crate::FfmpegConfig,
 }
 
 impl Default for PlayerConfig {
@@ -85,6 +87,7 @@ impl Default for PlayerConfig {
             registry: None,
             clock: None,
             audio_output: AudioOutputConfig::Default,
+            ffmpeg: crate::FfmpegConfig::default(),
         }
     }
 }
@@ -261,7 +264,7 @@ impl Player {
     /// Opens the source and probes/creates the demuxer and decoder on the calling thread
     /// (call it off the UI thread), then starts the pipeline threads.
     pub fn open(source: Source, config: PlayerConfig) -> Result<Player> {
-        let registry = config.registry.clone().unwrap_or_else(|| Arc::new(Registry::with_defaults()));
+        let registry = config.registry.clone().unwrap_or_else(|| Arc::new(Registry::with_ffmpeg(&config.ffmpeg)));
         let order = config.backend_order.as_deref();
 
         let mut src = source.open()?;

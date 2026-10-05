@@ -341,6 +341,7 @@ impl DecodeLoop {
     }
 
     fn on_eof(&mut self, shared: &Shared) -> bool {
+        self.decoder.send_eof();
         if !self.drain(shared) {
             return false;
         }

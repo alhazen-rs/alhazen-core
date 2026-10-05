@@ -117,4 +117,7 @@ pub trait VideoDecoder: Send {
     fn receive_frame(&mut self) -> Result<Option<DecodedFrame>>;
     /// Drops all buffered state; called on seek.
     fn flush(&mut self);
+    /// No more packets until the next `flush`: decoders with delayed output (an external
+    /// process) make `receive_frame` wait for and return the rest, then `Ok(None)`.
+    fn send_eof(&mut self) {}
 }

@@ -194,19 +194,28 @@ fn aac_audio_only_m4a_plays() {
     until("sound", 5, || (peak(&play_ms(&null, 50)) > 0.05).then_some(()));
 }
 
+/// No AAC decoder at all: neither `native-aac` nor ffmpeg.
+#[cfg(not(feature = "native-aac"))]
+fn without_ffmpeg() -> PlayerConfig {
+    PlayerConfig {
+        audio_output: AudioOutputConfig::Null(NullOutput::new(RATE, 2)),
+        ffmpeg: video_core::FfmpegConfig { enabled: false, ..Default::default() },
+        ..Default::default()
+    }
+}
+
 #[cfg(not(feature = "native-aac"))]
 #[test]
-fn aac_without_native_aac_plays_video_silently_with_warning() {
-    let (player, _null) = open("av1_aac.mp4");
+fn aac_without_any_decoder_plays_video_silently_with_warning() {
+    let player = Player::open(fixture("av1_aac.mp4"), without_ffmpeg()).unwrap();
     assert!(player.has_video() && !player.has_audio());
     assert!(player.events().try_iter().any(|e| matches!(e, PlayerEvent::Warning(_))));
 }
 
 #[cfg(not(feature = "native-aac"))]
 #[test]
-fn aac_audio_only_without_native_aac_is_an_error() {
-    let config = PlayerConfig { audio_output: AudioOutputConfig::Null(NullOutput::new(RATE, 2)), ..Default::default() };
-    assert!(Player::open(fixture("aac_only.m4a"), config).is_err());
+fn aac_audio_only_without_any_decoder_is_an_error() {
+    assert!(Player::open(fixture("aac_only.m4a"), without_ffmpeg()).is_err());
 }
 
 #[test]
