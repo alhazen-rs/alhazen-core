@@ -20,6 +20,10 @@ fn main() {
     use video_core::mf::{MfAudioDecoder, MfVideoDecoder};
     use video_core::Source;
 
+    if std::env::args().nth(1).as_deref() == Some("--native-type") {
+        native_types(&std::env::args().nth(2).expect("usage: mf-check --native-type <file>"));
+        return;
+    }
     let dir = std::env::args().nth(1).unwrap_or_else(|| "crates/video-core/tests/fixtures".into());
     // (file, track kind, expected frames or audio sample frames, tolerance)
     let cases: &[(&str, StreamKind, usize, usize)] = &[
@@ -129,4 +133,64 @@ fn main() {
         }
     }
     std::process::exit(if failed == 0 { 0 } else { 1 });
+}
+
+/// `mf-check --native-type <file>`: the media types Windows' own demuxer (Source Reader) reports
+/// for each stream, every attribute included. Shows what Windows' decoders expect as input.
+#[cfg(all(windows, feature = "media-foundation", feature = "native"))]
+fn native_types(file: &str) {
+    use windows::Win32::Media::MediaFoundation::*;
+    use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+    use windows::core::{GUID, HSTRING};
+
+    let names: &[(GUID, &str)] = &[
+        (MF_MT_MAJOR_TYPE, "MAJOR_TYPE"),
+        (MF_MT_SUBTYPE, "SUBTYPE"),
+        (MF_MT_AUDIO_SAMPLES_PER_SECOND, "AUDIO_SAMPLES_PER_SECOND"),
+        (MF_MT_AUDIO_NUM_CHANNELS, "AUDIO_NUM_CHANNELS"),
+        (MF_MT_AUDIO_BITS_PER_SAMPLE, "AUDIO_BITS_PER_SAMPLE"),
+        (MF_MT_AUDIO_BLOCK_ALIGNMENT, "AUDIO_BLOCK_ALIGNMENT"),
+        (MF_MT_AUDIO_AVG_BYTES_PER_SECOND, "AUDIO_AVG_BYTES_PER_SECOND"),
+        (MF_MT_AUDIO_CHANNEL_MASK, "AUDIO_CHANNEL_MASK"),
+        (MF_MT_AUDIO_VALID_BITS_PER_SAMPLE, "AUDIO_VALID_BITS_PER_SAMPLE"),
+        (MF_MT_AUDIO_SAMPLES_PER_BLOCK, "AUDIO_SAMPLES_PER_BLOCK"),
+        (MF_MT_USER_DATA, "USER_DATA"),
+        (MF_MT_ALL_SAMPLES_INDEPENDENT, "ALL_SAMPLES_INDEPENDENT"),
+        (MF_MT_FIXED_SIZE_SAMPLES, "FIXED_SIZE_SAMPLES"),
+        (MF_MT_SAMPLE_SIZE, "SAMPLE_SIZE"),
+        (MF_MT_COMPRESSED, "COMPRESSED"),
+        (MF_MT_AUDIO_PREFER_WAVEFORMATEX, "AUDIO_PREFER_WAVEFORMATEX"),
+    ];
+    let path = std::path::absolute(file).expect("path");
+    // SAFETY: COM/MF calls on objects owned here; blob buffers are sized from GetBlobSize.
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        MFStartup(MF_VERSION, MFSTARTUP_FULL).expect("MFStartup");
+        let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), None).expect("Source Reader");
+        for stream in 0u32.. {
+            let Ok(t) = reader.GetNativeMediaType(stream, 0) else { break };
+            println!("stream {stream}:");
+            for i in 0..t.GetCount().unwrap_or(0) {
+                let mut key = GUID::zeroed();
+                if t.GetItemByIndex(i, &mut key, None).is_err() {
+                    continue;
+                }
+                let name = names.iter().find(|(g, _)| *g == key).map(|(_, n)| n.to_string()).unwrap_or(format!("{key:?}"));
+                let value = match t.GetItemType(&key) {
+                    Ok(MF_ATTRIBUTE_UINT32) => t.GetUINT32(&key).map(|v| v.to_string()).unwrap_or_default(),
+                    Ok(MF_ATTRIBUTE_UINT64) => t.GetUINT64(&key).map(|v| v.to_string()).unwrap_or_default(),
+                    Ok(MF_ATTRIBUTE_GUID) => t.GetGUID(&key).map(|v| format!("{v:?}")).unwrap_or_default(),
+                    Ok(MF_ATTRIBUTE_BLOB) => {
+                        let n = t.GetBlobSize(&key).unwrap_or(0) as usize;
+                        let mut b = vec![0u8; n];
+                        let _ = t.GetBlob(&key, &mut b, None);
+                        format!("{n} bytes: {}", b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" "))
+                    }
+                    Ok(other) => format!("(type {})", other.0),
+                    Err(e) => format!("({e})"),
+                };
+                println!("  {name} = {value}");
+            }
+        }
+    }
 }
