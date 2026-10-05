@@ -375,6 +375,8 @@ impl Player {
             // Silence everything already queued; the audio thread re-opens playback for the
             // samples it decodes after this seek.
             out.discard_until.store(u64::MAX, Ordering::SeqCst);
+            // Audio will play again from the target, so it drives the clock again.
+            out.exhausted.store(false, Ordering::SeqCst);
         }
         s.clock.pause();
         s.clock.set(to);

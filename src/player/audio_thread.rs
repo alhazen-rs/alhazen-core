@@ -13,6 +13,38 @@ use crate::decode::{AudioBuffer, AudioDecoder};
 
 const POLL: Duration = Duration::from_millis(50);
 const MAX_DECODE_ERRORS: u32 = 3;
+/// Timestamp differences below this are container rounding, not gaps or overlaps.
+const TOLERANCE: Duration = Duration::from_millis(4);
+
+/// How a decoded buffer lines up with where the audio timeline expects the next sample.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Align {
+    /// Starts where expected (within `TOLERANCE`).
+    Keep,
+    /// Ends before the expected time (seek pre-roll, or an overlap): drop it.
+    Skip,
+    /// Starts this many frames too early: drop them.
+    Drop(usize),
+    /// Starts this many frames too late (a gap, or a skipped packet): play silence first.
+    Silence(usize),
+}
+
+fn frames_between(a: Duration, b: Duration, rate: u32) -> usize {
+    ((b - a).as_nanos() * rate as u128 / 1_000_000_000) as usize
+}
+
+pub(super) fn align(expected: Duration, pts: Duration, frames: usize, rate: u32) -> Align {
+    let end = pts + Duration::from_nanos(frames as u64 * 1_000_000_000 / rate.max(1) as u64);
+    if end <= expected {
+        Align::Skip
+    } else if pts + TOLERANCE < expected {
+        Align::Drop(frames_between(pts, expected, rate))
+    } else if pts > expected + TOLERANCE {
+        Align::Silence(frames_between(expected, pts, rate))
+    } else {
+        Align::Keep
+    }
+}
 
 pub(super) struct AudioLoop {
     decoder: Box<dyn AudioDecoder>,
@@ -20,8 +52,10 @@ pub(super) struct AudioLoop {
     out: Arc<OutputShared>,
     resampler: Option<Resampler>,
     generation: u64,
-    /// Accurate-seek target: samples before it are dropped; a gap after it is filled with silence.
-    target: Option<Duration>,
+    /// Where the next sample belongs on the timeline (the seek target right after a seek).
+    /// Buffers are trimmed or preceded by silence to match it, so gaps, overlaps and skipped
+    /// packets never shift audio against video.
+    expected: Duration,
     /// Frames pushed into the ring so far (the ring's sequence numbers).
     pushed: u64,
     errors: u32,
@@ -35,7 +69,7 @@ impl AudioLoop {
             out: pipe.out,
             resampler: None,
             generation: 0,
-            target: Some(Duration::ZERO),
+            expected: Duration::ZERO,
             pushed: 0,
             errors: 0,
         }
@@ -44,6 +78,10 @@ impl AudioLoop {
     pub fn run(mut self, shared: &Shared, rx: Receiver<Msg>) {
         loop {
             if shared.shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            if self.out.failed.load(Ordering::Relaxed) {
+                shared.disable_audio("audio device lost");
                 return;
             }
             let msg = match rx.recv_timeout(POLL) {
@@ -58,7 +96,7 @@ impl AudioLoop {
                         r.reset();
                     }
                     self.generation = generation;
-                    self.target = Some(target);
+                    self.expected = target;
                     self.errors = 0;
                     // Everything pushed so far predates the seek.
                     self.out.discard_until.store(self.pushed, Ordering::SeqCst);
@@ -108,35 +146,42 @@ impl AudioLoop {
         }
     }
 
-    /// Returns `false` only on shutdown.
+    /// Returns `false` only on shutdown or device loss.
     fn play(&mut self, shared: &Shared, buf: AudioBuffer) -> bool {
         let ch = self.out.channels;
         let rate = buf.rate.max(1);
         let mut samples = remix(&buf.samples, buf.channels, ch);
-        if let Some(target) = self.target {
-            if buf.pts + buf.duration() <= target {
-                return true; // entirely before the seek target
+        let start = match align(self.expected, buf.pts, buf.frames(), rate) {
+            Align::Skip => return true,
+            Align::Keep => buf.pts,
+            Align::Drop(n) => {
+                samples.drain(..(n * ch as usize).min(samples.len()));
+                self.expected
             }
-            let frames_between = |a: Duration, b: Duration| ((b - a).as_nanos() * rate as u128 / 1_000_000_000) as usize;
-            if buf.pts < target {
-                let drop = frames_between(buf.pts, target).min(samples.len() / ch as usize);
-                samples.drain(..drop * ch as usize);
-            } else if buf.pts > target {
-                let gap = frames_between(target, buf.pts);
-                samples.splice(0..0, std::iter::repeat_n(0.0, gap * ch as usize));
+            Align::Silence(n) => {
+                samples.splice(0..0, std::iter::repeat_n(0.0, n * ch as usize));
+                self.expected
             }
-            self.target = None;
-        }
+        };
+        let frames = samples.len() / ch.max(1) as usize;
+        self.expected = start + Duration::from_nanos(frames as u64 * 1_000_000_000 / rate as u64);
         if self.resampler.as_ref().is_none_or(|r| r.rates() != (rate, self.out.rate)) {
             self.resampler = Some(Resampler::new(rate, self.out.rate, ch));
         }
         let samples = self.resampler.as_mut().unwrap().process(&samples);
         let generation = self.generation;
+        let out = self.out.clone();
         let written = push_frames(&mut self.producer, ch, &samples, || {
-            !shared.shutdown.load(Ordering::SeqCst) && shared.generation.load(Ordering::SeqCst) == generation
+            !shared.shutdown.load(Ordering::SeqCst)
+                && !out.failed.load(Ordering::Relaxed)
+                && shared.generation.load(Ordering::SeqCst) == generation
         });
         self.pushed += written as u64;
         if shared.shutdown.load(Ordering::SeqCst) {
+            return false;
+        }
+        if self.out.failed.load(Ordering::Relaxed) {
+            shared.disable_audio("audio device lost");
             return false;
         }
         if written > 0 && !shared.has_video {
@@ -171,11 +216,33 @@ impl AudioLoop {
             if shared.generation.load(Ordering::SeqCst) != self.generation {
                 return true;
             }
-            if self.producer.slots() == capacity || self.out.failed.load(Ordering::Relaxed) {
+            if self.out.failed.load(Ordering::Relaxed) {
+                shared.disable_audio("audio device lost");
+                return false;
+            }
+            if self.producer.slots() == capacity {
+                // Everything was heard: time goes on without audio (e.g. video still playing).
+                self.out.exhausted.store(true, Ordering::SeqCst);
                 shared.stream_finished(self.generation, false);
                 return true;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aligns_buffers_to_the_expected_timeline() {
+        let ms = Duration::from_millis;
+        // 480 frames at 48 kHz = 10 ms buffers.
+        assert_eq!(align(ms(100), ms(100), 480, 48_000), Align::Keep);
+        assert_eq!(align(ms(100), ms(103), 480, 48_000), Align::Keep, "timestamp jitter is ignored");
+        assert_eq!(align(ms(100), ms(120), 480, 48_000), Align::Silence(960), "a 20 ms gap");
+        assert_eq!(align(ms(100), ms(95), 480, 48_000), Align::Drop(240), "a 5 ms overlap");
+        assert_eq!(align(ms(100), ms(80), 480, 48_000), Align::Skip, "entirely in the past");
     }
 }

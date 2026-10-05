@@ -1,6 +1,6 @@
 //! The audio-driven master clock.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,58 +10,67 @@ use crate::clock::{Clock, SystemClock};
 struct Base {
     time: Duration,
     frames: u64,
+    /// Running on wall time (audio failed or ran out).
+    wall: bool,
 }
 
 /// Time = base + frames actually played since `set` / rate − device latency.
-/// Freezes while paused and during underruns. If the device fails, it continues on a wall clock
-/// from where audio stopped.
+/// Freezes while paused and during underruns. When audio can no longer advance time — the device
+/// failed, or the audio stream ended before the video — it continues on a wall clock from where
+/// audio stopped. A seek returns it to audio time unless the device failed.
 pub struct AudioClock {
     out: Arc<OutputShared>,
     base: Mutex<Base>,
     fallback: SystemClock,
-    fell_back: AtomicBool,
 }
 
 impl AudioClock {
     pub(crate) fn new(out: Arc<OutputShared>) -> Self {
         Self {
             out,
-            base: Mutex::new(Base { time: Duration::ZERO, frames: 0 }),
+            base: Mutex::new(Base { time: Duration::ZERO, frames: 0, wall: false }),
             fallback: SystemClock::new(),
-            fell_back: AtomicBool::new(false),
         }
     }
 
-    fn audio_now(&self) -> Duration {
-        let base = self.base.lock().unwrap();
+    fn audio_now(&self, base: &Base) -> Duration {
         let played = self.out.frames_played.load(Ordering::Acquire).saturating_sub(base.frames);
         let played = Duration::from_nanos(played * 1_000_000_000 / self.out.rate.max(1) as u64);
         (base.time + played.saturating_sub(self.out.latency())).max(base.time)
     }
 
-    /// `true` once the device failed and the clock runs on wall time.
+    fn audio_gone(&self) -> bool {
+        self.out.failed.load(Ordering::Relaxed) || self.out.exhausted.load(Ordering::Relaxed)
+    }
+
+    /// `true` while the clock runs on wall time.
     pub fn is_fallback(&self) -> bool {
-        self.fell_back.load(Ordering::Relaxed)
+        let base = self.base.lock().unwrap();
+        base.wall || self.audio_gone()
     }
 }
 
 impl Clock for AudioClock {
     fn now(&self) -> Duration {
-        if self.out.failed.load(Ordering::Relaxed) && !self.fell_back.swap(true, Ordering::AcqRel) {
-            self.fallback.set(self.audio_now());
+        let mut base = self.base.lock().unwrap();
+        if !base.wall && self.audio_gone() {
+            self.fallback.set(self.audio_now(&base));
             if !self.out.paused.load(Ordering::Relaxed) {
                 self.fallback.resume();
             }
+            base.wall = true;
         }
-        if self.is_fallback() { self.fallback.now() } else { self.audio_now() }
+        if base.wall { self.fallback.now() } else { self.audio_now(&base) }
     }
     fn pause(&self) {
+        let _base = self.base.lock().unwrap();
         self.out.paused.store(true, Ordering::Relaxed);
         self.fallback.pause();
     }
     fn resume(&self) {
+        let base = self.base.lock().unwrap();
         self.out.paused.store(false, Ordering::Relaxed);
-        if self.is_fallback() {
+        if base.wall {
             self.fallback.resume();
         }
     }
@@ -70,6 +79,7 @@ impl Clock for AudioClock {
         base.time = t;
         base.frames = self.out.frames_played.load(Ordering::Acquire);
         self.fallback.set(t);
+        base.wall = self.audio_gone();
     }
     fn is_paused(&self) -> bool {
         self.out.paused.load(Ordering::Relaxed)

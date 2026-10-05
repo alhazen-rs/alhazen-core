@@ -12,13 +12,15 @@ struct SampleRef {
     offset: u64,
     size: u64,
     pts: Duration,
+    /// Decode time: the order samples must be read in, whatever the file layout.
+    dts: Duration,
     keyframe: bool,
 }
 
 pub struct Mp4Demuxer {
     src: Box<dyn MediaSource>,
     streams: Vec<StreamInfo>,
-    /// All samples of all tracks in file order.
+    /// All samples of all tracks in decode-time order.
     samples: Vec<SampleRef>,
     cursor: usize,
     video_track: Option<u32>,
@@ -67,10 +69,11 @@ impl Mp4Demuxer {
                 offset: s.offset,
                 size: s.size,
                 pts: ticks(s.composition_timestamp, s.timescale.max(1)),
+                dts: ticks(s.decode_timestamp, s.timescale.max(1)),
                 keyframe: s.is_sync,
             }));
         }
-        samples.sort_by_key(|s| s.offset);
+        let samples = interleave_by_time(samples);
         let video_track = streams.iter().find(|s| s.kind == StreamKind::Video).map(|s| s.id);
         Ok(Self { src, streams, samples, cursor: 0, video_track })
     }
@@ -107,6 +110,14 @@ impl Demuxer for Mp4Demuxer {
         self.cursor = index;
         Ok(self.samples.get(index).map(|s| s.pts).unwrap_or_default())
     }
+}
+
+/// All samples of all tracks in decode-time order. Files usually store tracks interleaved, but
+/// one that stores all video before all audio would otherwise starve the audio clock while video
+/// back-pressure blocks demuxing.
+fn interleave_by_time(mut samples: Vec<SampleRef>) -> Vec<SampleRef> {
+    samples.sort_by_key(|s| (s.dts, s.stream));
+    samples
 }
 
 /// Rebuilds the 2-byte AAC AudioSpecificConfig (object type, frequency index, channel config).
@@ -162,5 +173,22 @@ mod tests {
         assert!(p.keyframe);
         assert_eq!(p.pts, Duration::from_secs(1));
         assert_eq!(d.seek(Duration::from_millis(400)).unwrap(), Duration::ZERO);
+    }
+
+    #[test]
+    fn packets_come_out_in_decode_order_even_if_stored_apart() {
+        // All video stored before all audio in the file; reading must interleave by time,
+        // or the audio clock starves while video back-pressure blocks demuxing.
+        let s = |stream, offset, ms| SampleRef {
+            stream,
+            offset,
+            size: 1,
+            pts: Duration::from_millis(ms),
+            dts: Duration::from_millis(ms),
+            keyframe: true,
+        };
+        let ordered = interleave_by_time(vec![s(1, 0, 0), s(1, 10, 40), s(1, 20, 80), s(2, 100, 0), s(2, 110, 20), s(2, 120, 60)]);
+        let order: Vec<(u32, u128)> = ordered.iter().map(|x| (x.stream, x.dts.as_millis())).collect();
+        assert_eq!(order, [(1, 0), (2, 0), (2, 20), (1, 40), (2, 60), (1, 80)]);
     }
 }

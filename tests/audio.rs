@@ -6,9 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use video_core::audio::{AudioOutputConfig, NullOutput};
-#[cfg(not(feature = "native-aac"))]
-use video_core::PlayerEvent;
-use video_core::{Player, PlayerConfig, PlayerState, Source};
+use video_core::{Player, PlayerConfig, PlayerEvent, PlayerState, Source};
 
 const RATE: u32 = 48_000;
 
@@ -209,4 +207,43 @@ fn aac_without_native_aac_plays_video_silently_with_warning() {
 fn aac_audio_only_without_native_aac_is_an_error() {
     let config = PlayerConfig { audio_output: AudioOutputConfig::Null(NullOutput::new(RATE, 2)), ..Default::default() };
     assert!(Player::open(fixture("aac_only.m4a"), config).is_err());
+}
+
+#[test]
+fn video_keeps_playing_after_a_shorter_audio_track_ends() {
+    // 2 s of video, 1 s of audio: once audio runs out, time must keep going for the video.
+    let (player, null) = open("av1_short_audio.webm");
+    player.play();
+    let mut last = Duration::ZERO;
+    until("end of playback", 15, || {
+        play_ms(&null, 10);
+        if let Some(f) = player.current_frame() {
+            last = last.max(f.pts());
+        }
+        (player.state() == PlayerState::Ended).then_some(())
+    });
+    assert!(last >= Duration::from_millis(1900), "video stopped at {last:?}");
+}
+
+#[test]
+fn device_loss_warns_disables_audio_and_still_ends() {
+    let (player, null) = open("av1_with_audio.webm");
+    let events = player.events();
+    player.play();
+    until("playing", 5, || {
+        play_ms(&null, 10);
+        player.current_frame();
+        (player.position() > Duration::from_millis(200)).then_some(())
+    });
+    null.simulate_device_loss();
+    until("end after device loss", 15, || {
+        std::thread::sleep(Duration::from_millis(10));
+        player.current_frame();
+        (player.state() == PlayerState::Ended).then_some(())
+    });
+    assert!(!player.has_audio(), "audio must be reported as gone");
+    assert!(
+        events.try_iter().any(|e| matches!(&e, PlayerEvent::Warning(w) if w.contains("audio"))),
+        "a Warning must say audio was lost"
+    );
 }

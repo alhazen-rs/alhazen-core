@@ -26,8 +26,11 @@ pub(crate) struct OutputShared {
     pub discard_until: AtomicU64,
     /// Device output latency estimate.
     pub latency_ns: AtomicU64,
-    /// The device reported an error; audio is gone.
+    /// The device reported a fatal error; audio is gone.
     pub failed: AtomicBool,
+    /// Audio played everything it had (end of stream); time must go on without it.
+    /// Cleared by a seek.
+    pub exhausted: AtomicBool,
 }
 
 impl OutputShared {
@@ -41,6 +44,7 @@ impl OutputShared {
             discard_until: AtomicU64::new(0),
             latency_ns: AtomicU64::new(0),
             failed: AtomicBool::new(false),
+            exhausted: AtomicBool::new(false),
         }
     }
 
@@ -201,6 +205,13 @@ mod cpal_output {
         }
     }
 
+    /// Errors after which the stream will not play again. Others (xruns, a changed default
+    /// device while ours still works) are recoverable and must not cost us audio sync.
+    pub(super) fn is_fatal(kind: cpal::ErrorKind) -> bool {
+        use cpal::ErrorKind::*;
+        matches!(kind, DeviceNotAvailable | StreamInvalidated | HostUnavailable)
+    }
+
     /// Opens the default device on a dedicated thread (cpal streams are not `Send` everywhere).
     pub(super) fn open(volume: Arc<Volume>) -> Result<OpenedOutput> {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(Arc<OutputShared>, Producer<f32>)>>();
@@ -238,9 +249,13 @@ mod cpal_output {
         let config = supported.config();
         let (shared, producer, mut renderer) = ring(config.sample_rate, config.channels, volume);
         let failed = shared.clone();
-        let on_error = move |e| {
-            log::warn!("audio output error: {e}");
-            failed.failed.store(true, Ordering::Relaxed);
+        let on_error = move |e: cpal::Error| {
+            if is_fatal(e.kind()) {
+                log::warn!("audio output lost: {e}");
+                failed.failed.store(true, Ordering::Relaxed);
+            } else {
+                log::debug!("audio output hiccup: {e}");
+            }
         };
         let latency = shared.clone();
         let note_latency = move |info: &cpal::OutputCallbackInfo| {
@@ -392,5 +407,14 @@ mod tests {
             asked < 3
         });
         assert_eq!(written, capacity / 2, "fills what fits, then gives up");
+    }
+
+    #[cfg(feature = "audio-output")]
+    #[test]
+    fn only_device_loss_errors_are_fatal() {
+        use cpal::ErrorKind::*;
+        assert!(!cpal_output::is_fatal(Xrun), "an underrun is recoverable");
+        assert!(cpal_output::is_fatal(DeviceNotAvailable));
+        assert!(cpal_output::is_fatal(StreamInvalidated));
     }
 }
