@@ -41,8 +41,18 @@ impl Registry {
 
     /// Every backend compiled in through Cargo features, with this ffmpeg configuration.
     pub fn with_ffmpeg(ffmpeg: &crate::FfmpegConfig) -> Self {
+        Self::with_options(ffmpeg, true)
+    }
+
+    /// Every backend compiled in through Cargo features. `prefer_hardware`: platform decoders
+    /// (Media Foundation on Windows) rank ahead of the native ones for codecs both handle.
+    pub fn with_options(ffmpeg: &crate::FfmpegConfig, prefer_hardware: bool) -> Self {
         #[cfg_attr(not(any(feature = "native", feature = "ffmpeg-cli")), allow(unused_mut))]
         let mut r = Self::empty();
+        #[cfg(all(windows, feature = "media-foundation"))]
+        r.register(Arc::new(crate::mf::MfBackend::new(prefer_hardware)));
+        #[cfg(not(all(windows, feature = "media-foundation")))]
+        let _ = prefer_hardware;
         #[cfg(feature = "native")]
         r.register(Arc::new(NativeBackend));
         #[cfg(feature = "ffmpeg-cli")]
@@ -51,6 +61,15 @@ impl Registry {
         }
         #[cfg(not(feature = "ffmpeg-cli"))]
         let _ = ffmpeg;
+        r
+    }
+
+    /// Only the native backend (demuxers and pure-Rust decoders), when compiled in.
+    pub fn empty_with_native() -> Self {
+        #[cfg_attr(not(feature = "native"), allow(unused_mut))]
+        let mut r = Self::empty();
+        #[cfg(feature = "native")]
+        r.register(Arc::new(NativeBackend));
         r
     }
 

@@ -33,6 +33,9 @@ pub(crate) fn no_window(cmd: &mut Command) {
 
 pub(crate) struct FfmpegProcess<T> {
     child: Child,
+    /// Windows: the kill-on-close job ffmpeg runs in (dropped last, ending its whole tree).
+    #[cfg(windows)]
+    _job: Option<super::job::Job>,
     input: Option<Sender<Vec<u8>>>,
     output: Option<Receiver<T>>,
     stderr: Arc<Mutex<String>>,
@@ -50,8 +53,11 @@ impl<T: Send + 'static> FfmpegProcess<T> {
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
         cmd.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        no_window(&mut cmd);
-        let mut child = cmd.spawn().map_err(|e| Error::Decode(format!("cannot start {}: {e}", program.display())))?;
+        let cannot = |e: std::io::Error| Error::Decode(format!("cannot start {}: {e}", program.display()));
+        #[cfg(windows)]
+        let (mut child, job) = super::job::spawn(&mut cmd).map_err(cannot)?;
+        #[cfg(not(windows))]
+        let mut child = cmd.spawn().map_err(cannot)?;
         let (mut stdin, stdout, mut stderr) =
             (child.stdin.take().unwrap(), child.stdout.take().unwrap(), child.stderr.take().unwrap());
         let (in_tx, in_rx) = crossbeam_channel::bounded::<Vec<u8>>(INPUT_QUEUE);
@@ -86,7 +92,15 @@ impl<T: Send + 'static> FfmpegProcess<T> {
                 }
             }
         })?);
-        Ok(Self { child, input: Some(in_tx), output: Some(out_rx), stderr: tail, threads })
+        Ok(Self {
+            child,
+            #[cfg(windows)]
+            _job: job,
+            input: Some(in_tx),
+            output: Some(out_rx),
+            stderr: tail,
+            threads,
+        })
     }
 
     /// Queues bytes for stdin. While the queue is full, outputs that are already decoded are

@@ -774,4 +774,13 @@ mod tests {
         // ffmpeg tagged the AV1 fixture limited ("tv") range, matrix unspecified.
         assert_eq!((d.streams()[0].color_matrix, d.streams()[0].full_range), (None, Some(false)));
     }
+
+    #[test]
+    fn maps_windows_audio_codecs() {
+        for (name, codec) in [("mp3.mkv", Codec::Mp3), ("ac3.mkv", Codec::Ac3), ("eac3.mkv", Codec::Eac3), ("flac.mkv", Codec::Flac)] {
+            let d = MatroskaDemuxer::open(Box::new(FileSource::open(format!("tests/fixtures/{name}")).unwrap())).unwrap();
+            let s = &d.streams()[0];
+            assert_eq!((s.kind, &s.codec, s.sample_rate, s.channels), (StreamKind::Audio, &codec, 48_000, 2), "{name}");
+        }
+    }
 }

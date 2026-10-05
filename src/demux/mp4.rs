@@ -56,8 +56,12 @@ impl Mp4Demuxer {
             info.duration = Some(ticks(track.duration as i64, timescale));
             info.extradata = track.raw_codec_config(&mp4);
             if let re_mp4::StsdBoxContent::Mp4a(mp4a) = &track.trak(&mp4).mdia.minf.stbl.stsd.contents {
-                // re_mp4 gives no codec string for mp4a; the sample entry itself means AAC.
-                info.codec = Codec::Aac;
+                // re_mp4 gives no codec string for mp4a; the esds object type tells AAC from MP3.
+                let object_type = mp4a_esds(&moov, track.track_id).and_then(parse_esds).map(|(t, _)| t);
+                info.codec = match object_type {
+                    Some(0x69 | 0x6B) => Codec::Mp3,
+                    _ => Codec::Aac,
+                };
                 info.sample_rate = mp4a.samplerate.value() as u32;
                 info.channels = mp4a.channelcount;
                 info.extradata = raw_audio_specific_config(&moov, track.track_id).or_else(|| {
@@ -75,6 +79,18 @@ impl Mp4Demuxer {
             {
                 info.codec = Codec::ProRes;
                 info.kind = StreamKind::Video;
+            }
+            if matches!(info.codec, Codec::Other(_))
+                && let Some((fourcc, entry)) = sample_entry(&moov, track.track_id)
+                && let Some((codec, extradata)) = compressed_audio_entry(fourcc, entry)
+            {
+                info.codec = codec;
+                info.kind = StreamKind::Audio;
+                info.extradata = extradata;
+                // AudioSampleEntry: channelcount at 16, samplerate (16.16) at 24.
+                let u16_at = |at: usize| entry.get(at..at + 2).map(|b| u16::from_be_bytes([b[0], b[1]]));
+                info.channels = u16_at(16).unwrap_or(0);
+                info.sample_rate = u16_at(24).unwrap_or(0) as u32;
             }
             if matches!(info.codec, Codec::Other(_))
                 && let Some((fourcc, entry)) = sample_entry(&moov, track.track_id)
@@ -265,6 +281,24 @@ fn sample_entry(moov: &[u8], track_id: u32) -> Option<(&[u8], &[u8])> {
     boxes(sample_entries(moov, track_id)?).next()
 }
 
+/// Codec and codec setup data of an ISO audio sample entry re_mp4 does not know: ALAC (the
+/// 24-byte ALACSpecificConfig "magic cookie" from its `alac` child box), AC-3, E-AC-3, FLAC
+/// (`dfLa` metadata blocks, prefixed with `fLaC` as in Matroska).
+fn compressed_audio_entry(fourcc: &[u8], e: &[u8]) -> Option<(Codec, Option<Vec<u8>>)> {
+    let kids = e.get(28..).unwrap_or_default();
+    match fourcc {
+        // `alac` box: version/flags, then the ALACSpecificConfig.
+        b"alac" => Some((Codec::Alac, child(kids, b"alac").and_then(|c| c.get(4..)).map(<[u8]>::to_vec))),
+        b"ac-3" => Some((Codec::Ac3, None)),
+        b"ec-3" => Some((Codec::Eac3, None)),
+        b"fLaC" => Some((
+            Codec::Flac,
+            child(kids, b"dfLa").and_then(|d| d.get(4..)).map(|blocks| [b"fLaC".as_slice(), blocks].concat()),
+        )),
+        _ => None,
+    }
+}
+
 /// PCM format, channels and rate of a QuickTime/ISO sound sample entry, if it is PCM.
 fn pcm_entry(fourcc: &[u8], e: &[u8]) -> Option<(PcmFormat, u16, u32)> {
     let u16_at = |at: usize| Some(u16::from_be_bytes(e.get(at..at + 2)?.try_into().ok()?));
@@ -321,6 +355,13 @@ fn sample_entry_fourcc(moov: &[u8], track_id: u32) -> Option<[u8; 4]> {
     kind.try_into().ok()
 }
 
+/// The `esds` box of `track_id`'s `mp4a` sample entry.
+fn mp4a_esds(moov: &[u8], track_id: u32) -> Option<&[u8]> {
+    let mp4a = child(sample_entries(moov, track_id)?, b"mp4a")?;
+    // AudioSampleEntry: 28 bytes of fields before its child boxes.
+    child(mp4a.get(28..)?, b"esds")
+}
+
 /// The raw AudioSpecificConfig of `track_id`'s `mp4a` sample entry.
 fn raw_audio_specific_config(moov: &[u8], track_id: u32) -> Option<Vec<u8>> {
     let mp4a = child(sample_entries(moov, track_id)?, b"mp4a")?;
@@ -330,6 +371,12 @@ fn raw_audio_specific_config(moov: &[u8], track_id: u32) -> Option<Vec<u8>> {
 
 /// The DecSpecificInfo (AudioSpecificConfig) bytes inside an `esds` payload (ISO 14496-1).
 fn parse_esds_asc(esds: &[u8]) -> Option<Vec<u8>> {
+    parse_esds(esds)?.1
+}
+
+/// The esds DecoderConfigDescriptor's objectTypeIndication (0x40 AAC, 0x6B/0x69 MP3, …) and the
+/// DecoderSpecificInfo (AudioSpecificConfig for AAC), if present.
+fn parse_esds(esds: &[u8]) -> Option<(u8, Option<Vec<u8>>)> {
     /// Tag and expandable length (1–4 bytes, high bit = more) at `pos`; returns (tag, len, body start).
     fn descriptor(d: &[u8], pos: usize) -> Option<(u8, usize, usize)> {
         let tag = *d.get(pos)?;
@@ -365,8 +412,11 @@ fn parse_esds_asc(esds: &[u8]) -> Option<Vec<u8>> {
     if tag != 0x04 {
         return None;
     }
-    let (tag, len, start) = descriptor(esds, pos + 13)?; // after the fixed DecoderConfig fields
-    (tag == 0x05).then(|| esds[start..start + len].to_vec())
+    let object_type = *esds.get(pos)?;
+    let specific = descriptor(esds, pos + 13) // after the fixed DecoderConfig fields
+        .filter(|(tag, _, _)| *tag == 0x05)
+        .map(|(_, len, start)| esds[start..start + len].to_vec());
+    Some((object_type, specific))
 }
 
 /// Rebuilds the 2-byte AAC AudioSpecificConfig (object type, frequency index, channel config).
@@ -414,6 +464,25 @@ mod tests {
             let p = d.next_packet().unwrap().unwrap();
             assert_eq!(&p.data[4..8], b"icpf", "{name}: packets are whole ProRes frames");
         }
+    }
+
+    #[test]
+    fn mp3_in_mp4_is_not_aac() {
+        // MP3 in MP4 also uses the `mp4a` sample entry; the esds object type (0x6B) says MP3.
+        let d = Mp4Demuxer::open(Box::new(FileSource::open("tests/fixtures/mp3.mp4").unwrap())).unwrap();
+        let s = &d.streams()[0];
+        assert_eq!((s.kind, &s.codec, s.sample_rate, s.channels), (StreamKind::Audio, &Codec::Mp3, 48_000, 2));
+    }
+
+    #[test]
+    fn alac_track_carries_its_magic_cookie() {
+        let d = Mp4Demuxer::open(Box::new(FileSource::open("tests/fixtures/alac.m4a").unwrap())).unwrap();
+        let s = &d.streams()[0];
+        assert_eq!((s.kind, &s.codec, s.sample_rate, s.channels), (StreamKind::Audio, &Codec::Alac, 48_000, 2));
+        // ALACSpecificConfig: 24 bytes, big-endian frame length 4096 first.
+        let cookie = s.extradata.as_deref().expect("magic cookie");
+        assert_eq!(cookie.len(), 24);
+        assert_eq!(u32::from_be_bytes(cookie[..4].try_into().unwrap()), 4096);
     }
 
     #[test]

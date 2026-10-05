@@ -90,6 +90,10 @@ pub struct PlayerConfig {
     /// frames are scaled down before colour conversion. `None`: full size. Change it while
     /// playing with `Player::set_max_output_size`.
     pub max_output_size: Option<(u32, u32)>,
+    /// Prefer the platform's (GPU) decoders over the native ones for codecs both handle (VP9 and
+    /// AV1 through Media Foundation on Windows). `false` keeps native first. Ignored when
+    /// `registry` is set.
+    pub prefer_hardware: bool,
 }
 
 impl Default for PlayerConfig {
@@ -108,6 +112,7 @@ impl Default for PlayerConfig {
             ffmpeg: crate::FfmpegConfig::default(),
             auto_fallback: true,
             max_output_size: None,
+            prefer_hardware: true,
         }
     }
 }
@@ -352,7 +357,7 @@ impl Player {
     /// Opens the source and probes/creates the demuxer and decoder on the calling thread
     /// (call it off the UI thread), then starts the pipeline threads.
     pub fn open(source: Source, config: PlayerConfig) -> Result<Player> {
-        let registry = config.registry.clone().unwrap_or_else(|| Arc::new(Registry::with_ffmpeg(&config.ffmpeg)));
+        let registry = config.registry.clone().unwrap_or_else(|| Arc::new(Registry::with_options(&config.ffmpeg, config.prefer_hardware)));
         let order = config.backend_order.as_deref();
 
         let mut src = source.open()?;

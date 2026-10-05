@@ -33,6 +33,8 @@ impl Default for FfmpegConfig {
 
 #[cfg(feature = "ffmpeg-cli")]
 mod audio;
+#[cfg(all(windows, feature = "ffmpeg-cli"))]
+mod job;
 #[cfg(feature = "ffmpeg-cli")]
 pub mod locate;
 #[cfg(feature = "ffmpeg-cli")]
@@ -131,6 +133,11 @@ mod backend {
             Codec::Opus => &["opus", "libopus"],
             Codec::Vorbis => &["vorbis", "libvorbis"],
             Codec::Aac => &["aac", "aac_fixed", "libfdk_aac"],
+            Codec::Mp3 => &["mp3", "mp3float"],
+            Codec::Ac3 => &["ac3", "ac3_fixed"],
+            Codec::Eac3 => &["eac3"],
+            Codec::Flac => &["flac"],
+            Codec::Alac => &["alac"],
             Codec::Pcm(_) => &[],
             Codec::Other(id) => match id.as_str() {
                 "V_MPEG1" => &["mpeg1video"],
@@ -138,14 +145,9 @@ mod backend {
                 "V_MPEG4/ISO/ASP" | "V_MPEG4/ISO/SP" | "V_MPEG4/ISO/AP" => &["mpeg4"],
                 "V_THEORA" => &["theora"],
                 "V_MJPEG" => &["mjpeg"],
-                "A_AC3" => &["ac3", "ac3_fixed"],
-                "A_EAC3" => &["eac3"],
                 "A_DTS" => &["dca"],
-                "A_FLAC" => &["flac"],
-                "A_MPEG/L3" => &["mp3", "mp3float"],
                 "A_MPEG/L2" => &["mp2", "mp2float"],
                 "A_TRUEHD" => &["truehd"],
-                "A_ALAC" => &["alac"],
                 _ => &[],
             },
         }
