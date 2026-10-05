@@ -24,8 +24,9 @@ const STALL: Duration = Duration::from_secs(10);
 
 /// A picture from ffmpeg's output, or the reason the stream stopped.
 pub(crate) enum Raw {
-    /// `ms`: the block timestamp, i.e. the input packet's pts in whole milliseconds.
-    Frame { width: u32, height: u32, data: Vec<u8>, ms: u64 },
+    /// `ms`: the block timestamp, i.e. the input packet's pts in whole milliseconds. Colour
+    /// information as ffmpeg tagged its output.
+    Frame { width: u32, height: u32, data: Vec<u8>, ms: u64, matrix: Option<u8>, full_range: Option<bool> },
     Bad(String),
 }
 
@@ -80,8 +81,8 @@ impl FfmpegVideoDecoder {
     }
 
     fn make_frame(&mut self, out: Raw) -> Result<DecodedFrame> {
-        let (width, height, data, ms) = match out {
-            Raw::Frame { width, height, data, ms } => (width, height, data, ms),
+        let (width, height, data, ms, matrix, full_range) = match out {
+            Raw::Frame { width, height, data, ms, matrix, full_range } => (width, height, data, ms, matrix, full_range),
             Raw::Bad(msg) => return Err(Error::Decode(format!("ffmpeg output: {msg}"))),
         };
         let pts = match_pts(&mut self.pending, ms);
@@ -96,8 +97,8 @@ impl FfmpegVideoDecoder {
             layout: PixelLayout::I420,
             planes: [data, u, v],
             strides: [width as usize, cw as usize, cw as usize],
-            matrix: ColorMatrix::guess_for_height(height),
-            full_range: false,
+            matrix: matrix.and_then(ColorMatrix::from_h273).unwrap_or_else(|| ColorMatrix::guess_for_height(height)),
+            full_range: full_range.unwrap_or(false),
             pts,
         }))
     }
@@ -246,7 +247,8 @@ pub(crate) fn read_raw(stdout: ChildStdout, tx: Sender<Raw>) {
             return;
         }
         let ms = p.pts.as_millis() as u64;
-        if tx.send(Raw::Frame { width, height, data: p.data, ms }).is_err() {
+        let (matrix, full_range) = (track.color_matrix, track.full_range);
+        if tx.send(Raw::Frame { width, height, data: p.data, ms, matrix, full_range }).is_err() {
             return;
         }
     }

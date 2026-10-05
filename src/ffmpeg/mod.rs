@@ -132,6 +132,7 @@ mod backend {
                 "V_MPEG2" => &["mpeg2video"],
                 "V_MPEG4/ISO/ASP" | "V_MPEG4/ISO/SP" | "V_MPEG4/ISO/AP" => &["mpeg4"],
                 "V_THEORA" => &["theora"],
+                "V_MJPEG" => &["mjpeg"],
                 "A_AC3" => &["ac3", "ac3_fixed"],
                 "A_EAC3" => &["eac3"],
                 "A_DTS" => &["dca"],

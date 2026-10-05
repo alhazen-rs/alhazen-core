@@ -187,6 +187,26 @@ impl MatroskaDemuxer {
                             match v.id {
                                 id::PIXEL_WIDTH => info.width = self.r.read_uint(known(v)?)? as u32,
                                 id::PIXEL_HEIGHT => info.height = self.r.read_uint(known(v)?)? as u32,
+                                id::COLOUR => {
+                                    let colour_end = v.data_start + known(v)?;
+                                    while self.r.position() < colour_end {
+                                        let c = self.header()?;
+                                        match c.id {
+                                            // 2 = unspecified.
+                                            id::MATRIX_COEFFICIENTS => {
+                                                let m = self.r.read_uint(known(c)?)?;
+                                                info.color_matrix = (m != 2 && m < 256).then_some(m as u8);
+                                            }
+                                            // 0 unspecified, 1 broadcast, 2 full, 3 defined by matrix.
+                                            id::RANGE => match self.r.read_uint(known(c)?)? {
+                                                1 => info.full_range = Some(false),
+                                                2 => info.full_range = Some(true),
+                                                _ => {}
+                                            },
+                                            _ => self.r.skip(known(c)?)?,
+                                        }
+                                    }
+                                }
                                 _ => self.r.skip(known(v)?)?,
                             }
                         }
@@ -742,5 +762,16 @@ mod tests {
         let (plain, laced) = (payloads("tests/fixtures/vorbis_only.webm"), payloads("tests/fixtures/laced_vorbis.webm"));
         assert_eq!(laced.len(), plain.len());
         assert!(laced == plain, "laced frames must split back into the original packets");
+    }
+
+    #[test]
+    fn reads_container_colour_info() {
+        let src = Box::new(FileSource::open("tests/fixtures/mjpeg_full_range.mkv").unwrap());
+        let d = MatroskaDemuxer::open(src).unwrap();
+        assert_eq!(d.streams()[0].full_range, Some(true), "JPEG video is tagged full range");
+        let src = Box::new(FileSource::open("tests/fixtures/av1.webm").unwrap());
+        let d = MatroskaDemuxer::open(src).unwrap();
+        // ffmpeg tagged the AV1 fixture limited ("tv") range, matrix unspecified.
+        assert_eq!((d.streams()[0].color_matrix, d.streams()[0].full_range), (None, Some(false)));
     }
 }

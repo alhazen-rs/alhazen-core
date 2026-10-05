@@ -110,6 +110,43 @@ fn frames_keep_their_timestamps_when_ffmpeg_skips_some() {
     assert_eq!(shown.last(), sent.last(), "the last frame keeps the last timestamp");
 }
 
+/// The first frame ffmpeg decodes from `name`'s video track.
+fn ffmpeg_first_frame(b: &FfmpegCliBackend, name: &str) -> Option<video_core::decode::YuvFrame> {
+    let source = Source::parse(&fixture_path(name)).unwrap();
+    let mut src = source.open().unwrap();
+    let format = video_core::demux::probe(src.as_mut()).unwrap().unwrap();
+    let mut d = video_core::backend::Registry::with_defaults().open_demuxer(&source, format, src, None).unwrap();
+    let stream = d.streams().iter().find(|s| s.kind == StreamKind::Video).unwrap().clone();
+    if !b.supports_video(&stream) {
+        return None;
+    }
+    let mut dec = b.open_video_decoder(&stream, 1).unwrap();
+    while let Some(p) = d.next_packet().unwrap() {
+        if p.stream == stream.id {
+            dec.send_packet(&p).unwrap();
+        }
+    }
+    dec.send_eof();
+    match dec.receive_frame().unwrap() {
+        Some(DecodedFrame::Yuv(f)) => Some(f),
+        None => None,
+    }
+}
+
+/// Colour matrix and range come from the stream (via ffmpeg's output), not a guess by height.
+#[test]
+fn ffmpeg_frames_carry_the_streams_colour_matrix_and_range() {
+    let Some(b) = backend() else { return };
+    let f = ffmpeg_first_frame(&b, "h264_bt709.mp4").unwrap();
+    // 320x240 would be guessed BT.601; the stream says BT.709.
+    assert_eq!((f.matrix, f.full_range), (video_core::decode::ColorMatrix::Bt709, false));
+    let Some(f) = ffmpeg_first_frame(&b, "mjpeg_full_range.mkv") else {
+        eprintln!("skipped MJPEG: no mjpeg decoder");
+        return;
+    };
+    assert!(f.full_range, "JPEG video is full range");
+}
+
 #[test]
 fn decodes_hevc_from_matroska() {
     let Some(b) = backend() else { return };

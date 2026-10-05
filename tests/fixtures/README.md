@@ -108,3 +108,13 @@ ffmpeg -v error -y -f lavfi -i testsrc2=size=128x96:rate=30 -f lavfi -i sine=fre
   endian), `sowt`, `twos`, `fl32` (+`enda`), `raw `; MP4 `ipcm` (+`pcmC`); Matroska `A_PCM/INT/LIT`,
   `A_PCM/INT/BIG`, `A_PCM/FLOAT/IEEE`, 8-bit unsigned `A_PCM/INT/LIT`
 - `prores_pcm.mov`: ProRes Proxy video with 24-bit PCM audio, like camera/editor exports
+
+## Colour-tagged fixtures
+
+```bash
+ffmpeg -v error -y -f lavfi -i testsrc2=size=320x240:rate=30 -t 0.5 -pix_fmt yuv420p -c:v libx264 -preset ultrafast -crf 40 -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv h264_bt709.mp4
+ffmpeg -v error -y -f lavfi -i testsrc2=size=320x240:rate=30 -t 0.2 -pix_fmt yuvj420p -c:v mjpeg -q:v 8 mjpeg_full_range.mkv
+```
+
+- `h264_bt709.mp4`: 320×240 tagged BT.709 (a height-based guess would say BT.601)
+- `mjpeg_full_range.mkv`: full-range (JPEG) MJPEG; Matroska `Colour/Range` = 2

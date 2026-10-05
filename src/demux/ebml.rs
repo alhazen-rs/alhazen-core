@@ -23,6 +23,9 @@ pub mod id {
     pub const VIDEO: u32 = 0xE0;
     pub const PIXEL_WIDTH: u32 = 0xB0;
     pub const PIXEL_HEIGHT: u32 = 0xBA;
+    pub const COLOUR: u32 = 0x55B0;
+    pub const MATRIX_COEFFICIENTS: u32 = 0x55B1;
+    pub const RANGE: u32 = 0x55B9;
     pub const AUDIO: u32 = 0xE1;
     pub const SAMPLING_FREQUENCY: u32 = 0xB5;
     pub const CHANNELS: u32 = 0x9F;

@@ -133,6 +133,11 @@ pub struct StreamInfo {
     pub codec_delay: Duration,
     /// Audio only: how much earlier decoding must start for a seek to be clean (SeekPreRoll).
     pub seek_preroll: Duration,
+    /// Video only: colour matrix as signalled by the container (ITU-T H.273 MatrixCoefficients:
+    /// 1 BT.709, 5/6 BT.601, 9/10 BT.2020), when present.
+    pub color_matrix: Option<u8>,
+    /// Video only: whether samples use the full range (container-signalled), when present.
+    pub full_range: Option<bool>,
 }
 
 impl StreamInfo {
@@ -151,6 +156,8 @@ impl StreamInfo {
             channels: 0,
             codec_delay: Duration::ZERO,
             seek_preroll: Duration::ZERO,
+            color_matrix: None,
+            full_range: None,
         }
     }
 }

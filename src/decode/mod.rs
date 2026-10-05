@@ -64,6 +64,16 @@ pub enum ColorMatrix {
 }
 
 impl ColorMatrix {
+    /// From an ITU-T H.273 MatrixCoefficients value (as in containers and codec headers).
+    pub fn from_h273(m: u8) -> Option<ColorMatrix> {
+        match m {
+            1 => Some(ColorMatrix::Bt709),
+            5 | 6 => Some(ColorMatrix::Bt601),
+            9 | 10 => Some(ColorMatrix::Bt2020),
+            _ => None,
+        }
+    }
+
     /// Fallback when the stream does not say: HD and larger is BT.709, SD is BT.601.
     pub fn guess_for_height(height: u32) -> ColorMatrix {
         if height >= 720 { ColorMatrix::Bt709 } else { ColorMatrix::Bt601 }
