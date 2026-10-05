@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::decode::VideoDecoder;
+use crate::decode::{AudioDecoder, VideoDecoder};
 use crate::demux::{ContainerFormat, Demuxer, StreamInfo};
 use crate::source::{MediaSource, Source};
 use crate::{Error, Result};
@@ -15,6 +15,13 @@ pub trait Backend: Send + Sync {
     fn open_demuxer(&self, format: ContainerFormat, src: Box<dyn MediaSource>) -> Result<Box<dyn Demuxer>>;
     fn supports_video(&self, stream: &StreamInfo) -> bool;
     fn open_video_decoder(&self, stream: &StreamInfo, threads: usize) -> Result<Box<dyn VideoDecoder>>;
+    /// Audio support is optional for a backend.
+    fn supports_audio(&self, _stream: &StreamInfo) -> bool {
+        false
+    }
+    fn open_audio_decoder(&self, _stream: &StreamInfo) -> Result<Box<dyn AudioDecoder>> {
+        Err(Error::Unsupported("audio"))
+    }
 }
 
 #[derive(Clone, Default)]
@@ -84,6 +91,24 @@ impl Registry {
         Err(last_err.unwrap_or(Error::UnsupportedContainer))
     }
 
+    /// Opens an audio decoder for `stream`, trying each capable backend in order.
+    pub fn open_audio_decoder(&self, stream: &StreamInfo, order: Option<&[&'static str]>) -> Result<Box<dyn AudioDecoder>> {
+        let mut tried = Vec::new();
+        let mut last_err = None;
+        for b in self.ordered(order).into_iter().filter(|b| b.supports_audio(stream)) {
+            tried.push(b.name());
+            match b.open_audio_decoder(stream) {
+                Ok(d) => return Ok(d),
+                Err(e) => {
+                    log::warn!("backend {} failed to open {} decoder: {e}", b.name(), stream.codec);
+                    last_err = Some(e);
+                }
+            }
+        }
+        // A decoder that exists but refused this stream says more than "unsupported codec".
+        Err(last_err.unwrap_or(Error::UnsupportedCodec { codec: stream.codec.to_string(), tried_backends: tried }))
+    }
+
     /// Opens a video decoder for `stream`, trying each capable backend in order.
     pub fn open_video_decoder(
         &self,
@@ -129,6 +154,20 @@ impl Backend for NativeBackend {
     }
     fn open_video_decoder(&self, _stream: &StreamInfo, threads: usize) -> Result<Box<dyn VideoDecoder>> {
         Ok(Box::new(crate::decode::Av1Decoder::new(threads)?))
+    }
+    fn supports_audio(&self, stream: &StreamInfo) -> bool {
+        use crate::demux::Codec;
+        matches!(stream.codec, Codec::Opus | Codec::Vorbis) || (cfg!(feature = "native-aac") && stream.codec == Codec::Aac)
+    }
+    fn open_audio_decoder(&self, stream: &StreamInfo) -> Result<Box<dyn AudioDecoder>> {
+        use crate::demux::Codec;
+        Ok(match stream.codec {
+            Codec::Opus => Box::new(crate::decode::OpusAudioDecoder::new(stream)?),
+            Codec::Vorbis => Box::new(crate::decode::VorbisAudioDecoder::new(stream)?),
+            #[cfg(feature = "native-aac")]
+            Codec::Aac => Box::new(crate::decode::AacAudioDecoder::new(stream)?),
+            _ => return Err(Error::Unsupported("audio codec")),
+        })
     }
 }
 

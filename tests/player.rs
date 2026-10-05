@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use video_core::audio::AudioOutputConfig;
 use video_core::clock::MockClock;
 use video_core::{Error, Player, PlayerConfig, PlayerEvent, PlayerState, Source};
 
@@ -13,7 +14,13 @@ fn fixture(name: &str) -> Source {
 
 fn open(name: &str) -> (Player, Arc<MockClock>) {
     let clock = Arc::new(MockClock::new());
-    let config = PlayerConfig { clock: Some(clock.clone()), decoder_threads: 2, ..Default::default() };
+    let config = PlayerConfig {
+        clock: Some(clock.clone()),
+        decoder_threads: 2,
+        // Never touch the real sound device from tests.
+        audio_output: AudioOutputConfig::Disabled,
+        ..Default::default()
+    };
     (Player::open(fixture(name), config).unwrap(), clock)
 }
 
@@ -94,10 +101,10 @@ fn play_after_end_restarts() {
 }
 
 #[test]
-fn audio_track_produces_warning_not_failure() {
+fn disabled_audio_plays_video_only() {
     let (player, _clock) = open("av1_with_audio.webm");
-    let warned = player.events().try_iter().any(|e| matches!(e, PlayerEvent::Warning(_)));
-    assert!(warned);
+    assert!(player.has_video());
+    assert!(!player.has_audio());
     wait_for("first frame", || player.current_frame());
 }
 
@@ -114,7 +121,8 @@ fn truncated_file_ends_in_error_state() {
 
 #[test]
 fn non_video_file_is_rejected() {
-    let err = Player::open(fixture("not_video.bin"), PlayerConfig::default()).err().unwrap();
+    let config = PlayerConfig { audio_output: AudioOutputConfig::Disabled, ..Default::default() };
+    let err = Player::open(fixture("not_video.bin"), config).err().unwrap();
     assert!(matches!(err, Error::UnsupportedContainer));
 }
 
@@ -128,4 +136,10 @@ fn drop_during_playback_joins_threads() {
     let start = Instant::now();
     drop(player);
     assert!(start.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn player_is_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Player>();
 }

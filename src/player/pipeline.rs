@@ -8,10 +8,12 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError};
 
+use super::audio_thread::AudioLoop;
 use super::{Command, PlayerEvent, PlayerState, Shared};
+use crate::audio::OutputShared;
 use crate::convert::yuv_to_bgra;
-use crate::decode::{DecodedFrame, VideoDecoder, YuvFrame};
-use crate::demux::{Demuxer, Packet};
+use crate::decode::{AudioDecoder, DecodedFrame, VideoDecoder, YuvFrame};
+use crate::demux::{Demuxer, Packet, StreamInfo};
 use crate::frame::VideoFrame;
 use crate::{Error, Result};
 
@@ -19,32 +21,85 @@ const POLL: Duration = Duration::from_millis(50);
 /// Consecutive decode errors tolerated before the player gives up.
 const MAX_DECODE_ERRORS: u32 = 3;
 
-enum Msg {
+pub(super) enum Msg {
     Packet(Packet),
     /// A seek happened: drop decoder state; frames before `target` are decoded but not shown.
     Flush { generation: u64, target: Duration },
     Eof { generation: u64 },
 }
 
+/// Everything the audio thread needs.
+pub(crate) struct AudioPipe {
+    pub info: StreamInfo,
+    pub decoder: Box<dyn AudioDecoder>,
+    pub producer: rtrb::Producer<f32>,
+    pub out: Arc<OutputShared>,
+}
+
+/// Where the demux thread sends one stream's packets.
+struct Route {
+    stream: u32,
+    tx: Option<Sender<Msg>>,
+}
+
 pub(super) fn spawn(
     shared: Arc<Shared>,
     demuxer: Box<dyn Demuxer>,
-    decoder: Box<dyn VideoDecoder>,
-    video_stream: u32,
+    video: Option<(u32, Box<dyn VideoDecoder>)>,
+    audio: Option<AudioPipe>,
     commands: Receiver<Command>,
     packet_queue_len: usize,
     pool: Arc<rayon::ThreadPool>,
 ) -> Result<Vec<JoinHandle<()>>> {
-    let (tx, rx) = crossbeam_channel::bounded(packet_queue_len.max(1));
-    let s = shared.clone();
-    let demux = thread::Builder::new()
-        .name("video-demux".into())
-        .spawn(move || guarded(&s, |s| demux_loop(s, demuxer, video_stream, commands, tx)))?;
+    let mut threads = Vec::new();
+    let mut routes = Vec::new();
+    let has_video = video.is_some();
+    if let Some((stream, decoder)) = video {
+        let (tx, rx) = crossbeam_channel::bounded(packet_queue_len.max(1));
+        routes.push(Route { stream, tx: Some(tx) });
+        let s = shared.clone();
+        threads.push(
+            thread::Builder::new()
+                .name("video-decode".into())
+                .spawn(move || guarded(&s, |s| DecodeLoop::new(decoder, pool).run(s, rx)))?,
+        );
+    }
+    let mut seek_preroll = Duration::ZERO;
+    if let Some(pipe) = audio {
+        // With video, the audio channel must never block the demuxer: when video back-pressure
+        // stalls demuxing, audio needs every packet up to that point or the audio clock (and so
+        // video) would stall too. The bounded video channel caps how far ahead that can get.
+        let (tx, rx) = if has_video {
+            crossbeam_channel::unbounded()
+        } else {
+            crossbeam_channel::bounded(packet_queue_len.max(1))
+        };
+        routes.push(Route { stream: pipe.info.id, tx: Some(tx) });
+        if !has_video {
+            seek_preroll = pipe.info.seek_preroll;
+        }
+        let s = shared.clone();
+        threads.push(
+            thread::Builder::new()
+                .name("audio-decode".into())
+                .spawn(move || guarded_audio(&s, |s| AudioLoop::new(pipe).run(s, rx)))?,
+        );
+    }
     let s = shared;
-    let decode = thread::Builder::new()
-        .name("video-decode".into())
-        .spawn(move || guarded(&s, |s| DecodeLoop::new(decoder, pool).run(s, rx)))?;
-    Ok(vec![demux, decode])
+    threads.insert(
+        0,
+        thread::Builder::new()
+            .name("video-demux".into())
+            .spawn(move || guarded(&s, |s| demux_loop(s, demuxer, routes, seek_preroll, commands)))?,
+    );
+    Ok(threads)
+}
+
+/// Like `guarded`, but an audio panic only disables audio.
+fn guarded_audio(shared: &Arc<Shared>, body: impl FnOnce(&Shared)) {
+    if catch_unwind(AssertUnwindSafe(|| body(shared))).is_err() {
+        shared.disable_audio("audio thread panicked");
+    }
 }
 
 /// Converts a panic in a pipeline thread into a player error instead of tearing down the app.
@@ -62,9 +117,9 @@ fn guarded(shared: &Arc<Shared>, body: impl FnOnce(&Shared)) {
 fn demux_loop(
     shared: &Shared,
     mut demuxer: Box<dyn Demuxer>,
-    video_stream: u32,
+    mut routes: Vec<Route>,
+    seek_preroll: Duration,
     commands: Receiver<Command>,
-    tx: Sender<Msg>,
 ) {
     let mut generation = 0;
     let mut eof = false;
@@ -88,11 +143,13 @@ fn demux_loop(
         if let Some(Command::Seek { target, generation: g }) = command {
             generation = g;
             eof = false;
-            if let Err(e) = demuxer.seek(target) {
+            // Audio-only: start early enough for the codec's pre-roll; samples before the target
+            // are decoded and dropped.
+            if let Err(e) = demuxer.seek(target.saturating_sub(seek_preroll)) {
                 shared.fail(e);
                 return;
             }
-            if !send(shared, &tx, &commands, Msg::Flush { generation, target }) {
+            if !broadcast(shared, &mut routes, &commands, |_| Msg::Flush { generation, target }) {
                 return;
             }
             continue;
@@ -101,16 +158,17 @@ fn demux_loop(
             continue;
         }
         match demuxer.next_packet() {
-            Ok(Some(mut p)) if p.stream == video_stream => {
+            Ok(Some(mut p)) => {
                 p.generation = generation;
-                if !send(shared, &tx, &commands, Msg::Packet(p)) {
+                if let Some(route) = routes.iter_mut().find(|r| r.stream == p.stream)
+                    && !send_to(shared, route, &commands, Msg::Packet(p))
+                {
                     return;
                 }
             }
-            Ok(Some(_)) => {} // non-video streams are ignored in phase 1
             Ok(None) => {
                 eof = true;
-                if !send(shared, &tx, &commands, Msg::Eof { generation }) {
+                if !broadcast(shared, &mut routes, &commands, |_| Msg::Eof { generation }) {
                     return;
                 }
             }
@@ -122,22 +180,50 @@ fn demux_loop(
     }
 }
 
-/// Sends with back-pressure. Gives up on the message (returning `true`) if a new command is
-/// waiting, because that command makes it stale. Returns `false` when the pipeline should stop.
-fn send(shared: &Shared, tx: &Sender<Msg>, commands: &Receiver<Command>, mut msg: Msg) -> bool {
+fn broadcast(shared: &Shared, routes: &mut [Route], commands: &Receiver<Command>, msg: impl Fn(u32) -> Msg) -> bool {
+    routes.iter_mut().all(|r| {
+        let m = msg(r.stream);
+        send_to(shared, r, commands, m)
+    })
+}
+
+/// Sends to one route. A closed route (its decoder thread gave up) is dropped silently.
+/// Returns `false` when the pipeline should stop.
+fn send_to(shared: &Shared, route: &mut Route, commands: &Receiver<Command>, msg: Msg) -> bool {
+    let Some(tx) = &route.tx else { return true };
+    match send(shared, tx, commands, msg) {
+        SendOutcome::Sent | SendOutcome::Superseded => true,
+        SendOutcome::Closed => {
+            route.tx = None;
+            !shared.shutdown.load(Ordering::SeqCst)
+        }
+        SendOutcome::Shutdown => false,
+    }
+}
+
+enum SendOutcome {
+    Sent,
+    /// A newer command is waiting, which makes this message stale.
+    Superseded,
+    Closed,
+    Shutdown,
+}
+
+/// Sends with back-pressure, giving up on the message if a new command arrives meanwhile.
+fn send(shared: &Shared, tx: &Sender<Msg>, commands: &Receiver<Command>, mut msg: Msg) -> SendOutcome {
     loop {
         if shared.shutdown.load(Ordering::SeqCst) {
-            return false;
+            return SendOutcome::Shutdown;
         }
         match tx.send_timeout(msg, POLL) {
-            Ok(()) => return true,
+            Ok(()) => return SendOutcome::Sent,
             Err(SendTimeoutError::Timeout(m)) => {
                 if !commands.is_empty() {
-                    return true;
+                    return SendOutcome::Superseded;
                 }
                 msg = m;
             }
-            Err(SendTimeoutError::Disconnected(_)) => return false,
+            Err(SendTimeoutError::Disconnected(_)) => return SendOutcome::Closed,
         }
     }
 }
@@ -273,10 +359,7 @@ impl DecodeLoop {
                 return true;
             }
             if shared.queue.is_empty() {
-                shared.clock.pause();
-                shared.wants_play.store(false, Ordering::SeqCst);
-                shared.set_state(PlayerState::Ended);
-                let _ = shared.events.send(PlayerEvent::Ended);
+                shared.stream_finished(self.generation, true);
                 return true;
             }
             thread::sleep(Duration::from_millis(10));
@@ -297,7 +380,7 @@ impl DecodeLoop {
                 // Superseded by a newer seek: must not touch the clock or the queue.
                 return !shared.shutdown.load(Ordering::SeqCst);
             }
-            if first && f.pts > shared.clock.now() {
+            if first && !shared.audio_master && f.pts > shared.clock.now() {
                 // Seeked before the first frame: start the clock at the first frame instead.
                 shared.clock.set(f.pts);
             }
@@ -353,6 +436,14 @@ mod tests {
             events: crossbeam_channel::unbounded().0,
             duration: None,
             seek_lock: Mutex::new(()),
+            has_video: true,
+            audio_active: AtomicBool::new(false),
+            audio_master: false,
+            audio_out: None,
+            volume: Arc::new(crate::audio::Volume::default()),
+            video_done: AtomicU64::new(u64::MAX),
+            audio_done: AtomicU64::new(u64::MAX),
+            ended_generation: AtomicU64::new(u64::MAX),
         }
     }
 

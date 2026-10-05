@@ -1,5 +1,6 @@
 //! The public `Player`: opens a source, runs the demux/decode threads, exposes frames.
 
+mod audio_thread;
 mod pipeline;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -9,9 +10,10 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 
+use crate::audio::{AudioClock, AudioOutputConfig, OutputShared, Volume, open_output};
 use crate::backend::Registry;
 use crate::clock::{Clock, SystemClock};
-use crate::demux::{self, StreamKind};
+use crate::demux::{self, StreamInfo, StreamKind};
 use crate::frame::{FrameQueue, VideoFrame};
 use crate::source::Source;
 use crate::{Error, Result};
@@ -63,8 +65,11 @@ pub struct PlayerConfig {
     pub autoplay: bool,
     /// `None` uses `Registry::with_defaults()`.
     pub registry: Option<Arc<Registry>>,
+    /// Clock used when audio is not the master (no audio, or audio disabled/unavailable).
     /// `None` uses a `SystemClock`. Tests inject a `MockClock`.
     pub clock: Option<Arc<dyn Clock>>,
+    /// Where audio goes. With an output, audio is the master clock and `clock` is not used.
+    pub audio_output: AudioOutputConfig,
 }
 
 impl Default for PlayerConfig {
@@ -79,6 +84,7 @@ impl Default for PlayerConfig {
             autoplay: false,
             registry: None,
             clock: None,
+            audio_output: AudioOutputConfig::Default,
         }
     }
 }
@@ -122,6 +128,18 @@ pub(crate) struct Shared {
     /// Held while a seek bumps the generation and sets the clock, and while the decode thread
     /// checks its generation before moving the clock, so a superseded frame cannot move it.
     pub seek_lock: Mutex<()>,
+    pub has_video: bool,
+    /// Audio is being played (false if absent, disabled, or given up after errors).
+    pub audio_active: AtomicBool,
+    /// The audio output drives `clock` (an `AudioClock`).
+    pub audio_master: bool,
+    pub audio_out: Option<Arc<OutputShared>>,
+    pub volume: Arc<Volume>,
+    /// Generation in which each stream reached its end and drained (u64::MAX = not yet).
+    pub video_done: AtomicU64,
+    pub audio_done: AtomicU64,
+    /// Generation for which `Ended` was announced (so it is announced once).
+    pub ended_generation: AtomicU64,
 }
 
 impl Shared {
@@ -143,6 +161,42 @@ impl Shared {
         let _ = self.events.send(PlayerEvent::StateChanged(new));
     }
 
+    /// Records that a stream drained to its end in `generation`, and announces `Ended` once every
+    /// active stream has.
+    pub fn stream_finished(&self, generation: u64, video: bool) {
+        let done = if video { &self.video_done } else { &self.audio_done };
+        done.store(generation, Ordering::SeqCst);
+        self.check_ended(generation);
+    }
+
+    pub fn check_ended(&self, generation: u64) {
+        let _guard = self.seek_lock.lock().unwrap();
+        if generation != self.generation.load(Ordering::SeqCst) {
+            return;
+        }
+        let video_ok = !self.has_video || self.video_done.load(Ordering::SeqCst) == generation;
+        let audio_ok = !self.audio_active.load(Ordering::SeqCst) || self.audio_done.load(Ordering::SeqCst) == generation;
+        if !(video_ok && audio_ok) || self.ended_generation.swap(generation, Ordering::SeqCst) == generation {
+            return;
+        }
+        self.clock.pause();
+        self.wants_play.store(false, Ordering::SeqCst);
+        self.set_state(PlayerState::Ended);
+        let _ = self.events.send(PlayerEvent::Ended);
+    }
+
+    /// Stops audio for the rest of playback (errors, device loss); video carries on.
+    pub fn disable_audio(&self, why: &str) {
+        if self.audio_active.swap(false, Ordering::SeqCst) {
+            if let Some(out) = &self.audio_out {
+                // Hands the clock over to wall time from the current position.
+                out.failed.store(true, Ordering::SeqCst);
+            }
+            let _ = self.events.send(PlayerEvent::Warning(format!("audio disabled: {why}")));
+            self.check_ended(self.generation.load(Ordering::SeqCst));
+        }
+    }
+
     pub fn fail(&self, err: Error) {
         let err = Arc::new(err);
         self.clock.pause();
@@ -158,6 +212,8 @@ pub struct Player {
     threads: Vec<JoinHandle<()>>,
     video_size: (u32, u32),
     seekable: bool,
+    /// Keeps the audio device stream alive; dropped after the threads.
+    _audio_guard: Option<Box<dyn Send + Sync>>,
 }
 
 impl Player {
@@ -172,24 +228,50 @@ impl Player {
         let format = demux::probe(src.as_mut())?.ok_or(Error::UnsupportedContainer)?;
         let demuxer = registry.open_demuxer(&source, format, src, order)?;
         let streams = demuxer.streams().to_vec();
-        let video = streams
-            .iter()
-            .find(|s| s.kind == StreamKind::Video)
-            .cloned()
-            .ok_or(Error::Unsupported("media without a video stream"))?;
-        let decoder = registry.open_video_decoder(&video, config.decoder_threads, order)?;
-
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
-        for s in streams.iter().filter(|s| s.kind == StreamKind::Audio) {
-            let _ = event_tx.send(PlayerEvent::Warning(format!(
-                "audio track {} ({}) ignored: audio playback is not supported yet",
-                s.id, s.codec
-            )));
+        let warn = |msg: String| {
+            let _ = event_tx.send(PlayerEvent::Warning(msg));
+        };
+
+        let video = streams.iter().find(|s| s.kind == StreamKind::Video).cloned();
+        let video_decoder = match &video {
+            Some(v) => Some(registry.open_video_decoder(v, config.decoder_threads, order)?),
+            None => None,
+        };
+
+        // Audio: the default-flagged track, else the first one.
+        let audio_streams: Vec<&StreamInfo> = streams.iter().filter(|s| s.kind == StreamKind::Audio).collect();
+        let audio_stream = audio_streams.iter().find(|s| s.default).or(audio_streams.first()).map(|s| (*s).clone());
+        let volume = Arc::new(Volume::default());
+        let mut audio = None;
+        if let Some(a) = &audio_stream
+            && !matches!(config.audio_output, AudioOutputConfig::Disabled)
+        {
+            match registry.open_audio_decoder(a, order) {
+                Ok(decoder) => match open_output(&config.audio_output, volume.clone()) {
+                    Ok(Some(out)) => audio = Some((a.clone(), decoder, out)),
+                    Ok(None) => {}
+                    Err(e) => warn(format!("no audio output ({e}); playing without sound")),
+                },
+                Err(e) if video.is_some() => warn(format!("audio track {} not played: {e}", a.id)),
+                Err(e) => return Err(e),
+            }
+        }
+        if video.is_none() && audio.is_none() {
+            return Err(match audio_stream {
+                Some(_) => Error::Unsupported("audio-only media with audio disabled or no output"),
+                None => Error::Unsupported("media without a playable video or audio stream"),
+            });
         }
 
-        let clock = config.clock.clone().unwrap_or_else(|| Arc::new(SystemClock::new()));
+        let audio_out = audio.as_ref().map(|(_, _, out)| out.shared.clone());
+        let clock: Arc<dyn Clock> = match &audio_out {
+            Some(out) => Arc::new(AudioClock::new(out.clone())),
+            None => config.clock.clone().unwrap_or_else(|| Arc::new(SystemClock::new())),
+        };
         clock.pause();
         clock.set(Duration::ZERO);
+        let duration = video.as_ref().and_then(|v| v.duration).or(audio_stream.as_ref().and_then(|a| a.duration));
         let shared = Arc::new(Shared {
             state: Mutex::new(PlayerState::Paused),
             clock,
@@ -199,17 +281,30 @@ impl Player {
             wants_play: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             last_frame: Mutex::new(None),
-            events: event_tx,
-            duration: video.duration,
+            events: event_tx.clone(),
+            duration,
             seek_lock: Mutex::new(()),
+            has_video: video.is_some(),
+            audio_active: AtomicBool::new(audio.is_some()),
+            audio_master: audio_out.is_some(),
+            audio_out,
+            volume,
+            video_done: AtomicU64::new(u64::MAX),
+            audio_done: AtomicU64::new(u64::MAX),
+            ended_generation: AtomicU64::new(u64::MAX),
         });
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let pool = config.thread_pool.clone().unwrap_or_else(shared_thread_pool);
+        let mut audio_guard = None;
+        let audio_pipe = audio.map(|(info, decoder, out)| {
+            audio_guard = out._guard;
+            pipeline::AudioPipe { info, decoder, producer: out.producer, out: out.shared }
+        });
         let threads = pipeline::spawn(
             shared.clone(),
             demuxer,
-            decoder,
-            video.id,
+            video.as_ref().zip(video_decoder).map(|(v, d)| (v.id, d)),
+            audio_pipe,
             cmd_rx,
             config.packet_queue_len,
             pool,
@@ -220,8 +315,9 @@ impl Player {
             commands: Some(cmd_tx),
             events: event_rx,
             threads,
-            video_size: (video.width, video.height),
+            video_size: video.as_ref().map(|v| (v.width, v.height)).unwrap_or_default(),
             seekable,
+            _audio_guard: audio_guard,
         };
         if config.autoplay {
             player.play();
@@ -275,6 +371,11 @@ impl Player {
         let guard = s.seek_lock.lock().unwrap();
         let generation = s.generation.fetch_add(1, Ordering::SeqCst) + 1;
         s.queue.clear(generation);
+        if let Some(out) = &s.audio_out {
+            // Silence everything already queued; the audio thread re-opens playback for the
+            // samples it decodes after this seek.
+            out.discard_until.store(u64::MAX, Ordering::SeqCst);
+        }
         s.clock.pause();
         s.clock.set(to);
         drop(guard);
@@ -305,6 +406,32 @@ impl Player {
 
     pub fn duration(&self) -> Option<Duration> {
         self.shared.duration
+    }
+
+    pub fn has_video(&self) -> bool {
+        self.shared.has_video
+    }
+
+    /// Whether sound is currently being played.
+    pub fn has_audio(&self) -> bool {
+        self.shared.audio_active.load(Ordering::SeqCst)
+    }
+
+    /// 0.0..=1.0 (clamped). Applied instantly.
+    pub fn set_volume(&self, volume: f32) {
+        self.shared.volume.set(volume);
+    }
+
+    pub fn volume(&self) -> f32 {
+        self.shared.volume.get()
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.shared.volume.set_muted(muted);
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.shared.volume.is_muted()
     }
 
     pub fn video_size(&self) -> Option<(u32, u32)> {
