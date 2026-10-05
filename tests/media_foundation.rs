@@ -123,6 +123,17 @@ fn decode_audio(name: &str) -> Option<(usize, u32, u16, f32)> {
     Some((frames, rate, channels, peak))
 }
 
+/// Runs `f(name)` on its own thread and fails the test, naming the file, if it hangs.
+fn within_30s<T: Send + 'static>(name: &'static str, f: fn(&str) -> T) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(f(name)));
+    match rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(v) => v,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("{name}: still decoding after 30 s"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("{name}: decoding panicked"),
+    }
+}
+
 #[test]
 fn audio_codecs_windows_ships() {
     // 0.5 s of a 440 Hz tone at 48 kHz stereo (AAC: 1 s at 44.1 kHz mono), within codec padding.
@@ -135,7 +146,7 @@ fn audio_codecs_windows_ships() {
         ("alac.m4a", 24_000, 48_000, 2),
         ("h264_aac.mp4", 44_100, 44_100, 1),
     ] {
-        let Some((frames, r, c, peak)) = decode_audio(name) else { continue };
+        let Some((frames, r, c, peak)) = within_30s(name, decode_audio) else { continue };
         eprintln!("{name}: {frames} frames, {r} Hz, {c} ch, peak {peak:.3}");
         assert_eq!((r, c), (rate, channels), "{name}");
         assert!(frames.abs_diff(expect) <= 2 * 1152 + 2048, "{name}: {frames} frames, expected about {expect}");

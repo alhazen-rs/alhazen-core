@@ -74,6 +74,9 @@ pub enum Output {
     StreamChange,
 }
 
+/// Output buffer size when a decoder reports none (0): fits any compressed-audio frame's PCM.
+const MIN_OUTPUT_BUFFER: u32 = 1 << 20;
+
 /// Pulls one output sample, allocating it when the transform does not provide its own.
 pub fn process_output(mft: &IMFTransform) -> Result<Output> {
     // SAFETY: COM calls on a live transform; the output buffer struct owns the sample it
@@ -83,7 +86,7 @@ pub fn process_output(mft: &IMFTransform) -> Result<Output> {
         let provides = info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0 as u32) != 0;
         let mut buffer = MFT_OUTPUT_DATA_BUFFER::default();
         if !provides {
-            let mem = MFCreateMemoryBuffer(info.cbSize.max(1)).map_err(err("output buffer"))?;
+            let mem = MFCreateMemoryBuffer(info.cbSize.max(MIN_OUTPUT_BUFFER)).map_err(err("output buffer"))?;
             let s = MFCreateSample().map_err(err("output sample"))?;
             s.AddBuffer(&mem).map_err(err("add output buffer"))?;
             buffer.pSample = std::mem::ManuallyDrop::new(Some(s));

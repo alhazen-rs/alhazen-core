@@ -129,6 +129,11 @@ impl MfAudioDecoder {
                 // SAFETY: COM call on a live sample.
                 let pts = mft::from_mf_time(unsafe { sample.GetSampleTime() }.unwrap_or(0));
                 let bytes = mft::sample_bytes(&sample)?;
+                if bytes.is_empty() {
+                    // Some decoders answer with empty samples instead of NEED_MORE_INPUT; treating
+                    // them as progress made the decode loops spin forever.
+                    return Ok(false);
+                }
                 let samples = pcm_to_f32(&bytes, s.int_bits);
                 self.ready.push_back(AudioBuffer { rate: s.rate, channels: s.channels, samples, pts });
                 Ok(true)
