@@ -128,7 +128,8 @@ impl Registry {
     }
 }
 
-/// Pure-Rust backend: Matroska/WebM + MP4 demuxing; AV1 (rav1d) and VP9 (vp9-mt) decoding.
+/// Pure-Rust backend: Matroska/WebM + MP4/MOV demuxing; AV1 (rav1d), VP9 (vp9-mt),
+/// VP8 (oximedia-codec) and ProRes (oxideav-prores) decoding.
 #[cfg(feature = "native")]
 pub struct NativeBackend;
 
@@ -151,13 +152,15 @@ impl Backend for NativeBackend {
     }
     fn supports_video(&self, stream: &StreamInfo) -> bool {
         use crate::demux::Codec;
-        matches!(stream.codec, Codec::Av1 | Codec::Vp9)
+        matches!(stream.codec, Codec::Av1 | Codec::Vp9 | Codec::Vp8 | Codec::ProRes)
     }
     fn open_video_decoder(&self, stream: &StreamInfo, threads: usize) -> Result<Box<dyn VideoDecoder>> {
         use crate::demux::Codec;
         Ok(match stream.codec {
             Codec::Av1 => Box::new(crate::decode::Av1Decoder::new(threads)?),
             Codec::Vp9 => Box::new(crate::decode::Vp9Decoder::new(threads)),
+            Codec::Vp8 => Box::new(crate::decode::Vp8Decoder::new()?),
+            Codec::ProRes => Box::new(crate::decode::ProResDecoder::new()),
             _ => return Err(Error::Unsupported("video codec")),
         })
     }

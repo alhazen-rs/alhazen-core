@@ -67,6 +67,15 @@ impl Mp4Demuxer {
                     })
                 });
             }
+            // re_mp4 only knows a few sample entries; QuickTime ProRes tracks come out as
+            // "unknown" with no kind, so read the sample entry's FourCC ourselves.
+            if matches!(info.codec, Codec::Other(_))
+                && let Some(fourcc) = sample_entry_fourcc(&moov, track.track_id)
+                && let Codec::ProRes = Codec::from_mp4_codec_string(&String::from_utf8_lossy(&fourcc))
+            {
+                info.codec = Codec::ProRes;
+                info.kind = StreamKind::Video;
+            }
             streams.push(info);
             samples.extend(track.samples.iter().map(|s| SampleRef {
                 stream: track.track_id,
@@ -183,8 +192,8 @@ fn child<'a>(data: &'a [u8], kind: &[u8]) -> Option<&'a [u8]> {
     boxes(data).find(|(k, _)| *k == kind).map(|(_, p)| p)
 }
 
-/// The raw AudioSpecificConfig of `track_id`'s `mp4a` sample entry.
-fn raw_audio_specific_config(moov: &[u8], track_id: u32) -> Option<Vec<u8>> {
+/// The sample entries (payload of `stsd` after version/flags and entry count) of `track_id`.
+fn sample_entries(moov: &[u8], track_id: u32) -> Option<&[u8]> {
     let trak = boxes(moov).filter(|(k, _)| *k == b"trak").map(|(_, p)| p).find(|trak| {
         child(trak, b"tkhd").and_then(|tkhd| {
             let at = if tkhd.first() == Some(&1) { 20 } else { 12 };
@@ -192,8 +201,18 @@ fn raw_audio_specific_config(moov: &[u8], track_id: u32) -> Option<Vec<u8>> {
         }) == Some(track_id)
     })?;
     let stsd = child(child(child(child(trak, b"mdia")?, b"minf")?, b"stbl")?, b"stsd")?;
-    // stsd: version/flags + entry count, then sample entries.
-    let mp4a = child(stsd.get(8..)?, b"mp4a")?;
+    stsd.get(8..)
+}
+
+/// The FourCC of `track_id`'s first sample entry (e.g. `apch`).
+fn sample_entry_fourcc(moov: &[u8], track_id: u32) -> Option<[u8; 4]> {
+    let (kind, _) = boxes(sample_entries(moov, track_id)?).next()?;
+    kind.try_into().ok()
+}
+
+/// The raw AudioSpecificConfig of `track_id`'s `mp4a` sample entry.
+fn raw_audio_specific_config(moov: &[u8], track_id: u32) -> Option<Vec<u8>> {
+    let mp4a = child(sample_entries(moov, track_id)?, b"mp4a")?;
     // AudioSampleEntry: 28 bytes of fields before its child boxes.
     parse_esds_asc(child(mp4a.get(28..)?, b"esds")?)
 }
@@ -272,6 +291,18 @@ mod tests {
         }
         assert_eq!(n, 60);
         assert_eq!(first, Some(true));
+    }
+
+    #[test]
+    fn quicktime_prores_track_is_video() {
+        for name in ["prores_hq.mov", "prores_4444.mov"] {
+            let src = Box::new(FileSource::open(format!("tests/fixtures/{name}")).unwrap());
+            let mut d = Mp4Demuxer::open(src).unwrap();
+            let s = &d.streams()[0];
+            assert_eq!((s.kind, &s.codec, s.width, s.height), (StreamKind::Video, &Codec::ProRes, 192, 128), "{name}");
+            let p = d.next_packet().unwrap().unwrap();
+            assert_eq!(&p.data[4..8], b"icpf", "{name}: packets are whole ProRes frames");
+        }
     }
 
     #[test]

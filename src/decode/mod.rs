@@ -12,9 +12,13 @@ mod opus;
 #[cfg(feature = "native")]
 mod planar;
 #[cfg(feature = "native")]
+mod prores;
+#[cfg(feature = "native")]
 mod opus_multistream;
 #[cfg(feature = "native")]
 mod vorbis;
+#[cfg(feature = "native")]
+mod vp8;
 #[cfg(feature = "native")]
 mod vp9;
 
@@ -29,6 +33,10 @@ pub use av1::Av1Decoder;
 pub use opus::OpusAudioDecoder;
 #[cfg(feature = "native")]
 pub use vorbis::VorbisAudioDecoder;
+#[cfg(feature = "native")]
+pub use prores::ProResDecoder;
+#[cfg(feature = "native")]
+pub use vp8::Vp8Decoder;
 #[cfg(feature = "native")]
 pub use vp9::Vp9Decoder;
 

@@ -31,6 +31,8 @@ pub enum Codec {
     Vp9,
     H264,
     Hevc,
+    /// Apple ProRes (any 422/4444 profile).
+    ProRes,
     Opus,
     Vorbis,
     Aac,
@@ -46,6 +48,7 @@ impl Codec {
             "V_VP9" => Codec::Vp9,
             "V_MPEG4/ISO/AVC" => Codec::H264,
             "V_MPEGH/ISO/HEVC" => Codec::Hevc,
+            "V_PRORES" => Codec::ProRes,
             "A_OPUS" => Codec::Opus,
             "A_VORBIS" => Codec::Vorbis,
             id if id.starts_with("A_AAC") => Codec::Aac,
@@ -62,6 +65,7 @@ impl Codec {
             "vp09" => Codec::Vp9,
             "avc1" | "avc3" => Codec::H264,
             "hvc1" | "hev1" => Codec::Hevc,
+            "apco" | "apcs" | "apcn" | "apch" | "ap4h" | "ap4x" => Codec::ProRes,
             "Opus" | "opus" => Codec::Opus,
             "mp4a" => Codec::Aac,
             _ => Codec::Other(s.to_owned()),
@@ -162,7 +166,8 @@ pub fn probe(src: &mut dyn MediaSource) -> Result<Option<ContainerFormat>> {
     if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
         return Ok(Some(ContainerFormat::Matroska));
     }
-    if head.len() >= 8 && matches!(&head[4..8], b"ftyp" | b"moov" | b"styp") {
+    // QuickTime files may start with `wide`/`mdat`/`free` before `moov`.
+    if head.len() >= 8 && matches!(&head[4..8], b"ftyp" | b"moov" | b"styp" | b"wide" | b"mdat" | b"free") {
         return Ok(Some(ContainerFormat::Mp4));
     }
     Ok(None)
@@ -182,6 +187,7 @@ mod tests {
     fn probes_by_magic_bytes() {
         assert_eq!(probe_path("tests/fixtures/av1.webm"), Some(ContainerFormat::Matroska));
         assert_eq!(probe_path("tests/fixtures/av1.mp4"), Some(ContainerFormat::Mp4));
+        assert_eq!(probe_path("tests/fixtures/prores_hq.mov"), Some(ContainerFormat::Mp4));
         assert_eq!(probe_path("tests/fixtures/not_video.bin"), None);
     }
 
@@ -192,6 +198,8 @@ mod tests {
         assert_eq!(Codec::from_mp4_codec_string("av01.0.00M.08"), Codec::Av1);
         assert_eq!(Codec::from_mp4_codec_string("avc1.64001f"), Codec::H264);
         assert_eq!(Codec::from_mp4_codec_string("xyz1"), Codec::Other("xyz1".into()));
+        assert_eq!(Codec::from_matroska_id("V_PRORES"), Codec::ProRes);
+        assert_eq!(Codec::from_mp4_codec_string("ap4h"), Codec::ProRes);
         assert_eq!(Codec::Vp9.to_string(), "Vp9");
     }
 }
