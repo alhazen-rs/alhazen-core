@@ -97,6 +97,34 @@ impl Renderer {
     }
 }
 
+/// Renders into an f32 scratch buffer and converts to a device's integer sample format.
+/// The scratch is sized once (half a second) so the real-time callback never allocates.
+#[cfg(any(feature = "audio-output", test))]
+pub(crate) struct Converter {
+    scratch: Vec<f32>,
+}
+
+#[cfg(any(feature = "audio-output", test))]
+impl Converter {
+    pub fn new(rate: u32, channels: u16) -> Self {
+        Self { scratch: Vec::with_capacity((rate as usize / 2).max(1) * channels.max(1) as usize) }
+    }
+
+    #[cfg(test)]
+    pub fn capacity(&self) -> usize {
+        self.scratch.capacity()
+    }
+
+    pub fn render_into<T>(&mut self, renderer: &mut Renderer, data: &mut [T], convert: impl Fn(f32) -> T) {
+        // Within capacity this only writes zeros; it allocates only for a callback longer than 0.5 s.
+        self.scratch.resize(data.len(), 0.0);
+        renderer.render(&mut self.scratch);
+        for (d, s) in data.iter_mut().zip(&self.scratch) {
+            *d = convert(s.clamp(-1.0, 1.0));
+        }
+    }
+}
+
 /// What a player gets from opening an output.
 pub(crate) struct OpenedOutput {
     pub shared: Arc<OutputShared>,
@@ -274,32 +302,24 @@ mod cpal_output {
                 None,
             ),
             cpal::SampleFormat::I16 => {
-                let mut scratch = Vec::new();
+                let mut conv = Converter::new(config.sample_rate, config.channels);
                 device.build_output_stream(
                     config,
                     move |data: &mut [i16], info| {
                         note_latency(info);
-                        scratch.resize(data.len(), 0.0);
-                        renderer.render(&mut scratch);
-                        for (d, s) in data.iter_mut().zip(&scratch) {
-                            *d = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-                        }
+                        conv.render_into(&mut renderer, data, |s| (s * i16::MAX as f32) as i16);
                     },
                     on_error,
                     None,
                 )
             }
             cpal::SampleFormat::U16 => {
-                let mut scratch = Vec::new();
+                let mut conv = Converter::new(config.sample_rate, config.channels);
                 device.build_output_stream(
                     config,
                     move |data: &mut [u16], info| {
                         note_latency(info);
-                        scratch.resize(data.len(), 0.0);
-                        renderer.render(&mut scratch);
-                        for (d, s) in data.iter_mut().zip(&scratch) {
-                            *d = ((s.clamp(-1.0, 1.0) + 1.0) * 0.5 * u16::MAX as f32) as u16;
-                        }
+                        conv.render_into(&mut renderer, data, |s| ((s + 1.0) * 0.5 * u16::MAX as f32) as u16);
                     },
                     on_error,
                     None,
@@ -439,5 +459,19 @@ mod tests {
             start.elapsed() < Duration::from_millis(200)
         });
         assert!(wakeups <= 15, "{wakeups} wake-ups in 200 ms while paused (was polling every 2 ms)");
+    }
+
+    #[test]
+    fn integer_conversion_never_allocates_in_the_callback() {
+        let (_null, mut out, _) = attached();
+        out.shared.paused.store(false, Ordering::Relaxed);
+        push_frames(&mut out.producer, &out.shared, &[0.5; 400], || true);
+        let mut renderer = Renderer { consumer: RingBuffer::new(8).1, shared: out.shared.clone(), consumed: 0 };
+        // Sized for half a second at 1 kHz stereo, like the device setup does.
+        let mut conv = Converter::new(1000, 2);
+        let before = conv.capacity();
+        let mut data = vec![0i16; 960];
+        conv.render_into(&mut renderer, &mut data, |s| (s * i16::MAX as f32) as i16);
+        assert_eq!(conv.capacity(), before, "the callback reallocated its scratch buffer");
     }
 }
