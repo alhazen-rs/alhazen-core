@@ -408,6 +408,7 @@ impl DecodeLoop {
                     f.current
                 )));
                 self.decoder = decoder;
+                *shared.video_backend.lock().unwrap() = Some(name);
                 if shared.seekable {
                     // Restart decoding from where playback is: the demuxer goes back to the
                     // keyframe before it and frames up to here are decoded but not shown.
@@ -530,6 +531,7 @@ mod tests {
             ended_generation: AtomicU64::new(u64::MAX),
             commands: crossbeam_channel::unbounded().0,
             seekable: true,
+            video_backend: Mutex::new(None),
         }
     }
 

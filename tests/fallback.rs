@@ -109,6 +109,7 @@ fn play_until_end(player: &Player, clock: &MockClock, mut each: impl FnMut(Durat
 fn too_slow_decoder_is_replaced_once_and_playback_continues() {
     let (player, clock, slow, fast) = open(true);
     let events = player.events();
+    assert_eq!(player.stats().video_backend, Some("slow"));
     let mut shown = vec![];
     play_until_end(&player, &clock, |pts| {
         if shown.last() != Some(&pts) {
@@ -116,6 +117,7 @@ fn too_slow_decoder_is_replaced_once_and_playback_continues() {
         }
     });
     assert_eq!((slow.load(Ordering::SeqCst), fast.load(Ordering::SeqCst)), (1, 1), "exactly one switch");
+    assert_eq!(player.stats().video_backend, Some("fast"), "stats report the backend in use");
     let warnings: Vec<String> =
         events.try_iter().filter_map(|e| if let PlayerEvent::Warning(w) = e { Some(w) } else { None }).collect();
     assert_eq!(warnings.len(), 1, "{warnings:?}");

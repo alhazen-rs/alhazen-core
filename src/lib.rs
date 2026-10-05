@@ -15,5 +15,5 @@ pub mod source;
 pub use error::{Error, Result};
 pub use ffmpeg::FfmpegConfig;
 pub use frame::VideoFrame;
-pub use player::{Player, PlayerConfig, PlayerEvent, PlayerState, shared_thread_pool};
+pub use player::{Player, PlayerConfig, PlayerEvent, PlayerState, PlayerStats, shared_thread_pool};
 pub use source::Source;

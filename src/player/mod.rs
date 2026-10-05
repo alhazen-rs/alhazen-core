@@ -53,6 +53,15 @@ pub enum PlayerEvent {
     Ended,
 }
 
+/// Diagnostics for a playing `Player`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PlayerStats {
+    /// The backend decoding video (`"native"`, `"ffmpeg-cli"`, …), if there is video.
+    pub video_backend: Option<&'static str>,
+    /// Frames decoded but never shown because a later one was already due.
+    pub frames_dropped: u64,
+}
+
 #[derive(Clone)]
 pub struct PlayerConfig {
     /// Threads used inside the video decoder.
@@ -161,6 +170,8 @@ pub(crate) struct Shared {
     /// To the demux thread (seeks).
     pub commands: Sender<Command>,
     pub seekable: bool,
+    /// Name of the backend decoding video (changes on a speed fallback).
+    pub video_backend: Mutex<Option<&'static str>>,
 }
 
 impl Shared {
@@ -382,6 +393,7 @@ impl Player {
             ended_generation: AtomicU64::new(u64::MAX),
             commands: cmd_tx,
             seekable,
+            video_backend: Mutex::new(video_decoder.as_ref().map(|(name, _)| *name)),
         });
         let pool = config.thread_pool.clone().unwrap_or_else(shared_thread_pool);
         let mut audio_guard = None;
@@ -460,6 +472,13 @@ impl Player {
 
     pub fn state(&self) -> PlayerState {
         self.shared.state()
+    }
+
+    pub fn stats(&self) -> PlayerStats {
+        PlayerStats {
+            video_backend: *self.shared.video_backend.lock().unwrap(),
+            frames_dropped: self.shared.queue.dropped(),
+        }
     }
 
     pub fn position(&self) -> Duration {
