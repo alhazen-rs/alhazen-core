@@ -203,4 +203,25 @@ pub(crate) mod tests {
         let make = |s: &StreamInfo| -> Result<Box<dyn AudioDecoder>> { Ok(Box::new(crate::decode::VorbisAudioDecoder::new(s)?)) };
         assert_matches_reference("tests/fixtures/chirp_vorbis.webm", make, &[(0, 576), (13, 1024), (36, 1024), (60, 1024)]);
     }
+
+    #[test]
+    fn only_mapping_family_1_is_reordered() {
+        // Same 5.1 stream, header relabelled as mapping family 255 (application-defined order):
+        // channels must come out exactly as stored, so the centre tone stays on channel 1.
+        let (_, bufs) = decode_file("tests/fixtures/opus_51_center.webm", |s| {
+            let mut s = s.clone();
+            s.extradata.as_mut().unwrap()[18] = 255;
+            Ok(Box::new(crate::decode::OpusAudioDecoder::new(&s)?))
+        });
+        let mut energy = [0f32; 6];
+        for b in &bufs {
+            for f in b.samples.chunks(6) {
+                for (e, s) in energy.iter_mut().zip(f) {
+                    *e += s * s;
+                }
+            }
+        }
+        let loudest = energy.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+        assert_eq!(loudest, 1, "family 255 must not be reordered, energies {energy:?}");
+    }
 }

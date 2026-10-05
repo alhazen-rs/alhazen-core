@@ -21,6 +21,8 @@ const MAX_FRAMES: usize = 5_760;
 pub(crate) struct OpusHead {
     pub channels: u16,
     pub pre_skip: u16,
+    /// Channel mapping family: 0 mono/stereo, 1 Vorbis-order surround, 2/3 ambisonics, 255 custom.
+    pub family: u8,
     /// (stream count, coupled count, channel mapping) for mapping family != 0.
     pub multistream: Option<(u8, u8, Vec<u8>)>,
 }
@@ -37,10 +39,14 @@ pub(crate) fn parse_opus_head(b: &[u8]) -> Option<OpusHead> {
     } else {
         let streams = *b.get(19)?;
         let coupled = *b.get(20)?;
+        // RFC 7845 §5.1.1: at least one stream, coupled ≤ streams, streams + coupled ≤ 255.
+        if streams == 0 || coupled > streams || streams as u16 + coupled as u16 > 255 {
+            return None;
+        }
         let mapping = b.get(21..21 + channels as usize)?.to_vec();
         Some((streams, coupled, mapping))
     };
-    Some(OpusHead { channels, pre_skip, multistream })
+    Some(OpusHead { channels, pre_skip, family, multistream })
 }
 
 enum Inner {
@@ -59,6 +65,8 @@ pub struct OpusAudioDecoder {
     /// Matroska block times are offset by the codec delay (= pre-skip); presentation time is
     /// block time minus this, as ffmpeg's decoder reports it.
     codec_delay: Duration,
+    /// Reorder surround output from Vorbis order to WAVE order (mapping family 1).
+    reorder: bool,
     out: VecDeque<AudioBuffer>,
     pcm: Vec<f32>,
 }
@@ -71,6 +79,8 @@ impl OpusAudioDecoder {
             Some(h) => h.pre_skip as usize,
             None => (stream.codec_delay.as_nanos() * RATE as u128 / 1_000_000_000) as usize,
         };
+        // Only family 1 uses the Vorbis channel order; 2/3 (ambisonics) and 255 stay as stored.
+        let reorder = head.as_ref().is_some_and(|h| h.family == 1);
         let inner = match head.and_then(|h| h.multistream) {
             // Our own multistream layer: honors whatever stream counts and mapping OpusHead declares.
             Some((streams, coupled, mapping)) => Inner::Multi(
@@ -90,6 +100,7 @@ impl OpusAudioDecoder {
             pre_skip,
             skip: pre_skip,
             codec_delay: stream.codec_delay,
+            reorder,
             out: VecDeque::new(),
             pcm: vec![0.0; MAX_FRAMES * channels as usize],
         })
@@ -117,7 +128,8 @@ impl AudioDecoder for OpusAudioDecoder {
                 rate: RATE,
                 channels: self.channels,
                 samples: match self.inner {
-                    Inner::Multi(_) => to_wave_order(samples, self.channels),
+                    Inner::Multi(_) if self.reorder => to_wave_order(samples, self.channels),
+                    Inner::Multi(_) => samples,
                     Inner::Single(_) => samples,
                 },
                 pts: (packet.pts + Duration::from_nanos(drop as u64 * 1_000_000_000 / RATE as u64))
@@ -151,12 +163,25 @@ mod tests {
     fn parses_opus_head() {
         let mut stereo = b"OpusHead".to_vec();
         stereo.extend([1, 2, 0x38, 0x01, 0x80, 0xBB, 0, 0, 0, 0, 0]);
-        assert_eq!(parse_opus_head(&stereo), Some(OpusHead { channels: 2, pre_skip: 312, multistream: None }));
+        assert_eq!(parse_opus_head(&stereo), Some(OpusHead { channels: 2, pre_skip: 312, family: 0, multistream: None }));
         let mut surround = b"OpusHead".to_vec();
         surround.extend([1, 6, 0x38, 0x01, 0x80, 0xBB, 0, 0, 0, 0, 1, 4, 2, 0, 4, 1, 2, 3, 5]);
         let head = parse_opus_head(&surround).unwrap();
         assert_eq!(head.multistream, Some((4, 2, vec![0, 4, 1, 2, 3, 5])));
         assert_eq!(parse_opus_head(b"OpusTags........."), None);
         assert_eq!(parse_opus_head(&surround[..20]), None, "truncated mapping");
+    }
+
+    #[test]
+    fn rejects_impossible_stream_counts() {
+        let head = |streams: u8, coupled: u8| {
+            let mut h = b"OpusHead".to_vec();
+            h.extend([1, 2, 0x38, 0x01, 0x80, 0xBB, 0, 0, 0, 0, 1, streams, coupled, 0, 1]);
+            h
+        };
+        assert!(parse_opus_head(&head(1, 1)).is_some());
+        assert_eq!(parse_opus_head(&head(200, 100)), None, "streams + coupled > 255");
+        assert_eq!(parse_opus_head(&head(1, 2)), None, "more coupled streams than streams");
+        assert_eq!(parse_opus_head(&head(0, 0)), None, "no streams");
     }
 }

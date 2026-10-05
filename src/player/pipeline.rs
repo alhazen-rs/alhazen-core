@@ -75,9 +75,9 @@ pub(super) fn spawn(
             crossbeam_channel::bounded(packet_queue_len.max(1))
         };
         routes.push(Route { stream: pipe.info.id, tx: Some(tx) });
-        if !has_video {
-            seek_preroll = pipe.info.seek_preroll;
-        }
+        // Start early enough for the codec's pre-roll (Opus: 80 ms) even when a video keyframe
+        // happens to sit exactly on the target; the extra audio/video is decoded and dropped.
+        seek_preroll = pipe.info.seek_preroll;
         let s = shared.clone();
         threads.push(
             thread::Builder::new()

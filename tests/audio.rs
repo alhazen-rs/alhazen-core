@@ -263,3 +263,49 @@ fn laced_vorbis_without_default_duration_plays_completely() {
     });
     assert!((90..=105).contains(&loud), "{loud} loud 20 ms chunks for 2 s of tone");
 }
+
+#[test]
+fn audio_after_a_seek_onto_a_keyframe_is_already_converged() {
+    // Opus needs 80 ms of pre-roll. Seeking exactly onto the 1.0 s keyframe must still give the
+    // same audio as decoding straight through. Reference: the decoder's own output at 1.0 s.
+    let reference = {
+        let mut d = video_core::demux::MatroskaDemuxer::open(Box::new(
+            video_core::source::FileSource::open(format!("{}/tests/fixtures/av1_with_audio.webm", env!("CARGO_MANIFEST_DIR")))
+                .unwrap(),
+        ))
+        .unwrap();
+        use video_core::decode::AudioDecoder;
+        use video_core::demux::{Demuxer, StreamKind};
+        let a = d.streams().iter().find(|s| s.kind == StreamKind::Audio).unwrap().clone();
+        let mut dec = video_core::decode::OpusAudioDecoder::new(&a).unwrap();
+        let mut mono = Vec::new();
+        while let Some(p) = d.next_packet().unwrap() {
+            if p.stream == a.id {
+                dec.send_packet(&p).unwrap();
+                while let Some(b) = dec.receive_samples().unwrap() {
+                    mono.extend(b.samples);
+                }
+            }
+        }
+        mono[48_000..48_000 + 960].to_vec() // 20 ms from 1.0 s (decoded audio starts at 0)
+    };
+    let (player, null) = open("av1_with_audio.webm");
+    player.seek(Duration::from_millis(1000));
+    player.play();
+    // Playback starts once the first video frame after the seek is ready; then let the ring
+    // buffer fill and take 20 ms in one pull so no underrun can land inside it.
+    until("playing after seek", 10, || (player.state() == PlayerState::Playing).then_some(()));
+    std::thread::sleep(Duration::from_millis(100));
+    let after: Vec<f32> = null.pull(960).chunks(2).map(|f| f[0]).collect();
+    // Matroska timestamps have 1 ms resolution, so the seek may land up to ±0.5 ms off; that is
+    // inaudible. What must hold is that the waveform is the converged one: within one period of
+    // the 440 Hz tone (109 frames) some offset matches the reference closely.
+    let rms = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+    let best = (-55i64..=55)
+        .map(|lag| {
+            let d: Vec<f32> = (60..900usize).map(|i| after[i] - reference[(i as i64 + lag) as usize]).collect();
+            rms(&d)
+        })
+        .fold(f32::MAX, f32::min);
+    assert!(best < rms(&reference) * 0.02, "post-seek audio is not converged: best rms diff {best} vs signal {}", rms(&reference));
+}
