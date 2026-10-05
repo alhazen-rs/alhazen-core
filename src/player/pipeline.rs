@@ -21,6 +21,12 @@ use crate::frame::VideoFrame;
 use crate::{Error, Result};
 
 const POLL: Duration = Duration::from_millis(50);
+/// Catch-up: a frame this far behind the clock is not converted or queued...
+const SKIP_LATE: Duration = Duration::from_millis(50);
+/// ...unless it is this much media time after the last frame shown (the picture keeps moving
+/// while catching up). Media time, not wall time, so it holds at any playback speed.
+const MIN_SHOW_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Consecutive decode errors tolerated before the player gives up.
 const MAX_DECODE_ERRORS: u32 = 3;
 
@@ -264,6 +270,8 @@ struct DecodeLoop {
     monitor: SpeedMonitor,
     /// Time spent inside the decoder since the last decoded frame.
     busy: Duration,
+    /// Pts of the last frame converted and queued.
+    last_shown: Option<Duration>,
 }
 
 impl DecodeLoop {
@@ -279,6 +287,7 @@ impl DecodeLoop {
             fallback: None,
             monitor: SpeedMonitor::new(),
             busy: Duration::ZERO,
+            last_shown: None,
         }
     }
 
@@ -302,6 +311,7 @@ impl DecodeLoop {
                     self.waiting_for_keyframe = false;
                     self.monitor.reset();
                     self.busy = Duration::ZERO;
+                    self.last_shown = None;
                     true
                 }
                 Msg::Packet(p) => self.on_packet(shared, p),
@@ -457,6 +467,19 @@ impl DecodeLoop {
 
     /// Converts and queues a frame. Returns `false` only on shutdown.
     fn present(&mut self, shared: &Shared, f: YuvFrame) -> bool {
+        // Catch-up: while behind the clock, don't spend time converting frames that are already
+        // late, so the decoder can get ahead again; still show one every MIN_SHOW_INTERVAL.
+        let first = shared.ready_generation.load(Ordering::SeqCst) != self.generation;
+        if !first
+            && shared.clock.now().saturating_sub(f.pts) > SKIP_LATE
+            && self.last_shown.is_some_and(|p| f.pts.saturating_sub(p) < MIN_SHOW_INTERVAL)
+            && shared.state() == PlayerState::Playing
+        {
+            let cost = std::mem::take(&mut self.busy);
+            self.check_speed(shared, cost, f.pts);
+            shared.queue.note_skipped();
+            return true;
+        }
         let mut bgra = Vec::new();
         let start = Instant::now();
         if let Err(e) = self.pool.install(|| yuv_to_bgra(&f, &mut bgra)) {
@@ -477,9 +500,11 @@ impl DecodeLoop {
                 shared.clock.set(f.pts);
             }
         }
+        let pts = frame.pts();
         if !shared.queue.push(self.generation, frame) {
             return !shared.shutdown.load(Ordering::SeqCst);
         }
+        self.last_shown = Some(pts);
         if first && shared.frame_ready(self.generation) {
             let _ = shared.events.send(PlayerEvent::FrameReady);
         }
@@ -607,6 +632,36 @@ mod tests {
         }
         assert_eq!(*shared.video_backend.lock().unwrap(), Some("spare"));
         assert_eq!(shared.queue.dropped(), 0, "the drop rule did not do it");
+    }
+
+    #[test]
+    fn late_frames_are_skipped_but_the_picture_still_updates() {
+        let clock = Arc::new(MockClock::new());
+        let shared = shared(clock.clone());
+        *shared.state.lock().unwrap() = PlayerState::Playing;
+        shared.ready_generation.store(0, Ordering::SeqCst);
+        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+        let mut decode = DecodeLoop::new(Box::new(NoDecoder), pool);
+        // The decoder is 1 s behind and catching up: 30 frames arrive within ~50 ms.
+        clock.set(Duration::from_secs(2));
+        let mut shown = 0;
+        for i in 0..30u64 {
+            decode.present(&shared, frame(Duration::from_millis(1000 + i * 16)));
+            if shared.queue.frame_for(clock.now()).is_some() {
+                shown += 1;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Shown: 1000, 1112, 1224, 1336, 1448 ms — one per 100 ms of video.
+        assert_eq!(shown, 5, "late frames are not converted, except one per 100 ms of video");
+        assert_eq!(shared.queue.skipped(), 25);
+        // On time again: every frame is shown.
+        for i in 0..5u64 {
+            let pts = Duration::from_millis(2100 + i * 16);
+            clock.set(pts);
+            decode.present(&shared, frame(pts));
+            assert!(shared.queue.frame_for(pts).is_some(), "on-time frame {i} skipped");
+        }
     }
 
     #[test]

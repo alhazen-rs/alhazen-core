@@ -58,7 +58,8 @@ pub enum PlayerEvent {
 pub struct PlayerStats {
     /// The backend decoding video (`"native"`, `"ffmpeg-cli"`, …), if there is video.
     pub video_backend: Option<&'static str>,
-    /// Frames decoded but never shown because a later one was already due.
+    /// Frames decoded but never shown because they were late: discarded by the renderer, or
+    /// skipped by the decode thread while catching up.
     pub frames_dropped: u64,
 }
 
@@ -477,7 +478,7 @@ impl Player {
     pub fn stats(&self) -> PlayerStats {
         PlayerStats {
             video_backend: *self.shared.video_backend.lock().unwrap(),
-            frames_dropped: self.shared.queue.dropped(),
+            frames_dropped: self.shared.queue.dropped() + self.shared.queue.skipped(),
         }
     }
 

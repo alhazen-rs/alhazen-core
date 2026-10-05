@@ -55,6 +55,9 @@ fn plays_through_in_order_and_ends() {
         player.play();
         let mut seen = Vec::new();
         let start = Instant::now();
+        // Real-time pace: a faster clock than the decoder can follow makes the player skip late
+        // frames on purpose (catch-up), which is not what this test is about.
+        let mut last = Instant::now();
         while player.state() != PlayerState::Ended {
             assert!(start.elapsed() < Duration::from_secs(10), "{name}: never ended");
             if let Some(f) = player.current_frame()
@@ -62,7 +65,9 @@ fn plays_through_in_order_and_ends() {
             {
                 seen.push(f.pts());
             }
-            clock.advance(Duration::from_millis(10));
+            let now = Instant::now();
+            clock.advance(now - last);
+            last = now;
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(seen.windows(2).all(|w| w[0] < w[1]), "{name}: frames out of order");

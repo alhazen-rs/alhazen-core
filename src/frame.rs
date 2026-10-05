@@ -39,6 +39,8 @@ pub struct FrameQueue {
     capacity: usize,
     /// Frames discarded by `frame_for` because a later one was already due.
     dropped: AtomicU64,
+    /// Frames the decode side never converted because they were already late (catch-up).
+    skipped: AtomicU64,
 }
 
 impl FrameQueue {
@@ -48,6 +50,7 @@ impl FrameQueue {
             space: Condvar::new(),
             capacity: capacity.max(1),
             dropped: AtomicU64::new(0),
+            skipped: AtomicU64::new(0),
         }
     }
 
@@ -82,6 +85,16 @@ impl FrameQueue {
             self.space.notify_all();
         }
         due
+    }
+
+    /// Counts a frame the decode side discarded because it was already late.
+    pub fn note_skipped(&self) {
+        self.skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many frames the decode side skipped while catching up.
+    pub fn skipped(&self) -> u64 {
+        self.skipped.load(Ordering::Relaxed)
     }
 
     /// How many frames were never shown because they were already late.
