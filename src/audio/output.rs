@@ -1,8 +1,8 @@
 //! Audio sinks: a lock-free ring buffer drained by a device callback (cpal) or by a test.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
@@ -11,6 +11,26 @@ use crate::{Error, Result};
 
 /// Ring buffer length, in time.
 const BUFFER: Duration = Duration::from_millis(200);
+
+/// Monotonic nanoseconds since the first call (a process-wide time base for anchors).
+pub(crate) fn now_ns() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
+/// What the device callback last reported, for the clock to interpolate from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Anchor {
+    /// Seek epoch the callback rendered in; anchors from an older epoch are ignored.
+    pub epoch: u64,
+    /// Frames played in this epoch before this buffer.
+    pub frames_before: u64,
+    /// Frames in this buffer, heard progressively from `at_ns` on. 0 = count `frames_before`
+    /// as already heard (no interpolation; used by `NullOutput`).
+    pub len: u64,
+    /// `now_ns()` when the buffer's first frame reaches the speaker.
+    pub at_ns: u64,
+}
 
 /// State shared between the producer side (audio decode thread), the clock and the callback.
 #[derive(Debug)]
@@ -24,8 +44,11 @@ pub(crate) struct OutputShared {
     pub paused: AtomicBool,
     /// Frames with a lower sequence number than this are discarded unplayed (seek flush).
     pub discard_until: AtomicU64,
-    /// Device output latency estimate.
-    pub latency_ns: AtomicU64,
+    /// Seek epoch, bumped by the clock on every `set`.
+    epoch: AtomicU64,
+    /// Seqlock-protected latest `Anchor` (single writer: the callback).
+    anchor_seq: AtomicU64,
+    anchor: [AtomicU64; 4],
     /// The device reported a fatal error; audio is gone.
     pub failed: AtomicBool,
     /// Audio played everything it had (end of stream); time must go on without it.
@@ -42,14 +65,48 @@ impl OutputShared {
             frames_played: AtomicU64::new(0),
             paused: AtomicBool::new(true),
             discard_until: AtomicU64::new(0),
-            latency_ns: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
+            anchor_seq: AtomicU64::new(0),
+            anchor: Default::default(),
             failed: AtomicBool::new(false),
             exhausted: AtomicBool::new(false),
         }
     }
 
-    pub fn latency(&self) -> Duration {
-        Duration::from_nanos(self.latency_ns.load(Ordering::Relaxed))
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// Starts a new epoch (a seek); returns it.
+    pub fn next_epoch(&self) -> u64 {
+        self.epoch.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Lock-free publish (seqlock writer). Only the callback calls this.
+    pub fn publish(&self, a: Anchor) {
+        let seq = self.anchor_seq.load(Ordering::Relaxed);
+        self.anchor_seq.store(seq.wrapping_add(1), Ordering::Relaxed); // odd: writing
+        fence(Ordering::Release);
+        for (slot, v) in self.anchor.iter().zip([a.epoch, a.frames_before, a.len, a.at_ns]) {
+            slot.store(v, Ordering::Relaxed);
+        }
+        self.anchor_seq.store(seq.wrapping_add(2), Ordering::Release); // even: stable
+    }
+
+    /// Consistent snapshot of the latest anchor (seqlock reader).
+    pub fn anchor(&self) -> Anchor {
+        loop {
+            let s1 = self.anchor_seq.load(Ordering::Acquire);
+            if s1 & 1 == 1 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let v: [u64; 4] = std::array::from_fn(|i| self.anchor[i].load(Ordering::Relaxed));
+            fence(Ordering::Acquire);
+            if self.anchor_seq.load(Ordering::Relaxed) == s1 {
+                return Anchor { epoch: v[0], frames_before: v[1], len: v[2], at_ns: v[3] };
+            }
+        }
     }
 }
 
@@ -59,12 +116,27 @@ pub(crate) struct Renderer {
     shared: Arc<OutputShared>,
     /// Frames taken out of the ring so far (played or discarded).
     consumed: u64,
+    /// Epoch of the frames below, and frames played in it so far.
+    epoch: u64,
+    epoch_frames: u64,
 }
 
 impl Renderer {
-    /// Fills `out` (interleaved, `shared.channels` per frame) with the next samples.
+    /// Fills `out` and reports it as heard immediately (no interpolation; `NullOutput`).
     pub fn render(&mut self, out: &mut [f32]) {
+        self.render_at(out, None);
+    }
+
+    /// Fills `out` (interleaved, `shared.channels` per frame) with the next samples. With
+    /// `Some(delay)`, the buffer is announced as playing from `delay` from now on, so the clock
+    /// can interpolate through it (device callbacks).
+    pub fn render_at(&mut self, out: &mut [f32], delay: Option<Duration>) {
         let ch = self.shared.channels as usize;
+        let epoch = self.shared.epoch();
+        if epoch != self.epoch {
+            self.epoch = epoch;
+            self.epoch_frames = 0;
+        }
         // Drop samples that a seek made stale, even while paused.
         let discard = self.shared.discard_until.load(Ordering::Acquire);
         if self.consumed < discard {
@@ -94,6 +166,14 @@ impl Renderer {
         out[n..].fill(0.0);
         self.consumed += frames as u64;
         self.shared.frames_played.fetch_add(frames as u64, Ordering::Release);
+        if frames > 0 {
+            let before = self.epoch_frames;
+            self.epoch_frames += frames as u64;
+            self.shared.publish(match delay {
+                Some(d) => Anchor { epoch, frames_before: before, len: frames as u64, at_ns: now_ns() + d.as_nanos() as u64 },
+                None => Anchor { epoch, frames_before: self.epoch_frames, len: 0, at_ns: now_ns() },
+            });
+        }
     }
 }
 
@@ -115,10 +195,10 @@ impl Converter {
         self.scratch.capacity()
     }
 
-    pub fn render_into<T>(&mut self, renderer: &mut Renderer, data: &mut [T], convert: impl Fn(f32) -> T) {
+    pub fn render_into<T>(&mut self, renderer: &mut Renderer, data: &mut [T], delay: Option<Duration>, convert: impl Fn(f32) -> T) {
         // Within capacity this only writes zeros; it allocates only for a callback longer than 0.5 s.
         self.scratch.resize(data.len(), 0.0);
-        renderer.render(&mut self.scratch);
+        renderer.render_at(&mut self.scratch, delay);
         for (d, s) in data.iter_mut().zip(&self.scratch) {
             *d = convert(s.clamp(-1.0, 1.0));
         }
@@ -137,7 +217,7 @@ fn ring(rate: u32, channels: u16, volume: Arc<Volume>) -> (Arc<OutputShared>, Pr
     let shared = Arc::new(OutputShared::new(rate, channels, volume));
     let frames = (rate as u128 * BUFFER.as_millis() / 1000) as usize;
     let (producer, consumer) = RingBuffer::new(frames.max(1) * channels.max(1) as usize);
-    let renderer = Renderer { consumer, shared: shared.clone(), consumed: 0 };
+    let renderer = Renderer { consumer, shared: shared.clone(), consumed: 0, epoch: 0, epoch_frames: 0 };
     (shared, producer, renderer)
 }
 
@@ -158,6 +238,16 @@ impl NullOutput {
 
     pub fn new(rate: u32, channels: u16) -> Arc<Self> {
         Arc::new(Self { rate, channels, renderer: Mutex::new(None) })
+    }
+
+    /// Renders like a real device: the buffer is heard progressively, starting `delay` from now.
+    /// (`pull` instead counts frames as heard the moment they are pulled.)
+    pub fn render_realtime(&self, frames: usize, delay: Duration) -> Vec<f32> {
+        let mut out = vec![0.0; frames * self.channels as usize];
+        if let Some(r) = self.renderer.lock().unwrap().as_mut() {
+            r.render_at(&mut out, Some(delay));
+        }
+        out
     }
 
     /// Renders `frames` frames as a device callback would (silence until a player is attached).
@@ -285,19 +375,15 @@ mod cpal_output {
                 log::debug!("audio output hiccup: {e}");
             }
         };
-        let latency = shared.clone();
-        let note_latency = move |info: &cpal::OutputCallbackInfo| {
+        // How long until this callback's buffer reaches the speaker.
+        let delay = |info: &cpal::OutputCallbackInfo| {
             let ts = info.timestamp();
-            let d = ts.playback.duration_since(ts.callback);
-            latency.latency_ns.store(d.as_nanos() as u64, Ordering::Relaxed);
+            Some(ts.playback.duration_since(ts.callback))
         };
         let stream = match supported.sample_format() {
             cpal::SampleFormat::F32 => device.build_output_stream(
                 config,
-                move |data: &mut [f32], info| {
-                    note_latency(info);
-                    renderer.render(data);
-                },
+                move |data: &mut [f32], info| renderer.render_at(data, delay(info)),
                 on_error,
                 None,
             ),
@@ -306,8 +392,7 @@ mod cpal_output {
                 device.build_output_stream(
                     config,
                     move |data: &mut [i16], info| {
-                        note_latency(info);
-                        conv.render_into(&mut renderer, data, |s| (s * i16::MAX as f32) as i16);
+                        conv.render_into(&mut renderer, data, delay(info), |s| (s * i16::MAX as f32) as i16)
                     },
                     on_error,
                     None,
@@ -318,8 +403,7 @@ mod cpal_output {
                 device.build_output_stream(
                     config,
                     move |data: &mut [u16], info| {
-                        note_latency(info);
-                        conv.render_into(&mut renderer, data, |s| ((s + 1.0) * 0.5 * u16::MAX as f32) as u16);
+                        conv.render_into(&mut renderer, data, delay(info), |s| ((s + 1.0) * 0.5 * u16::MAX as f32) as u16)
                     },
                     on_error,
                     None,
@@ -466,12 +550,13 @@ mod tests {
         let (_null, mut out, _) = attached();
         out.shared.paused.store(false, Ordering::Relaxed);
         push_frames(&mut out.producer, &out.shared, &[0.5; 400], || true);
-        let mut renderer = Renderer { consumer: RingBuffer::new(8).1, shared: out.shared.clone(), consumed: 0 };
+        let mut renderer =
+            Renderer { consumer: RingBuffer::new(8).1, shared: out.shared.clone(), consumed: 0, epoch: 0, epoch_frames: 0 };
         // Sized for half a second at 1 kHz stereo, like the device setup does.
         let mut conv = Converter::new(1000, 2);
         let before = conv.capacity();
         let mut data = vec![0i16; 960];
-        conv.render_into(&mut renderer, &mut data, |s| (s * i16::MAX as f32) as i16);
+        conv.render_into(&mut renderer, &mut data, None, |s| (s * i16::MAX as f32) as i16);
         assert_eq!(conv.capacity(), before, "the callback reallocated its scratch buffer");
     }
 }

@@ -4,18 +4,21 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::output::OutputShared;
+use super::output::{OutputShared, now_ns};
 use crate::clock::{Clock, SystemClock};
 
 struct Base {
     time: Duration,
-    frames: u64,
+    /// Seek epoch started by the last `set`; device reports from older epochs are ignored.
+    epoch: u64,
     /// Running on wall time (audio failed or ran out).
     wall: bool,
 }
 
-/// Time = base + frames actually played since `set` / rate − device latency.
-/// Freezes while paused and during underruns. When audio can no longer advance time — the device
+/// Time = base + frames heard since `set` / rate, interpolated through the device buffer that is
+/// playing (from the callback's anchor), so it moves smoothly rather than in buffer-sized steps.
+/// Freezes while paused and during underruns; reports from callbacks that started before a
+/// seek are ignored. When audio can no longer advance time — the device
 /// failed, or the audio stream ended before the video — it continues on a wall clock from where
 /// audio stopped. A seek returns it to audio time unless the device failed.
 pub struct AudioClock {
@@ -26,17 +29,27 @@ pub struct AudioClock {
 
 impl AudioClock {
     pub(crate) fn new(out: Arc<OutputShared>) -> Self {
+        let epoch = out.epoch();
         Self {
             out,
-            base: Mutex::new(Base { time: Duration::ZERO, frames: 0, wall: false }),
+            base: Mutex::new(Base { time: Duration::ZERO, epoch, wall: false }),
             fallback: SystemClock::new(),
         }
     }
 
     fn audio_now(&self, base: &Base) -> Duration {
-        let played = self.out.frames_played.load(Ordering::Acquire).saturating_sub(base.frames);
-        let played = Duration::from_nanos(played * 1_000_000_000 / self.out.rate.max(1) as u64);
-        (base.time + played.saturating_sub(self.out.latency())).max(base.time)
+        let a = self.out.anchor();
+        if a.epoch != base.epoch {
+            return base.time;
+        }
+        let rate = self.out.rate.max(1) as u64;
+        let heard = if a.len == 0 {
+            a.frames_before
+        } else {
+            let into = now_ns().saturating_sub(a.at_ns);
+            a.frames_before + (into as u128 * rate as u128 / 1_000_000_000).min(a.len as u128) as u64
+        };
+        base.time + Duration::from_nanos(heard * 1_000_000_000 / rate)
     }
 
     fn audio_gone(&self) -> bool {
@@ -77,7 +90,7 @@ impl Clock for AudioClock {
     fn set(&self, t: Duration) {
         let mut base = self.base.lock().unwrap();
         base.time = t;
-        base.frames = self.out.frames_played.load(Ordering::Acquire);
+        base.epoch = self.out.next_epoch();
         self.fallback.set(t);
         base.wall = self.audio_gone();
     }
@@ -90,7 +103,7 @@ impl Clock for AudioClock {
 mod tests {
     use super::*;
     use crate::audio::{NullOutput, Volume};
-    use crate::audio::output::push_frames;
+    use crate::audio::output::{Anchor, push_frames};
 
     #[test]
     fn advances_only_with_played_frames_and_freezes_when_paused() {
@@ -112,7 +125,7 @@ mod tests {
     }
 
     #[test]
-    fn set_rebases_and_latency_is_subtracted() {
+    fn set_rebases_the_clock() {
         let null = NullOutput::new(1000, 1);
         let mut out = null.attach(Arc::new(Volume::default()));
         let clock = AudioClock::new(out.shared.clone());
@@ -121,9 +134,39 @@ mod tests {
         null.pull(100);
         clock.set(Duration::from_secs(5));
         assert_eq!(clock.now(), Duration::from_secs(5));
-        out.shared.latency_ns.store(20_000_000, Ordering::Relaxed);
         null.pull(50);
-        assert_eq!(clock.now(), Duration::from_millis(5_030), "50 ms played − 20 ms latency");
+        assert_eq!(clock.now(), Duration::from_millis(5_050));
+    }
+
+    #[test]
+    fn interpolates_within_a_device_buffer_and_honours_latency() {
+        // A real device plays a callback's buffer over time, starting `delay` after the callback.
+        let null = NullOutput::new(1000, 1);
+        let mut out = null.attach(Arc::new(Volume::default()));
+        let clock = AudioClock::new(out.shared.clone());
+        clock.resume();
+        push_frames(&mut out.producer, &out.shared, &[0.1; 200], || true); // the ring holds 200 ms here
+        // 100 ms buffer whose first frame reaches the speaker 30 ms from now.
+        null.render_realtime(100, Duration::from_millis(30));
+        assert!(clock.now() < Duration::from_millis(5), "nothing audible yet: {:?}", clock.now());
+        std::thread::sleep(Duration::from_millis(80));
+        let mid = clock.now();
+        assert!(mid > Duration::from_millis(35) && mid < Duration::from_millis(75), "mid-buffer: {mid:?}");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(clock.now(), Duration::from_millis(100), "clamped at the end of what was played");
+    }
+
+    #[test]
+    fn a_callback_that_started_before_a_seek_does_not_move_the_clock() {
+        let null = NullOutput::new(1000, 1);
+        let out = null.attach(Arc::new(Volume::default()));
+        let clock = AudioClock::new(out.shared.clone());
+        clock.resume();
+        let before_seek = out.shared.epoch();
+        clock.set(Duration::from_secs(5));
+        // That callback finishes now and reports 100 ms of (pre-seek) audio.
+        out.shared.publish(Anchor { epoch: before_seek, frames_before: 100, len: 0, at_ns: 0 });
+        assert_eq!(clock.now(), Duration::from_secs(5));
     }
 
     #[test]
