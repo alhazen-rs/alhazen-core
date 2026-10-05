@@ -196,10 +196,9 @@ impl AudioLoop {
 
     /// Pushes resampled samples into the ring. Returns `false` on shutdown or device loss.
     fn push(&mut self, shared: &Shared, samples: &[f32]) -> bool {
-        let ch = self.out.channels;
         let generation = self.generation;
         let out = self.out.clone();
-        let written = push_frames(&mut self.producer, ch, samples, || {
+        let written = push_frames(&mut self.producer, &self.out, samples, || {
             !shared.shutdown.load(Ordering::SeqCst)
                 && !out.failed.load(Ordering::Relaxed)
                 && shared.generation.load(Ordering::SeqCst) == generation

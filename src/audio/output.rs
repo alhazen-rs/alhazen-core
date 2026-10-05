@@ -314,14 +314,16 @@ mod cpal_output {
 }
 
 /// Producer side helper: pushes whole frames, waiting (with `keep_waiting` checks) when full.
-/// Returns the number of frames written (fewer than given if `keep_waiting` said stop).
+/// While waiting it sleeps about as long as the device needs to free the space (2–20 ms), and
+/// 20 ms while paused, instead of spinning. Returns the number of frames written (fewer than
+/// given if `keep_waiting` said stop).
 pub(crate) fn push_frames(
     producer: &mut Producer<f32>,
-    channels: u16,
+    out: &OutputShared,
     mut samples: &[f32],
     mut keep_waiting: impl FnMut() -> bool,
 ) -> usize {
-    let ch = channels.max(1) as usize;
+    let ch = out.channels.max(1) as usize;
     let mut written = 0;
     while samples.len() >= ch {
         let n = (producer.slots() / ch * ch).min(samples.len() / ch * ch);
@@ -329,7 +331,14 @@ pub(crate) fn push_frames(
             if !keep_waiting() {
                 return written;
             }
-            std::thread::sleep(Duration::from_millis(2));
+            let wait = if out.paused.load(Ordering::Relaxed) {
+                Duration::from_millis(20)
+            } else {
+                let needed = (samples.len() / ch).min(producer.buffer().capacity() / ch / 2) as u64;
+                Duration::from_nanos(needed * 1_000_000_000 / out.rate.max(1) as u64)
+                    .clamp(Duration::from_millis(2), Duration::from_millis(20))
+            };
+            std::thread::sleep(wait);
             continue;
         }
         if let Ok(mut chunk) = producer.write_chunk(n) {
@@ -359,7 +368,7 @@ mod tests {
     fn plays_pushed_frames_and_counts_them() {
         let (null, mut out, _) = attached();
         out.shared.paused.store(false, Ordering::Relaxed);
-        assert_eq!(push_frames(&mut out.producer, 2, &[0.1, 0.2, 0.3, 0.4], || true), 2);
+        assert_eq!(push_frames(&mut out.producer, &out.shared, &[0.1, 0.2, 0.3, 0.4], || true), 2);
         assert_eq!(null.pull(3), vec![0.1, 0.2, 0.3, 0.4, 0.0, 0.0], "underrun pads with silence");
         assert_eq!(out.shared.frames_played.load(Ordering::Relaxed), 2, "silence is not counted");
     }
@@ -367,7 +376,7 @@ mod tests {
     #[test]
     fn paused_output_consumes_nothing() {
         let (null, mut out, _) = attached();
-        push_frames(&mut out.producer, 2, &[0.5; 4], || true);
+        push_frames(&mut out.producer, &out.shared, &[0.5; 4], || true);
         assert_eq!(null.pull(2), vec![0.0; 4]);
         assert_eq!(out.shared.frames_played.load(Ordering::Relaxed), 0);
         out.shared.paused.store(false, Ordering::Relaxed);
@@ -378,7 +387,7 @@ mod tests {
     fn volume_and_mute_scale_samples() {
         let (null, mut out, volume) = attached();
         out.shared.paused.store(false, Ordering::Relaxed);
-        push_frames(&mut out.producer, 2, &[0.8; 8], || true);
+        push_frames(&mut out.producer, &out.shared, &[0.8; 8], || true);
         volume.set(0.5);
         assert_eq!(null.pull(2), vec![0.4; 4]);
         volume.set_muted(true);
@@ -389,9 +398,9 @@ mod tests {
     fn discard_drops_stale_frames_before_playing() {
         let (null, mut out, _) = attached();
         out.shared.paused.store(false, Ordering::Relaxed);
-        push_frames(&mut out.producer, 2, &[0.9; 6], || true); // frames 0..3 (stale)
+        push_frames(&mut out.producer, &out.shared, &[0.9; 6], || true); // frames 0..3 (stale)
         out.shared.discard_until.store(3, Ordering::Release);
-        push_frames(&mut out.producer, 2, &[0.1; 2], || true); // frame 3 (fresh)
+        push_frames(&mut out.producer, &out.shared, &[0.1; 2], || true); // frame 3 (fresh)
         assert_eq!(null.pull(2), vec![0.1, 0.1, 0.0, 0.0]);
         assert_eq!(out.shared.frames_played.load(Ordering::Relaxed), 1);
     }
@@ -402,7 +411,7 @@ mod tests {
         let capacity = out.producer.slots();
         let samples = vec![0.0; capacity + 2];
         let mut asked = 0;
-        let written = push_frames(&mut out.producer, 2, &samples, || {
+        let written = push_frames(&mut out.producer, &out.shared, &samples, || {
             asked += 1;
             asked < 3
         });
@@ -416,5 +425,19 @@ mod tests {
         assert!(!cpal_output::is_fatal(Xrun), "an underrun is recoverable");
         assert!(cpal_output::is_fatal(DeviceNotAvailable));
         assert!(cpal_output::is_fatal(StreamInvalidated));
+    }
+
+    #[test]
+    fn a_full_ring_while_paused_does_not_spin() {
+        let (_null, mut out, _) = attached(); // paused, nobody consuming
+        let fill = vec![0.0; out.producer.slots()];
+        push_frames(&mut out.producer, &out.shared, &fill, || true);
+        let start = std::time::Instant::now();
+        let mut wakeups = 0;
+        push_frames(&mut out.producer, &out.shared, &[0.0; 2], || {
+            wakeups += 1;
+            start.elapsed() < Duration::from_millis(200)
+        });
+        assert!(wakeups <= 15, "{wakeups} wake-ups in 200 ms while paused (was polling every 2 ms)");
     }
 }

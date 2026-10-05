@@ -98,7 +98,7 @@ mod tests {
         let mut out = null.attach(Arc::new(Volume::default()));
         let clock = AudioClock::new(out.shared.clone());
         assert!(clock.is_paused());
-        push_frames(&mut out.producer, 1, &[0.1; 150], || true);
+        push_frames(&mut out.producer, &out.shared, &[0.1; 150], || true);
         null.pull(50);
         assert_eq!(clock.now(), Duration::ZERO, "paused: nothing played");
         clock.resume();
@@ -117,7 +117,7 @@ mod tests {
         let mut out = null.attach(Arc::new(Volume::default()));
         let clock = AudioClock::new(out.shared.clone());
         clock.resume();
-        push_frames(&mut out.producer, 1, &[0.1; 200], || true);
+        push_frames(&mut out.producer, &out.shared, &[0.1; 200], || true);
         null.pull(100);
         clock.set(Duration::from_secs(5));
         assert_eq!(clock.now(), Duration::from_secs(5));
@@ -132,7 +132,7 @@ mod tests {
         let mut out = null.attach(Arc::new(Volume::default()));
         let clock = AudioClock::new(out.shared.clone());
         clock.resume();
-        push_frames(&mut out.producer, 1, &[0.1; 100], || true);
+        push_frames(&mut out.producer, &out.shared, &[0.1; 100], || true);
         null.pull(100);
         out.shared.failed.store(true, Ordering::Relaxed);
         let at_failure = clock.now();
