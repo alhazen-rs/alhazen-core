@@ -70,10 +70,19 @@ impl MfAudioDecoder {
                 }
                 mft.SetInputType(0, &t, 0).map_err(err("input type"))?;
                 // Float if offered (most decoders), else integer PCM (the Dolby decoders).
-                let (mut float, mut pcm) = (None, None);
+                let (mut float, mut pcm, mut offered) = (None, None, Vec::new());
                 for i in 0.. {
-                    let Ok(o) = mft.GetOutputAvailableType(0, i) else { break };
+                    let o = match mft.GetOutputAvailableType(0, i) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            if i == 0 {
+                                offered.push(format!("none ({e})"));
+                            }
+                            break;
+                        }
+                    };
                     let sub = o.GetGUID(&MF_MT_SUBTYPE).unwrap_or_default();
+                    offered.push(format!("{sub:?}/{}bit", o.GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE).unwrap_or(0)));
                     if sub == MFAudioFormat_Float && float.is_none() {
                         float = Some(o);
                     } else if sub == MFAudioFormat_PCM
@@ -89,7 +98,12 @@ impl MfAudioDecoder {
                         let bits = o.GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE).map_err(err("bits"))?;
                         (o, bits)
                     }
-                    (None, None) => return Err(Error::Decode("Media Foundation offers no float or PCM output".into())),
+                    (None, None) => {
+                        return Err(Error::Decode(format!(
+                            "{name} offers no float or PCM output (offers: {})",
+                            offered.join(", ")
+                        )));
+                    }
                 };
                 mft.SetOutputType(0, &out, 0).map_err(err("output type"))?;
                 (
