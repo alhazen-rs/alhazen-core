@@ -173,8 +173,3 @@ impl<T> Drop for FfmpegProcess<T> {
         }
     }
 }
-
-/// Reads exactly `buf.len()` bytes; `false` on a clean or partial end of stream.
-pub(crate) fn read_full(r: &mut impl Read, buf: &mut [u8]) -> bool {
-    r.read_exact(buf).is_ok()
-}

@@ -1,8 +1,10 @@
-//! `VideoDecoder` that runs ffmpeg as a pure decoder: Matroska in, YUV4MPEG2 (4:2:0, 8-bit) out.
+//! `VideoDecoder` that runs ffmpeg as a pure decoder: Matroska in, and Matroska with raw 8-bit
+//! 4:2:0 frames out. Output blocks carry the input timestamps (`-copyts`), so every frame is
+//! matched to the packet it came from even when ffmpeg skips frames (open-GOP leading pictures
+//! after a seek, VP8 alt-refs, corrupt frames).
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, VecDeque};
-use std::io::{BufRead, BufReader, Read};
+use std::collections::{BTreeMap, VecDeque};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::process::ChildStdout;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,17 +13,19 @@ use crossbeam_channel::{RecvTimeoutError, Sender};
 
 use super::locate::FfmpegInfo;
 use super::mkv::{BlockWriter, header};
-use super::process::{FfmpegProcess, read_full};
+use super::process::FfmpegProcess;
 use crate::decode::{ColorMatrix, DecodedFrame, PixelLayout, VideoDecoder, YuvFrame, chroma_size};
-use crate::demux::{Packet, StreamInfo};
+use crate::demux::{Demuxer, MatroskaDemuxer, Packet, StreamInfo, StreamKind};
+use crate::source::MediaSource;
 use crate::{Error, Result};
 
 /// How long draining at end of stream waits for ffmpeg's next frame before calling it stalled.
 const STALL: Duration = Duration::from_secs(10);
 
-/// A picture from ffmpeg's y4m output, or the reason the stream stopped.
-pub(crate) enum Y4m {
-    Frame { width: u32, height: u32, data: Vec<u8> },
+/// A picture from ffmpeg's output, or the reason the stream stopped.
+pub(crate) enum Raw {
+    /// `ms`: the block timestamp, i.e. the input packet's pts in whole milliseconds.
+    Frame { width: u32, height: u32, data: Vec<u8>, ms: u64 },
     Bad(String),
 }
 
@@ -29,12 +33,12 @@ pub struct FfmpegVideoDecoder {
     info: Arc<FfmpegInfo>,
     stream: StreamInfo,
     hwaccel: bool,
-    process: Option<FfmpegProcess<Y4m>>,
+    process: Option<FfmpegProcess<Raw>>,
     blocks: BlockWriter,
-    /// Pts of packets sent and not yet matched to an output frame, smallest first: frames
-    /// come out in presentation order.
-    pending: BinaryHeap<Reverse<Duration>>,
-    ready: VecDeque<Y4m>,
+    /// Pts of packets sent and not yet matched to an output frame, by whole millisecond (the
+    /// precision of the Matroska round trip).
+    pending: BTreeMap<u64, Duration>,
+    ready: VecDeque<Raw>,
     eof: bool,
 }
 
@@ -47,7 +51,7 @@ impl FfmpegVideoDecoder {
             hwaccel,
             process: None,
             blocks: BlockWriter::default(),
-            pending: BinaryHeap::new(),
+            pending: BTreeMap::new(),
             ready: VecDeque::new(),
             eof: false,
         })
@@ -62,25 +66,25 @@ impl FfmpegVideoDecoder {
         a.extend(["-probesize", "32768", "-analyzeduration", "1"].map(String::from));
         a.extend(["-f", "matroska", "-i", "pipe:0", "-map", "0:v:0", "-an", "-sn"].map(String::from));
         a.extend(self.info.passthrough_args().map(String::from));
-        a.extend(["-pix_fmt", "yuv420p", "-f", "yuv4mpegpipe", "pipe:1"].map(String::from));
+        a.extend(["-copyts", "-c:v", "rawvideo", "-pix_fmt", "yuv420p", "-f", "matroska", "pipe:1"].map(String::from));
         a
     }
 
-    fn process(&mut self) -> Result<&mut FfmpegProcess<Y4m>> {
+    fn process(&mut self) -> Result<&mut FfmpegProcess<Raw>> {
         if self.process.is_none() {
             let head = header(&self.stream).expect("checked in new");
-            self.process = Some(FfmpegProcess::spawn(&self.info.path, &self.args(), head, 4, read_y4m)?);
+            self.process = Some(FfmpegProcess::spawn(&self.info.path, &self.args(), head, 4, read_raw)?);
             self.blocks = BlockWriter::default();
         }
         Ok(self.process.as_mut().unwrap())
     }
 
-    fn make_frame(&mut self, out: Y4m) -> Result<DecodedFrame> {
-        let (width, height, data) = match out {
-            Y4m::Frame { width, height, data } => (width, height, data),
-            Y4m::Bad(msg) => return Err(Error::Decode(format!("ffmpeg output: {msg}"))),
+    fn make_frame(&mut self, out: Raw) -> Result<DecodedFrame> {
+        let (width, height, data, ms) = match out {
+            Raw::Frame { width, height, data, ms } => (width, height, data, ms),
+            Raw::Bad(msg) => return Err(Error::Decode(format!("ffmpeg output: {msg}"))),
         };
-        let pts = self.pending.pop().map(|Reverse(p)| p).unwrap_or_default();
+        let pts = match_pts(&mut self.pending, ms);
         let (cw, ch) = chroma_size(PixelLayout::I420, width, height);
         let (ys, cs) = ((width * height) as usize, (cw * ch) as usize);
         let mut data = data;
@@ -112,7 +116,7 @@ impl VideoDecoder for FfmpegVideoDecoder {
         let mut ready = std::mem::take(&mut self.ready);
         let result = self.process.as_mut().unwrap().write(bytes, &mut ready);
         self.ready = ready;
-        self.pending.push(Reverse(packet.pts));
+        self.pending.insert(packet.pts.as_millis() as u64, packet.pts);
         result
     }
 
@@ -171,51 +175,78 @@ impl VideoDecoder for FfmpegVideoDecoder {
     }
 }
 
-/// Parses a YUV4MPEG2 stream: one header line, then `FRAME` lines each followed by a picture.
-pub(crate) fn read_y4m(stdout: ChildStdout, tx: Sender<Y4m>) {
-    parse_y4m(BufReader::with_capacity(1 << 20, stdout), &tx);
+/// How far ffmpeg's output timestamp may be from the input one: it rescales through the
+/// encoder's time base (66 ms in can come back as 67 ms).
+const MATCH_TOLERANCE_MS: u64 = 2;
+
+/// The pts of the packet whose frame ffmpeg output at `ms` (the nearest pending one within the
+/// tolerance). Earlier packets still pending made no frame (ffmpeg skipped them) and are forgotten.
+fn match_pts(pending: &mut BTreeMap<u64, Duration>, ms: u64) -> Duration {
+    let near = pending
+        .range(ms.saturating_sub(MATCH_TOLERANCE_MS)..=ms + MATCH_TOLERANCE_MS)
+        .min_by_key(|(k, _)| k.abs_diff(ms))
+        .map(|(k, _)| *k);
+    let cut = near.unwrap_or(ms.saturating_sub(MATCH_TOLERANCE_MS));
+    let later = pending.split_off(&cut);
+    *pending = later;
+    match near {
+        Some(k) => pending.remove(&k).unwrap(),
+        None => Duration::from_millis(ms),
+    }
 }
 
-pub(crate) fn parse_y4m(mut r: impl BufRead, tx: &Sender<Y4m>) {
-    let mut line = Vec::new();
-    if r.by_ref().take(1024).read_until(b'\n', &mut line).unwrap_or(0) == 0 {
-        return; // no output at all: the caller reports ffmpeg's stderr
+/// ffmpeg's stdout as a forward-only source for our Matroska demuxer.
+struct Pipe(BufReader<ChildStdout>);
+
+impl Read for Pipe {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
     }
-    let header = String::from_utf8_lossy(&line).into_owned();
-    let Some(params) = header.trim_end().strip_prefix("YUV4MPEG2") else {
-        let _ = tx.send(Y4m::Bad(format!("not a y4m stream: {:?}", header.trim_end())));
+}
+
+impl Seek for Pipe {
+    fn seek(&mut self, _: SeekFrom) -> std::io::Result<u64> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "pipe"))
+    }
+}
+
+impl MediaSource for Pipe {
+    fn byte_len(&self) -> Option<u64> {
+        None
+    }
+    fn is_seekable(&self) -> bool {
+        false
+    }
+    fn is_live(&self) -> bool {
+        false
+    }
+    fn description(&self) -> String {
+        "ffmpeg output".into()
+    }
+}
+
+/// Demuxes ffmpeg's Matroska output into frames.
+pub(crate) fn read_raw(stdout: ChildStdout, tx: Sender<Raw>) {
+    let Ok(mut demuxer) = MatroskaDemuxer::open(Box::new(Pipe(BufReader::with_capacity(1 << 20, stdout)))) else {
+        return; // no output at all: the caller reports ffmpeg's stderr
+    };
+    let Some(track) = demuxer.streams().iter().find(|s| s.kind == StreamKind::Video).cloned() else {
+        let _ = tx.send(Raw::Bad("no video track in ffmpeg's output".into()));
         return;
     };
-    let (mut width, mut height, mut chroma) = (0u32, 0u32, "420jpeg".to_owned());
-    for p in params.split_whitespace() {
-        match p.split_at(1) {
-            ("W", v) => width = v.parse().unwrap_or(0),
-            ("H", v) => height = v.parse().unwrap_or(0),
-            ("C", v) => chroma = v.to_owned(),
-            _ => {}
-        }
-    }
-    // 8-bit 4:2:0 is `420`, `420jpeg`, `420mpeg2`, `420paldv`; high bit depth is `420p10` etc.
-    if width == 0 || height == 0 || !chroma.starts_with("420") || chroma.starts_with("420p1") {
-        let _ = tx.send(Y4m::Bad(format!("unexpected y4m header {:?}", header.trim_end())));
-        return;
-    }
+    let (width, height) = (track.width, track.height);
     let (cw, ch) = chroma_size(PixelLayout::I420, width, height);
     let size = (width * height + 2 * cw * ch) as usize;
-    loop {
-        line.clear();
-        if r.by_ref().take(1024).read_until(b'\n', &mut line).unwrap_or(0) == 0 {
+    while let Ok(Some(p)) = demuxer.next_packet() {
+        if p.stream != track.id {
+            continue;
+        }
+        if size == 0 || p.data.len() != size {
+            let _ = tx.send(Raw::Bad(format!("{} byte frame for {width}x{height}", p.data.len())));
             return;
         }
-        if !line.starts_with(b"FRAME") {
-            let _ = tx.send(Y4m::Bad("missing FRAME marker".into()));
-            return;
-        }
-        let mut data = vec![0u8; size];
-        if !read_full(&mut r, &mut data) {
-            return;
-        }
-        if tx.send(Y4m::Frame { width, height, data }).is_err() {
+        let ms = p.pts.as_millis() as u64;
+        if tx.send(Raw::Frame { width, height, data: p.data, ms }).is_err() {
             return;
         }
     }
@@ -225,34 +256,30 @@ pub(crate) fn parse_y4m(mut r: impl BufRead, tx: &Sender<Y4m>) {
 mod tests {
     use super::*;
 
-    fn parse(bytes: &[u8]) -> Vec<Y4m> {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        parse_y4m(bytes, &tx);
-        drop(tx);
-        rx.iter().collect()
+    fn pending(ms: &[u64]) -> BTreeMap<u64, Duration> {
+        ms.iter().map(|&m| (m, Duration::from_micros(m * 1000 + 333))).collect()
     }
 
     #[test]
-    fn parses_frames_of_odd_size() {
-        // 3x3: Y 9 bytes, U/V 2x2 = 4 bytes each.
-        let mut s = b"YUV4MPEG2 W3 H3 F30:1 Ip A1:1 C420jpeg XYSCSS=420JPEG\n".to_vec();
-        for i in 0..2u8 {
-            s.extend_from_slice(b"FRAME\n");
-            s.extend(std::iter::repeat_n(i, 17));
-        }
-        let out = parse(&s);
-        assert_eq!(out.len(), 2);
-        assert!(matches!(&out[1], Y4m::Frame { width: 3, height: 3, data } if data.len() == 17 && data[0] == 1));
+    fn frames_take_their_own_packets_pts() {
+        let mut p = pending(&[0, 33, 67, 100]);
+        assert_eq!(match_pts(&mut p, 33), Duration::from_micros(33_333), "0 was skipped by ffmpeg");
+        assert_eq!(p.keys().copied().collect::<Vec<_>>(), [67, 100]);
+        assert_eq!(match_pts(&mut p, 100), Duration::from_micros(100_333));
+        assert!(p.is_empty());
     }
 
     #[test]
-    fn truncated_frame_is_dropped_and_wrong_format_reported() {
-        let mut s = b"YUV4MPEG2 W2 H2 C420mpeg2\nFRAME\n".to_vec();
-        s.extend([0u8; 3]);
-        assert!(parse(&s).is_empty());
-        assert!(matches!(&parse(b"YUV4MPEG2 W2 H2 C444\n")[0], Y4m::Bad(_)));
-        assert!(matches!(&parse(b"YUV4MPEG2 W2 H2 C420p10\n")[0], Y4m::Bad(_)));
-        assert!(matches!(&parse(b"garbage\n")[0], Y4m::Bad(_)));
-        assert!(parse(b"").is_empty());
+    fn timestamps_rounded_by_ffmpeg_still_match() {
+        let mut p = pending(&[0, 33, 66, 100]);
+        assert_eq!(match_pts(&mut p, 67), Duration::from_micros(66_333), "66 ms came back as 67");
+        assert_eq!(p.keys().copied().collect::<Vec<_>>(), [100]);
+    }
+
+    #[test]
+    fn an_unknown_timestamp_is_used_as_is() {
+        let mut p = pending(&[200]);
+        assert_eq!(match_pts(&mut p, 150), Duration::from_millis(150));
+        assert_eq!(p.len(), 1, "later packets stay pending");
     }
 }

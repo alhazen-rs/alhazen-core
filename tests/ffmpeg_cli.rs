@@ -77,6 +77,40 @@ fn decodes_h264_from_mp4_with_packet_timestamps() {
     assert_eq!((f.width, f.height, f.layout, f.planes[0].len()), (320, 240, PixelLayout::I420, 320 * 240));
 }
 
+/// Starting at an open-GOP (CRA) keyframe, as after a seek, ffmpeg skips the leading frames that
+/// reference the previous GOP: fewer frames come out than packets went in. Timestamps must still
+/// belong to the frames that are shown.
+#[test]
+fn frames_keep_their_timestamps_when_ffmpeg_skips_some() {
+    let Some(b) = backend() else { return };
+    let mut d = MatroskaDemuxer::open(Box::new(FileSource::open(fixture_path("hevc_open_gop.mkv")).unwrap())).unwrap();
+    let stream = d.streams()[0].clone();
+    if !b.supports_video(&stream) {
+        eprintln!("skipped: this ffmpeg has no HEVC decoder");
+        return;
+    }
+    let packets: Vec<_> = std::iter::from_fn(|| d.next_packet().unwrap()).collect();
+    let key = packets.iter().position(|p| p.keyframe && p.pts == Duration::from_secs(1)).expect("keyframe at 1 s");
+    let mut dec = b.open_video_decoder(&stream, 1).unwrap();
+    let mut shown = vec![];
+    for p in &packets[key..] {
+        dec.send_packet(p).unwrap();
+        while let Some(f) = dec.receive_frame().unwrap() {
+            shown.push(f.pts());
+        }
+    }
+    dec.send_eof();
+    while let Some(f) = dec.receive_frame().unwrap() {
+        shown.push(f.pts());
+    }
+    let sent: std::collections::BTreeSet<Duration> = packets[key..].iter().map(|p| p.pts).collect();
+    assert!(!shown.is_empty());
+    assert_eq!(shown[0], Duration::from_secs(1), "the first frame shown is the keyframe: {shown:?}");
+    assert!(shown.windows(2).all(|w| w[0] < w[1]), "display order: {shown:?}");
+    assert!(shown.iter().all(|p| sent.contains(p)), "every timestamp is a real packet's: {shown:?}");
+    assert_eq!(shown.last(), sent.last(), "the last frame keeps the last timestamp");
+}
+
 #[test]
 fn decodes_hevc_from_matroska() {
     let Some(b) = backend() else { return };

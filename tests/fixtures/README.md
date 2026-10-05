@@ -75,6 +75,9 @@ ffmpeg -v error -y $V -t 2 -pix_fmt yuv420p -c:v libvpx -deadline realtime -cpu-
 ffmpeg -v error -y -f lavfi -i testsrc2=size=192x128:rate=30 -t 0.2 -c:v prores_ks -profile:v 3 -pix_fmt yuv422p10le prores_hq.mov
 ffmpeg -v error -y -f lavfi -i testsrc2=size=192x128:rate=30 -t 0.2 -c:v prores_ks -profile:v 4 -pix_fmt yuv444p10le prores_4444.mov
 ffmpeg -v error -y -f lavfi -i testsrc2=size=192x128:rate=30 -t 0.1 -vf setfield=tff -c:v prores_ks -profile:v 4 -pix_fmt yuv444p10le -flags +ildct+ilme prores_4444_interlaced.mov
+ffmpeg -v error -y -f lavfi -i testsrc2=size=192x120:rate=30 -t 0.2 -c:v prores_ks -profile:v 4 -pix_fmt yuv444p10le prores_4444_h120.mov
+ffmpeg -v error -y -f lavfi -i testsrc2=size=192x120:rate=30 -t 0.1 -vf setfield=tff -c:v prores_ks -profile:v 4 -pix_fmt yuv444p10le -flags +ildct+ilme prores_4444_h120_interlaced.mov
+ffmpeg -v error -y $V -t 2 -pix_fmt yuv420p -c:v libx265 -preset fast -crf 40 -x265-params log-level=none:keyint=30:min-keyint=30:open-gop=1:bframes=4 hevc_open_gop.mkv
 ffmpeg -v error -y $V -f lavfi -i sine=frequency=440:sample_rate=44100 -t 1 -pix_fmt yuv420p -c:v libx264 -preset ultrafast -crf 40 -g 30 -c:a aac -b:a 48k -movflags +faststart h264_aac.mp4
 ffmpeg -v error -y $V -t 1 -pix_fmt yuv420p -c:v libx265 -preset ultrafast -crf 40 -g 30 -x265-params log-level=none hevc.mkv
 ffmpeg -v error -y -i vp9_tiles4.webm -c copy -f ivf ../../../vp9-mt/tests/data/tiles4.ivf
@@ -84,4 +87,7 @@ ffmpeg -v error -y -i vp9_tiles4.webm -c copy -f ivf ../../../vp9-mt/tests/data/
 - `vp9_tiles4.webm`: 1024×576, 11 frames, 4 tile columns on the key frame
 - ProRes: 192×128, 6 frames (`prores_hq.mov` `apch` 4:2:2; `prores_4444*.mov` `ap4h` 4:4:4; the
   interlaced one is 3 frames, top field first)
+- `prores_4444_h120*.mov`: 192×120, so the last macroblock row is partial (as at 1080p / 1080i)
 - `h264_aac.mp4` (H.264 + AAC-LC 44.1 kHz) and `hevc.mkv`: 1 s, decodable only through ffmpeg
+- `hevc_open_gop.mkv`: 2 s, open GOP (CRA keyframes at 0 and 1 s, 4 B-frames): decoding from the
+  1 s keyframe makes ffmpeg skip the leading frames
