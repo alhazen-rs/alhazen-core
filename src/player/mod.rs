@@ -97,6 +97,15 @@ impl Default for PlayerConfig {
     }
 }
 
+/// How to get a decoder for a codec the build cannot play, for warnings.
+fn codec_hint(codec: &demux::Codec) -> &'static str {
+    match codec {
+        demux::Codec::Aac => " (install ffmpeg, or enable video-core's `native-aac` feature)",
+        demux::Codec::H264 | demux::Codec::Hevc => " (install ffmpeg)",
+        _ => "",
+    }
+}
+
 /// The process-wide conversion pool shared by every player that does not supply its own.
 pub fn shared_thread_pool() -> Arc<rayon::ThreadPool> {
     static POOL: OnceLock<Arc<rayon::ThreadPool>> = OnceLock::new();
@@ -331,7 +340,7 @@ impl Player {
                     Ok(None) => {}
                     Err(e) => warn(format!("no audio output ({e}); playing without sound")),
                 },
-                Err(e) if video.is_some() => warn(format!("audio track {} not played: {e}", a.id)),
+                Err(e) if video.is_some() => warn(format!("audio track {} not played: {e}{}", a.id, codec_hint(&a.codec))),
                 Err(e) => return Err(e),
             }
         }

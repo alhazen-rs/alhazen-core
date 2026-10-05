@@ -209,7 +209,10 @@ fn without_ffmpeg() -> PlayerConfig {
 fn aac_without_any_decoder_plays_video_silently_with_warning() {
     let player = Player::open(fixture("av1_aac.mp4"), without_ffmpeg()).unwrap();
     assert!(player.has_video() && !player.has_audio());
-    assert!(player.events().try_iter().any(|e| matches!(e, PlayerEvent::Warning(_))));
+    // The warning says how to get AAC.
+    let warning = player.events().try_iter().find_map(|e| if let PlayerEvent::Warning(w) = e { Some(w) } else { None });
+    let warning = warning.expect("a warning");
+    assert!(warning.contains("ffmpeg") && warning.contains("native-aac"), "{warning}");
 }
 
 #[cfg(not(feature = "native-aac"))]

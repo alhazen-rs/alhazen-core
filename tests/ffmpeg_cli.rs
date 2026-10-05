@@ -3,11 +3,10 @@
 #![cfg(all(feature = "ffmpeg-cli", feature = "native"))]
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use video_core::audio::{AudioOutputConfig, NullOutput};
-use video_core::backend::{Backend, Registry};
+use video_core::backend::Backend;
 use video_core::decode::{DecodedFrame, PixelLayout};
 use video_core::demux::{Demuxer, MatroskaDemuxer, Mp4Demuxer, StreamKind};
 use video_core::ffmpeg::FfmpegCliBackend;
@@ -331,14 +330,29 @@ fn ffmpeg_that_stops_reading_is_an_error_not_a_hang() {
     assert!(elapsed < Duration::from_secs(15), "took {elapsed:?}");
 }
 
+/// Opening and playing natively decodable media never runs ffmpeg at all (not even to probe it):
+/// the "ffmpeg" here records every start in a marker file.
+#[cfg(unix)]
 #[test]
-fn native_codecs_are_never_sent_to_ffmpeg() {
-    let r = Registry::with_defaults();
-    let mut d = MatroskaDemuxer::open(Box::new(FileSource::open(fixture_path("vp9_profile0.webm")).unwrap())).unwrap();
-    let stream = d.streams()[0].clone();
-    let _ = d.next_packet();
-    // The native backend claims VP9 first; ffmpeg-cli is never probed for it.
-    let names = r.ordered(None).iter().filter(|b| b.supports_video(&stream)).map(|b| b.name()).next();
-    assert_eq!(names, Some("native"));
-    let _ = Arc::new(());
+fn native_media_never_runs_ffmpeg() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("video-core-spy-ffmpeg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (script, marker) = (dir.join("ffmpeg"), dir.join("ran"));
+    std::fs::write(&script, format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 1\n", marker.display())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let config = PlayerConfig {
+        decoder_threads: 2,
+        audio_output: AudioOutputConfig::Null(NullOutput::new(RATE, 2)),
+        ffmpeg: FfmpegConfig { path: Some(script), ..Default::default() },
+        ..Default::default()
+    };
+    // VP9 video + Opus audio, both native.
+    for name in ["vp9_profile0.webm", "av1_with_audio.webm"] {
+        let player = Player::open(Source::parse(&fixture_path(name)).unwrap(), config.clone()).unwrap();
+        until("first frame", 10, || player.current_frame());
+    }
+    let ran = std::fs::read_to_string(&marker).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(ran.is_empty(), "ffmpeg was run: {ran}");
 }
