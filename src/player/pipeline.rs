@@ -272,6 +272,7 @@ struct DecodeLoop {
     busy: Duration,
     /// Pts of the last frame converted and queued.
     last_shown: Option<Duration>,
+    scaler: crate::scale::FrameScaler,
 }
 
 impl DecodeLoop {
@@ -288,6 +289,7 @@ impl DecodeLoop {
             monitor: SpeedMonitor::new(),
             busy: Duration::ZERO,
             last_shown: None,
+            scaler: crate::scale::FrameScaler::default(),
         }
     }
 
@@ -482,12 +484,20 @@ impl DecodeLoop {
         }
         let mut bgra = Vec::new();
         let start = Instant::now();
-        if let Err(e) = self.pool.install(|| yuv_to_bgra(&f, &mut bgra)) {
-            return self.on_decode_error(shared, e);
-        }
+        let scaler = &mut self.scaler;
+        let max = shared.max_output_size();
+        let converted = self.pool.install(|| {
+            let scaled = max.and_then(|max| scaler.downscale(&f, max));
+            let f = scaled.as_ref().unwrap_or(&f);
+            yuv_to_bgra(f, &mut bgra).map(|()| (f.width, f.height))
+        });
+        let (out_w, out_h) = match converted {
+            Ok(size) => size,
+            Err(e) => return self.on_decode_error(shared, e),
+        };
         let cost = std::mem::take(&mut self.busy) + start.elapsed();
         self.check_speed(shared, cost, f.pts);
-        let frame = VideoFrame::Cpu { width: f.width, height: f.height, bgra: bgra.into(), pts: f.pts };
+        let frame = VideoFrame::Cpu { width: out_w, height: out_h, bgra: bgra.into(), pts: f.pts };
         let first = shared.ready_generation.load(Ordering::SeqCst) != self.generation;
         {
             let _guard = shared.seek_lock.lock().unwrap();
@@ -558,6 +568,7 @@ mod tests {
             commands: crossbeam_channel::unbounded().0,
             seekable: true,
             video_backend: Mutex::new(None),
+            max_output_size: AtomicU64::new(0),
         }
     }
 

@@ -148,3 +148,28 @@ fn player_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Player>();
 }
+
+/// With a display size set, frames come out scaled down to fit it (aspect kept); the size can
+/// change while playing (window resized).
+#[test]
+fn frames_are_scaled_to_the_output_size() {
+    let clock = Arc::new(MockClock::new());
+    let config = PlayerConfig {
+        clock: Some(clock.clone()),
+        decoder_threads: 2,
+        audio_output: AudioOutputConfig::Disabled,
+        max_output_size: Some((160, 160)),
+        ..Default::default()
+    };
+    let player = Player::open(fixture("av1.webm"), config).unwrap();
+    let frame = wait_for("first frame", || player.current_frame());
+    assert_eq!(frame.size(), (160, 120));
+    assert_eq!(player.video_size(), Some((320, 240)), "the video's own size is unchanged");
+
+    player.set_max_output_size(None);
+    player.play();
+    wait_for("a full-size frame", || {
+        clock.advance(Duration::from_millis(10));
+        player.current_frame().filter(|f| f.size() == (320, 240))
+    });
+}

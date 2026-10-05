@@ -10,6 +10,7 @@ mod error;
 pub mod ffmpeg;
 pub mod frame;
 mod player;
+mod scale;
 pub mod source;
 
 pub use error::{Error, Result};

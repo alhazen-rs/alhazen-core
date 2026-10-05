@@ -86,6 +86,10 @@ pub struct PlayerConfig {
     /// When video decoding cannot keep up with playback, switch (once) to the next backend that
     /// supports the stream, in practice `ffmpeg-cli` with hardware decoding.
     pub auto_fallback: bool,
+    /// Largest frame size wanted, in pixels (usually the display area in device pixels). Larger
+    /// frames are scaled down before colour conversion. `None`: full size. Change it while
+    /// playing with `Player::set_max_output_size`.
+    pub max_output_size: Option<(u32, u32)>,
 }
 
 impl Default for PlayerConfig {
@@ -103,6 +107,7 @@ impl Default for PlayerConfig {
             audio_output: AudioOutputConfig::Default,
             ffmpeg: crate::FfmpegConfig::default(),
             auto_fallback: true,
+            max_output_size: None,
         }
     }
 }
@@ -173,6 +178,21 @@ pub(crate) struct Shared {
     pub seekable: bool,
     /// Name of the backend decoding video (changes on a speed fallback).
     pub video_backend: Mutex<Option<&'static str>>,
+    /// `max_output_size` packed as `w << 32 | h`; 0 = no limit.
+    pub max_output_size: AtomicU64,
+}
+
+/// `PlayerConfig::max_output_size` in its atomic form.
+pub(crate) fn pack_size(size: Option<(u32, u32)>) -> u64 {
+    size.map_or(0, |(w, h)| (w as u64) << 32 | h as u64)
+}
+
+impl Shared {
+    /// The current output size limit.
+    pub fn max_output_size(&self) -> Option<(u32, u32)> {
+        let v = self.max_output_size.load(Ordering::Relaxed);
+        (v != 0).then_some(((v >> 32) as u32, v as u32))
+    }
 }
 
 impl Shared {
@@ -395,6 +415,7 @@ impl Player {
             commands: cmd_tx,
             seekable,
             video_backend: Mutex::new(video_decoder.as_ref().map(|(name, _)| *name)),
+            max_output_size: AtomicU64::new(pack_size(config.max_output_size)),
         });
         let pool = config.thread_pool.clone().unwrap_or_else(shared_thread_pool);
         let mut audio_guard = None;
@@ -473,6 +494,12 @@ impl Player {
 
     pub fn state(&self) -> PlayerState {
         self.shared.state()
+    }
+
+    /// Largest frame size wanted from now on (e.g. the display area in device pixels, updated
+    /// when the window is resized); larger frames are scaled down. `None`: full size.
+    pub fn set_max_output_size(&self, size: Option<(u32, u32)>) {
+        self.shared.max_output_size.store(pack_size(size), Ordering::Relaxed);
     }
 
     pub fn stats(&self) -> PlayerStats {
