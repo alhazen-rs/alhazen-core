@@ -4,11 +4,14 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError};
 
 use super::audio_thread::AudioLoop;
+use super::speed::SpeedMonitor;
+use super::PlayerState;
+use crate::backend::Registry;
 use super::{Command, PlayerEvent, Shared};
 use crate::audio::OutputShared;
 use crate::convert::yuv_to_bgra;
@@ -28,6 +31,23 @@ pub(super) enum Msg {
     Eof { generation: u64 },
 }
 
+/// The video stream's decoder, and where to find a faster one if it cannot keep up.
+pub(crate) struct VideoPipe {
+    pub stream: u32,
+    pub decoder: Box<dyn VideoDecoder>,
+    pub fallback: Option<Fallback>,
+}
+
+/// What the decode thread needs to open another backend's decoder for the same stream.
+pub(crate) struct Fallback {
+    pub registry: Arc<Registry>,
+    pub stream: StreamInfo,
+    pub threads: usize,
+    pub order: Option<Vec<&'static str>>,
+    /// The backend currently decoding (never chosen as its own fallback).
+    pub current: &'static str,
+}
+
 /// Everything the audio thread needs.
 pub(crate) struct AudioPipe {
     pub info: StreamInfo,
@@ -45,7 +65,7 @@ struct Route {
 pub(super) fn spawn(
     shared: Arc<Shared>,
     demuxer: Box<dyn Demuxer>,
-    video: Option<(u32, Box<dyn VideoDecoder>)>,
+    video: Option<VideoPipe>,
     audio: Option<AudioPipe>,
     commands: Receiver<Command>,
     packet_queue_len: usize,
@@ -54,15 +74,17 @@ pub(super) fn spawn(
     let mut threads = Vec::new();
     let mut routes = Vec::new();
     let has_video = video.is_some();
-    if let Some((stream, decoder)) = video {
+    if let Some(VideoPipe { stream, decoder, fallback }) = video {
         let (tx, rx) = crossbeam_channel::bounded(packet_queue_len.max(1));
         routes.push(Route { stream, tx: Some(tx) });
         let s = shared.clone();
-        threads.push(
-            thread::Builder::new()
-                .name("video-decode".into())
-                .spawn(move || guarded(&s, |s| DecodeLoop::new(decoder, pool).run(s, rx)))?,
-        );
+        threads.push(thread::Builder::new().name("video-decode".into()).spawn(move || {
+            guarded(&s, |s| {
+                let mut lp = DecodeLoop::new(decoder, pool);
+                lp.fallback = fallback;
+                lp.run(s, rx)
+            })
+        })?);
     }
     let mut seek_preroll = Duration::ZERO;
     if let Some(pipe) = audio {
@@ -237,6 +259,11 @@ struct DecodeLoop {
     held: Option<YuvFrame>,
     errors: u32,
     waiting_for_keyframe: bool,
+    /// Set until the one allowed switch to a faster backend has happened.
+    fallback: Option<Fallback>,
+    monitor: SpeedMonitor,
+    /// Time spent inside the decoder since the last decoded frame.
+    busy: Duration,
 }
 
 impl DecodeLoop {
@@ -249,6 +276,9 @@ impl DecodeLoop {
             held: None,
             errors: 0,
             waiting_for_keyframe: false,
+            fallback: None,
+            monitor: SpeedMonitor::new(),
+            busy: Duration::ZERO,
         }
     }
 
@@ -270,6 +300,8 @@ impl DecodeLoop {
                     self.held = None;
                     self.errors = 0;
                     self.waiting_for_keyframe = false;
+                    self.monitor.reset();
+                    self.busy = Duration::ZERO;
                     true
                 }
                 Msg::Packet(p) => self.on_packet(shared, p),
@@ -291,7 +323,10 @@ impl DecodeLoop {
             return true;
         }
         self.waiting_for_keyframe = false;
-        if let Err(e) = self.decoder.send_packet(&p) {
+        let start = Instant::now();
+        let sent = self.decoder.send_packet(&p);
+        self.busy += start.elapsed();
+        if let Err(e) = sent {
             return self.on_decode_error(shared, e);
         }
         self.drain(shared)
@@ -311,7 +346,10 @@ impl DecodeLoop {
 
     fn drain(&mut self, shared: &Shared) -> bool {
         loop {
-            match self.decoder.receive_frame() {
+            let start = Instant::now();
+            let received = self.decoder.receive_frame();
+            self.busy += start.elapsed();
+            match received {
                 Ok(Some(DecodedFrame::Yuv(f))) => {
                     self.errors = 0;
                     if !self.on_frame(shared, f) {
@@ -338,6 +376,52 @@ impl DecodeLoop {
             }
         }
         self.present(shared, f)
+    }
+
+    /// Feeds the speed monitor (only while actually playing) and switches backend, once, when
+    /// decoding has been too slow for too long.
+    fn check_speed(&mut self, shared: &Shared, cost: Duration, pts: Duration) {
+        if self.fallback.is_none() {
+            return;
+        }
+        if shared.state() != PlayerState::Playing {
+            self.monitor.reset();
+            return;
+        }
+        let now = Instant::now();
+        self.monitor.record_frame(now, cost, pts);
+        self.monitor.record_drops(now, shared.queue.dropped());
+        if self.monitor.too_slow(now) {
+            self.switch_backend(shared);
+        }
+    }
+
+    fn switch_backend(&mut self, shared: &Shared) {
+        let Some(f) = self.fallback.take() else { return };
+        let codec = &f.stream.codec;
+        match f.registry.open_video_decoder_except(&f.stream, f.threads, f.order.as_deref(), Some(f.current)) {
+            Ok((name, decoder)) => {
+                let _ = shared.events.send(PlayerEvent::Warning(format!(
+                    "{} {codec} decoding is too slow for this video; switching to {name}",
+                    f.current
+                )));
+                self.decoder = decoder;
+                if shared.seekable {
+                    // Restart decoding from where playback is: the demuxer goes back to the
+                    // keyframe before it and frames up to here are decoded but not shown.
+                    shared.seek(shared.clock.now());
+                } else {
+                    self.waiting_for_keyframe = true;
+                }
+            }
+            Err(e) => {
+                log::info!("{codec} decoding is too slow, and no other backend can take over: {e}");
+                let _ = shared.events.send(PlayerEvent::Warning(format!(
+                    "{} {codec} decoding is too slow for this video, and no faster decoder is available",
+                    f.current
+                )));
+            }
+        }
     }
 
     fn on_eof(&mut self, shared: &Shared) -> bool {
@@ -370,9 +454,12 @@ impl DecodeLoop {
     /// Converts and queues a frame. Returns `false` only on shutdown.
     fn present(&mut self, shared: &Shared, f: YuvFrame) -> bool {
         let mut bgra = Vec::new();
+        let start = Instant::now();
         if let Err(e) = self.pool.install(|| yuv_to_bgra(&f, &mut bgra)) {
             return self.on_decode_error(shared, e);
         }
+        let cost = std::mem::take(&mut self.busy) + start.elapsed();
+        self.check_speed(shared, cost, f.pts);
         let frame = VideoFrame::Cpu { width: f.width, height: f.height, bgra: bgra.into(), pts: f.pts };
         let first = shared.ready_generation.load(Ordering::SeqCst) != self.generation;
         {
@@ -439,6 +526,8 @@ mod tests {
             video_done: AtomicU64::new(u64::MAX),
             audio_done: AtomicU64::new(u64::MAX),
             ended_generation: AtomicU64::new(u64::MAX),
+            commands: crossbeam_channel::unbounded().0,
+            seekable: true,
         }
     }
 

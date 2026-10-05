@@ -127,11 +127,24 @@ impl Registry {
         threads: usize,
         order: Option<&[&'static str]>,
     ) -> Result<Box<dyn VideoDecoder>> {
+        self.open_video_decoder_except(stream, threads, order, None).map(|(_, d)| d)
+    }
+
+    /// Like `open_video_decoder`, skipping the backend named `except`; also returns the name of
+    /// the backend that opened it. Used to find a faster decoder when the current one is too slow.
+    pub fn open_video_decoder_except(
+        &self,
+        stream: &StreamInfo,
+        threads: usize,
+        order: Option<&[&'static str]>,
+        except: Option<&str>,
+    ) -> Result<(&'static str, Box<dyn VideoDecoder>)> {
         let mut tried = Vec::new();
-        for b in self.ordered(order).into_iter().filter(|b| b.supports_video(stream)) {
+        let candidates = self.ordered(order).into_iter().filter(|b| Some(b.name()) != except);
+        for b in candidates.filter(|b| b.supports_video(stream)) {
             tried.push(b.name());
             match b.open_video_decoder(stream, threads) {
-                Ok(d) => return Ok(d),
+                Ok(d) => return Ok((b.name(), d)),
                 Err(e) => log::warn!("backend {} failed to open {} decoder: {e}", b.name(), stream.codec),
             }
         }

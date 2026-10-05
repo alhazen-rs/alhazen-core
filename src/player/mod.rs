@@ -2,6 +2,7 @@
 
 mod audio_thread;
 mod pipeline;
+mod speed;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -72,6 +73,9 @@ pub struct PlayerConfig {
     pub audio_output: AudioOutputConfig,
     /// How the `ffmpeg-cli` backend finds ffmpeg (ignored when `registry` is set).
     pub ffmpeg: crate::FfmpegConfig,
+    /// When video decoding cannot keep up with playback, switch (once) to the next backend that
+    /// supports the stream, in practice `ffmpeg-cli` with hardware decoding.
+    pub auto_fallback: bool,
 }
 
 impl Default for PlayerConfig {
@@ -88,6 +92,7 @@ impl Default for PlayerConfig {
             clock: None,
             audio_output: AudioOutputConfig::Default,
             ffmpeg: crate::FfmpegConfig::default(),
+            auto_fallback: true,
         }
     }
 }
@@ -144,6 +149,9 @@ pub(crate) struct Shared {
     pub audio_done: AtomicU64,
     /// Generation for which `Ended` was announced (so it is announced once).
     pub ended_generation: AtomicU64,
+    /// To the demux thread (seeks).
+    pub commands: Sender<Command>,
+    pub seekable: bool,
 }
 
 impl Shared {
@@ -241,6 +249,33 @@ impl Shared {
         }
     }
 
+    /// Frame-accurate seek; see `Player::seek`. Also used internally (decoder fallback).
+    pub fn seek(&self, to: Duration) {
+        if self.state().is_error() || !self.seekable {
+            return;
+        }
+        let to = self.duration.map_or(to, |d| to.min(d));
+        let guard = self.seek_lock.lock().unwrap();
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.queue.clear(generation);
+        if let Some(out) = &self.audio_out {
+            // Silence everything already queued; the audio thread re-opens playback for the
+            // samples it decodes after this seek.
+            out.discard_until.store(u64::MAX, Ordering::SeqCst);
+            // Audio will play again from the target, so it drives the clock again.
+            out.exhausted.store(false, Ordering::SeqCst);
+        }
+        self.clock.pause();
+        self.clock.set(to);
+        drop(guard);
+        if self.wants_play.load(Ordering::SeqCst) {
+            self.set_state(PlayerState::Buffering);
+        } else {
+            self.set_state(PlayerState::Paused);
+        }
+        let _ = self.commands.send(Command::Seek { target: to, generation });
+    }
+
     pub fn fail(&self, err: Error) {
         let err = Arc::new(err);
         self.clock.pause();
@@ -251,7 +286,6 @@ impl Shared {
 
 pub struct Player {
     shared: Arc<Shared>,
-    commands: Option<Sender<Command>>,
     events: Receiver<PlayerEvent>,
     threads: Vec<JoinHandle<()>>,
     video_size: (u32, u32),
@@ -279,7 +313,7 @@ impl Player {
 
         let video = streams.iter().find(|s| s.kind == StreamKind::Video).cloned();
         let video_decoder = match &video {
-            Some(v) => Some(registry.open_video_decoder(v, config.decoder_threads, order)?),
+            Some(v) => Some(registry.open_video_decoder_except(v, config.decoder_threads, order, None)?),
             None => None,
         };
 
@@ -316,6 +350,7 @@ impl Player {
         clock.pause();
         clock.set(Duration::ZERO);
         let duration = video.as_ref().and_then(|v| v.duration).or(audio_stream.as_ref().and_then(|a| a.duration));
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let shared = Arc::new(Shared {
             state: Mutex::new(PlayerState::Paused),
             clock,
@@ -336,8 +371,9 @@ impl Player {
             video_done: AtomicU64::new(u64::MAX),
             audio_done: AtomicU64::new(u64::MAX),
             ended_generation: AtomicU64::new(u64::MAX),
+            commands: cmd_tx,
+            seekable,
         });
-        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let pool = config.thread_pool.clone().unwrap_or_else(shared_thread_pool);
         let mut audio_guard = None;
         let audio_pipe = audio.map(|(info, decoder, out)| {
@@ -347,7 +383,17 @@ impl Player {
         let threads = pipeline::spawn(
             shared.clone(),
             demuxer,
-            video.as_ref().zip(video_decoder).map(|(v, d)| (v.id, d)),
+            video.as_ref().zip(video_decoder).map(|(v, (backend, decoder))| pipeline::VideoPipe {
+                stream: v.id,
+                decoder,
+                fallback: config.auto_fallback.then(|| pipeline::Fallback {
+                    registry: registry.clone(),
+                    stream: v.clone(),
+                    threads: config.decoder_threads,
+                    order: config.backend_order.clone(),
+                    current: backend,
+                }),
+            }),
             audio_pipe,
             cmd_rx,
             config.packet_queue_len,
@@ -356,7 +402,6 @@ impl Player {
 
         let player = Player {
             shared,
-            commands: Some(cmd_tx),
             events: event_rx,
             threads,
             video_size: video.as_ref().map(|v| (v.width, v.height)).unwrap_or_default(),
@@ -401,28 +446,7 @@ impl Player {
             let _ = s.events.send(PlayerEvent::Warning("seek ignored: source is not seekable".into()));
             return;
         }
-        let to = self.shared.duration.map_or(to, |d| to.min(d));
-        let guard = s.seek_lock.lock().unwrap();
-        let generation = s.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        s.queue.clear(generation);
-        if let Some(out) = &s.audio_out {
-            // Silence everything already queued; the audio thread re-opens playback for the
-            // samples it decodes after this seek.
-            out.discard_until.store(u64::MAX, Ordering::SeqCst);
-            // Audio will play again from the target, so it drives the clock again.
-            out.exhausted.store(false, Ordering::SeqCst);
-        }
-        s.clock.pause();
-        s.clock.set(to);
-        drop(guard);
-        if s.wants_play.load(Ordering::SeqCst) {
-            s.set_state(PlayerState::Buffering);
-        } else {
-            s.set_state(PlayerState::Paused);
-        }
-        if let Some(tx) = &self.commands {
-            let _ = tx.send(Command::Seek { target: to, generation });
-        }
+        s.seek(to);
     }
 
     pub fn state(&self) -> PlayerState {
@@ -494,7 +518,6 @@ impl Drop for Player {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::SeqCst);
         self.shared.queue.close();
-        self.commands.take();
         // Threads poll the shutdown flag every few ms, except while blocked in I/O (e.g. a
         // stalled HTTP read). Never let that block the caller, which is usually the UI thread:
         // detach such a thread; it holds only shared state and exits once its read returns.

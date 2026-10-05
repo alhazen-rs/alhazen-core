@@ -1,6 +1,7 @@
 //! Displayable frames and the bounded queue between decoder and renderer.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -36,6 +37,8 @@ pub struct FrameQueue {
     inner: Mutex<Inner>,
     space: Condvar,
     capacity: usize,
+    /// Frames discarded by `frame_for` because a later one was already due.
+    dropped: AtomicU64,
 }
 
 impl FrameQueue {
@@ -44,6 +47,7 @@ impl FrameQueue {
             inner: Mutex::new(Inner { frames: VecDeque::new(), generation: 0, closed: false }),
             space: Condvar::new(),
             capacity: capacity.max(1),
+            dropped: AtomicU64::new(0),
         }
     }
 
@@ -69,12 +73,20 @@ impl FrameQueue {
         let mut q = self.inner.lock().unwrap();
         let mut due = None;
         while q.frames.front().is_some_and(|(_, f)| f.pts() <= now) {
+            if due.is_some() {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
             due = q.frames.pop_front().map(|(_, f)| f);
         }
         if due.is_some() {
             self.space.notify_all();
         }
         due
+    }
+
+    /// How many frames were never shown because they were already late.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Pts of the next queued frame, if any.
@@ -122,6 +134,7 @@ mod tests {
         }
         assert_eq!(q.frame_for(Duration::from_millis(70)).unwrap().pts(), Duration::from_millis(66));
         assert_eq!(q.len(), 1);
+        assert_eq!(q.dropped(), 2, "0 and 33 were never shown");
         assert!(q.frame_for(Duration::from_millis(80)).is_none());
         assert_eq!(q.peek_pts(), Some(Duration::from_millis(100)));
     }
