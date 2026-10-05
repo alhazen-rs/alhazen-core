@@ -9,7 +9,7 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError};
 
 use super::audio_thread::AudioLoop;
-use super::{Command, PlayerEvent, PlayerState, Shared};
+use super::{Command, PlayerEvent, Shared};
 use crate::audio::OutputShared;
 use crate::convert::yuv_to_bgra;
 use crate::decode::{AudioDecoder, DecodedFrame, VideoDecoder, YuvFrame};
@@ -388,15 +388,8 @@ impl DecodeLoop {
         if !shared.queue.push(self.generation, frame) {
             return !shared.shutdown.load(Ordering::SeqCst);
         }
-        if first {
-            shared.ready_generation.store(self.generation, Ordering::SeqCst);
+        if first && shared.frame_ready(self.generation) {
             let _ = shared.events.send(PlayerEvent::FrameReady);
-            if shared.wants_play.load(Ordering::SeqCst) {
-                shared.clock.resume();
-                if shared.state() == PlayerState::Buffering {
-                    shared.set_state(PlayerState::Playing);
-                }
-            }
         }
         true
     }
@@ -408,6 +401,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::player::PlayerState;
     use crate::clock::{Clock, MockClock};
     use crate::decode::{ColorMatrix, PixelLayout, VideoDecoder};
     use crate::frame::FrameQueue;
@@ -478,5 +472,33 @@ mod tests {
         assert_eq!(clock.now(), Duration::from_secs(2), "stale frame moved the clock");
         assert!(shared.queue.is_empty());
         assert_ne!(shared.ready_generation.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn play_pause_and_first_frame_never_leave_state_and_clock_disagreeing() {
+        // Race the UI's play/pause against the decode thread's "first frame ready".
+        for i in 0..3000 {
+            let clock = Arc::new(MockClock::new());
+            let s = Arc::new(shared(clock.clone()));
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let (s2, b2) = (s.clone(), barrier.clone());
+            let decoder = std::thread::spawn(move || {
+                b2.wait();
+                s2.frame_ready(0);
+            });
+            barrier.wait();
+            s.request_play();
+            if i % 2 == 1 {
+                s.request_pause();
+            }
+            decoder.join().unwrap();
+            let state = s.state();
+            match state {
+                PlayerState::Paused => assert!(clock.is_paused(), "iteration {i}: Paused but the clock runs"),
+                PlayerState::Playing => assert!(!clock.is_paused(), "iteration {i}: Playing but the clock is stopped"),
+                PlayerState::Buffering => panic!("iteration {i}: stuck in Buffering although the frame is ready"),
+                other => panic!("iteration {i}: unexpected {other:?}"),
+            }
+        }
     }
 }

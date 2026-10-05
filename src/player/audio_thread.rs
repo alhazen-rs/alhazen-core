@@ -7,7 +7,7 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 
 use super::pipeline::{AudioPipe, Msg};
-use super::{PlayerState, Shared};
+use super::Shared;
 use crate::audio::{OutputShared, Resampler, push_frames, remix};
 use crate::decode::{AudioBuffer, AudioDecoder};
 
@@ -219,15 +219,7 @@ impl AudioLoop {
 
     /// Audio-only media: the first audio of a generation is what playback waits for.
     fn mark_ready(&self, shared: &Shared) {
-        if shared.ready_generation.swap(self.generation, Ordering::SeqCst) == self.generation {
-            return;
-        }
-        if shared.wants_play.load(Ordering::SeqCst) {
-            shared.clock.resume();
-            if shared.state() == PlayerState::Buffering {
-                shared.set_state(PlayerState::Playing);
-            }
-        }
+        shared.frame_ready(self.generation);
     }
 
     /// Waits until the device has played everything queued, then reports the stream finished.

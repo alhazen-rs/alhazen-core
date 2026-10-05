@@ -125,8 +125,9 @@ pub(crate) struct Shared {
     pub last_frame: Mutex<Option<VideoFrame>>,
     pub events: Sender<PlayerEvent>,
     pub duration: Option<Duration>,
-    /// Held while a seek bumps the generation and sets the clock, and while the decode thread
-    /// checks its generation before moving the clock, so a superseded frame cannot move it.
+    /// Serializes every playback-control decision: seeks (generation + clock), the decode
+    /// threads' generation checks and first-frame start, play/pause, and Ended. Lock order:
+    /// `seek_lock` before `state`.
     pub seek_lock: Mutex<()>,
     pub has_video: bool,
     /// Audio is being played (false if absent, disabled, or given up after errors).
@@ -183,6 +184,46 @@ impl Shared {
         self.wants_play.store(false, Ordering::SeqCst);
         self.set_state(PlayerState::Ended);
         let _ = self.events.send(PlayerEvent::Ended);
+    }
+
+    /// Playback was requested: start now if the current seek's first frame is ready, else buffer.
+    /// `request_play`, `request_pause` and `frame_ready` decide under `seek_lock`, so the UI and
+    /// the decode threads can never interleave into "Paused with a running clock" or
+    /// "Buffering although ready".
+    pub fn request_play(&self) {
+        let _guard = self.seek_lock.lock().unwrap();
+        self.wants_play.store(true, Ordering::SeqCst);
+        if self.ready_generation.load(Ordering::SeqCst) == self.generation.load(Ordering::SeqCst) {
+            self.clock.resume();
+            self.set_state(PlayerState::Playing);
+        } else {
+            self.set_state(PlayerState::Buffering);
+        }
+    }
+
+    pub fn request_pause(&self) {
+        let _guard = self.seek_lock.lock().unwrap();
+        self.wants_play.store(false, Ordering::SeqCst);
+        self.clock.pause();
+        if self.state() != PlayerState::Ended {
+            self.set_state(PlayerState::Paused);
+        }
+    }
+
+    /// The first frame (video) or audio of `generation` is queued: start if playback was requested.
+    /// Returns `true` the first time for that generation.
+    pub fn frame_ready(&self, generation: u64) -> bool {
+        let _guard = self.seek_lock.lock().unwrap();
+        if self.ready_generation.swap(generation, Ordering::SeqCst) == generation {
+            return false;
+        }
+        if self.wants_play.load(Ordering::SeqCst) {
+            self.clock.resume();
+            if self.state() == PlayerState::Buffering {
+                self.set_state(PlayerState::Playing);
+            }
+        }
+        true
     }
 
     /// Stops audio for the rest of playback (errors, device loss); video carries on.
@@ -336,13 +377,7 @@ impl Player {
             PlayerState::Ended => self.seek(Duration::ZERO),
             _ => {}
         }
-        s.wants_play.store(true, Ordering::SeqCst);
-        if s.ready_generation.load(Ordering::SeqCst) == s.generation.load(Ordering::SeqCst) {
-            s.clock.resume();
-            s.set_state(PlayerState::Playing);
-        } else {
-            s.set_state(PlayerState::Buffering);
-        }
+        s.request_play();
     }
 
     pub fn pause(&self) {
@@ -350,11 +385,7 @@ impl Player {
         if s.state().is_error() {
             return;
         }
-        s.wants_play.store(false, Ordering::SeqCst);
-        s.clock.pause();
-        if s.state() != PlayerState::Ended {
-            s.set_state(PlayerState::Paused);
-        }
+        s.request_pause();
     }
 
     /// Frame-accurate seek. Takes effect immediately for `position()`; frames follow shortly.
