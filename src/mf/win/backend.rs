@@ -23,7 +23,7 @@ impl Catalogue for Installed {
                 return false;
             }
             let (category, major, subtype) = codecs::ids(codec);
-            mft::find_decoder(category, major, subtype).is_some()
+            mft::find_decoder(category, major, subtype, codecs::outputs(codec)).is_some()
         });
         found && (!hardware_only || device::gpu().is_some_and(|g| g.decodes(codec)))
     }

@@ -71,7 +71,7 @@ impl MfVideoDecoder {
             runtime::com_init();
             runtime::ensure_started()?;
             let (category, major, subtype) = codecs::ids(self.codec);
-            let activate = mft::find_decoder(category, major, subtype)
+            let activate = mft::find_decoder(category, major, subtype, codecs::outputs(self.codec))
                 .ok_or_else(|| Error::Decode(format!("no Media Foundation decoder for {:?}", self.codec)))?;
             let name = mft::friendly_name(&activate);
             let gpu = if self.allow_gpu { device::gpu() } else { None };
@@ -130,7 +130,7 @@ impl VideoDecoder for MfVideoDecoder {
             }
             None => &packet.data[..],
         };
-        let sample = mft::sample(data, packet.pts)?;
+        let sample = mft::sample(data, packet.pts, None)?;
         let mft = self.state.as_ref().unwrap().mft.clone();
         // SAFETY: COM call on a live transform.
         match unsafe { mft.ProcessInput(0, &sample, 0) } {

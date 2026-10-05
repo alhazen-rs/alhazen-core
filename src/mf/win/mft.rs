@@ -12,16 +12,22 @@ pub fn err(what: &str) -> impl Fn(windows::core::Error) -> Error + '_ {
     move |e| Error::Decode(format!("Media Foundation {what}: {e}"))
 }
 
-/// The first installed synchronous decoder transform taking `subtype` in `category`.
-pub fn find_decoder(category: GUID, major: GUID, subtype: GUID) -> Option<IMFActivate> {
-    let input = MFT_REGISTER_TYPE_INFO { guidMajorType: major, guidSubtype: subtype };
+/// The first installed synchronous decoder transform taking `subtype` in `category` and
+/// producing one of `outputs` (tried in order). Filtering on the output matters: Windows also
+/// registers, e.g., a Dolby AC-3 → S/PDIF passthrough converter that takes AC-3 but decodes
+/// nothing.
+pub fn find_decoder(category: GUID, major: GUID, subtype: GUID, outputs: &[GUID]) -> Option<IMFActivate> {
+    outputs.iter().find_map(|&out| find_one(category, MFT_REGISTER_TYPE_INFO { guidMajorType: major, guidSubtype: subtype }, MFT_REGISTER_TYPE_INFO { guidMajorType: major, guidSubtype: out }))
+}
+
+fn find_one(category: GUID, input: MFT_REGISTER_TYPE_INFO, output: MFT_REGISTER_TYPE_INFO) -> Option<IMFActivate> {
     let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count = 0u32;
     // SAFETY: valid in/out pointers; the returned array is CoTaskMemAlloc'd and freed below
     // after taking ownership of every element.
     unsafe {
         let flags = MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER;
-        MFTEnumEx(category, flags, Some(&input), None, &mut activates, &mut count).ok()?;
+        MFTEnumEx(category, flags, Some(&input), Some(&output), &mut activates, &mut count).ok()?;
         if activates.is_null() {
             return None;
         }
@@ -31,8 +37,8 @@ pub fn find_decoder(category: GUID, major: GUID, subtype: GUID) -> Option<IMFAct
     }
 }
 
-/// Wraps `data` in a sample with time `pts`.
-pub fn sample(data: &[u8], pts: Duration) -> Result<IMFSample> {
+/// Wraps `data` in a sample with time `pts` (and `duration`, for decoders that need one).
+pub fn sample(data: &[u8], pts: Duration, duration: Option<Duration>) -> Result<IMFSample> {
     // SAFETY: the buffer is created with `data.len()` capacity, locked for the copy, and
     // unlocked before it is attached to the sample.
     unsafe {
@@ -45,6 +51,9 @@ pub fn sample(data: &[u8], pts: Duration) -> Result<IMFSample> {
         let sample = MFCreateSample().map_err(err("sample"))?;
         sample.AddBuffer(&buffer).map_err(err("add buffer"))?;
         sample.SetSampleTime(to_mf_time(pts)).map_err(err("time"))?;
+        if let Some(d) = duration {
+            sample.SetSampleDuration(to_mf_time(d)).map_err(err("duration"))?;
+        }
         Ok(sample)
     }
 }

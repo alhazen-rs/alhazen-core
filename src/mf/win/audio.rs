@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use windows::Win32::Media::MediaFoundation::*;
 
 use super::super::select::MfCodec;
-use super::super::setup::audio_user_data;
+use super::super::setup::{audio_bits, audio_user_data, frame_duration};
 use super::mft::{self, Output, err};
 use super::{codecs, runtime};
 use crate::decode::{AudioBuffer, AudioDecoder};
@@ -46,7 +46,7 @@ impl MfAudioDecoder {
             runtime::com_init();
             runtime::ensure_started()?;
             let (category, major, subtype) = codecs::ids(self.codec);
-            let activate = mft::find_decoder(category, major, subtype)
+            let activate = mft::find_decoder(category, major, subtype, codecs::outputs(self.codec))
                 .ok_or_else(|| Error::Decode(format!("no Media Foundation decoder for {:?}", self.codec)))?;
             let name = mft::friendly_name(&activate);
             let mft = mft::activate(&activate)?;
@@ -64,6 +64,9 @@ impl MfAudioDecoder {
                 }
                 if self.codec == MfCodec::Aac {
                     t.SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0).map_err(err("aac payload"))?;
+                }
+                if let Some(bits) = audio_bits(&s.codec, s.extradata.as_deref()) {
+                    t.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, bits).map_err(err("bits per sample"))?;
                 }
                 if let Some(data) = audio_user_data(&s.codec, s.extradata.as_deref()) {
                     t.SetBlob(&MF_MT_USER_DATA, &data).map_err(err("codec data"))?;
@@ -141,7 +144,8 @@ impl AudioDecoder for MfAudioDecoder {
             return Ok(());
         }
         let mft = self.state()?.mft.clone();
-        let sample = mft::sample(&packet.data, packet.pts)?;
+        let duration = frame_duration(&self.stream.codec, self.stream.extradata.as_deref(), self.stream.sample_rate);
+        let sample = mft::sample(&packet.data, packet.pts, duration)?;
         // SAFETY: COM call on a live transform.
         match unsafe { mft.ProcessInput(0, &sample, 0) } {
             Ok(()) => Ok(()),

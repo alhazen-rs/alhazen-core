@@ -5,6 +5,14 @@ use windows::core::GUID;
 
 use super::super::select::MfCodec;
 
+/// Output subtypes we accept, in order of preference.
+pub fn outputs(codec: MfCodec) -> &'static [GUID] {
+    match codec {
+        MfCodec::H264 | MfCodec::Hevc | MfCodec::Vp9 | MfCodec::Av1 => &[MFVideoFormat_NV12, MFVideoFormat_P010],
+        _ => &[MFAudioFormat_Float, MFAudioFormat_PCM],
+    }
+}
+
 /// (transform category, major type, input subtype).
 pub fn ids(codec: MfCodec) -> (GUID, GUID, GUID) {
     let video = |s| (MFT_CATEGORY_VIDEO_DECODER, MFMediaType_Video, s);

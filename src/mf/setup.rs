@@ -22,6 +22,36 @@ pub fn audio_user_data(codec: &Codec, extradata: Option<&[u8]>) -> Option<Vec<u8
     }
 }
 
+/// Bits per sample of a lossless stream (FLAC STREAMINFO, ALAC cookie), which Windows' FLAC and
+/// ALAC decoders require on their input type.
+pub fn audio_bits(codec: &Codec, extradata: Option<&[u8]>) -> Option<u32> {
+    let data = audio_user_data(codec, extradata)?;
+    match codec {
+        // fLaC(4) + block header(4) + STREAMINFO: bits-per-sample − 1 is 5 bits at byte 12 bit 0 ..
+        // byte 13 bit 4.
+        Codec::Flac => {
+            let info = data.get(8..)?;
+            Some((((info.get(12)? & 1) << 4 | info.get(13)? >> 4) + 1) as u32)
+        }
+        // ALACSpecificConfig: frameLength u32, compatibleVersion u8, bitDepth u8, …
+        Codec::Alac => data.get(5).map(|&b| b as u32),
+        _ => None,
+    }
+}
+
+/// Duration of one coded frame when the codec's frames have a fixed length (ALAC: its cookie's
+/// frameLength); Windows' ALAC decoder rejects input samples without a duration.
+pub fn frame_duration(codec: &Codec, extradata: Option<&[u8]>, rate: u32) -> Option<std::time::Duration> {
+    match codec {
+        Codec::Alac if rate > 0 => {
+            let cookie = audio_user_data(codec, extradata)?;
+            let frames = u32::from_be_bytes(cookie.get(..4)?.try_into().ok()?);
+            Some(std::time::Duration::from_secs_f64(frames as f64 / rate as f64))
+        }
+        _ => None,
+    }
+}
+
 /// `fLaC` + the STREAMINFO metadata block (header + 34 bytes) from a Matroska/MP4 FLAC header.
 fn flac_streaminfo(header: &[u8]) -> Option<Vec<u8>> {
     let blocks = header.strip_prefix(b"fLaC")?;
@@ -61,6 +91,37 @@ mod tests {
         assert_eq!(&v[..5], b"fLaC\x80");
         assert!(v[8..].iter().all(|&b| b == 7));
         assert!(audio_user_data(&Codec::Flac, Some(b"junk")).is_none());
+    }
+
+    #[test]
+    fn lossless_bit_depth_and_alac_frame_duration() {
+        // STREAMINFO with 24 bits per sample: byte 12 bit 0 = 1, byte 13 high nibble = 0x7 (23).
+        let mut h = b"fLaC".to_vec();
+        h.extend_from_slice(&[0x80, 0, 0, 34]);
+        let mut info = [0u8; 34];
+        info[12] = 0x01;
+        info[13] = 0x70;
+        h.extend_from_slice(&info);
+        assert_eq!(audio_bits(&Codec::Flac, Some(&h)), Some(24));
+        let mut cookie = [0u8; 24];
+        cookie[..4].copy_from_slice(&4096u32.to_be_bytes());
+        cookie[5] = 16;
+        assert_eq!(audio_bits(&Codec::Alac, Some(&cookie)), Some(16));
+        assert_eq!(frame_duration(&Codec::Alac, Some(&cookie), 48_000), Some(std::time::Duration::from_secs_f64(4096.0 / 48_000.0)));
+        assert_eq!(frame_duration(&Codec::Aac, Some(&cookie), 48_000), None);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn reads_the_fixtures_setup_data() {
+        use crate::demux::{Demuxer, MatroskaDemuxer, Mp4Demuxer};
+        use crate::source::FileSource;
+        let flac = MatroskaDemuxer::open(Box::new(FileSource::open("tests/fixtures/flac.mkv").unwrap())).unwrap();
+        assert_eq!(audio_bits(&Codec::Flac, flac.streams()[0].extradata.as_deref()), Some(16));
+        let alac = Mp4Demuxer::open(Box::new(FileSource::open("tests/fixtures/alac.m4a").unwrap())).unwrap();
+        let s = &alac.streams()[0];
+        assert_eq!(audio_bits(&Codec::Alac, s.extradata.as_deref()), Some(16));
+        assert!(frame_duration(&Codec::Alac, s.extradata.as_deref(), s.sample_rate).is_some());
     }
 
     #[test]
