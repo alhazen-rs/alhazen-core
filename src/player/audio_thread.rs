@@ -175,12 +175,31 @@ impl AudioLoop {
         let frames = samples.len() / ch.max(1) as usize;
         self.expected = start + Duration::from_nanos(frames as u64 * 1_000_000_000 / rate as u64);
         if self.resampler.as_ref().is_none_or(|r| r.rates() != (rate, self.out.rate)) {
-            self.resampler = Some(Resampler::new(rate, self.out.rate, ch));
+            // The stream rate changed (or first buffer): finish the old resampler's tail first.
+            if let Some(mut old) = self.resampler.take() {
+                let tail = old.flush();
+                if !self.push(shared, &tail) {
+                    return false;
+                }
+            }
+            match Resampler::new(rate, self.out.rate, ch) {
+                Ok(r) => self.resampler = Some(r),
+                Err(e) => {
+                    shared.disable_audio(&format!("cannot resample {rate} Hz to {} Hz: {e}", self.out.rate));
+                    return false;
+                }
+            }
         }
         let samples = self.resampler.as_mut().unwrap().process(&samples);
+        self.push(shared, &samples)
+    }
+
+    /// Pushes resampled samples into the ring. Returns `false` on shutdown or device loss.
+    fn push(&mut self, shared: &Shared, samples: &[f32]) -> bool {
+        let ch = self.out.channels;
         let generation = self.generation;
         let out = self.out.clone();
-        let written = push_frames(&mut self.producer, ch, &samples, || {
+        let written = push_frames(&mut self.producer, ch, samples, || {
             !shared.shutdown.load(Ordering::SeqCst)
                 && !out.failed.load(Ordering::Relaxed)
                 && shared.generation.load(Ordering::SeqCst) == generation
@@ -216,6 +235,13 @@ impl AudioLoop {
     fn on_eof(&mut self, shared: &Shared) -> bool {
         if !self.drain(shared) {
             return false;
+        }
+        // The resampler still holds the last few milliseconds.
+        if let Some(r) = self.resampler.as_mut() {
+            let tail = r.flush();
+            if !self.push(shared, &tail) {
+                return false;
+            }
         }
         let capacity = self.producer.buffer().capacity();
         loop {
