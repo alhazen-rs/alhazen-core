@@ -30,15 +30,32 @@ impl FfmpegInfo {
     }
 }
 
-/// Which `ffmpeg` to run: `explicit`, else `$VIDEO_CORE_FFMPEG`, else `ffmpeg` on `PATH`.
-pub fn candidate(explicit: Option<&Path>) -> PathBuf {
+/// Which `ffmpeg` programs to try, in order: `explicit`, else `$VIDEO_CORE_FFMPEG`, else `ffmpeg`
+/// on `PATH` and then the standard install locations that `PATH` may lack.
+pub fn candidates(explicit: Option<&Path>) -> Vec<PathBuf> {
+    let env = std::env::var_os("VIDEO_CORE_FFMPEG").filter(|p| !p.is_empty()).map(PathBuf::from);
+    candidates_for(std::env::consts::OS, explicit, env)
+}
+
+/// `candidates` for a given OS, explicit path and `$VIDEO_CORE_FFMPEG` value.
+pub fn candidates_for(os: &str, explicit: Option<&Path>, env: Option<PathBuf>) -> Vec<PathBuf> {
     if let Some(p) = explicit {
-        return p.to_owned();
+        return vec![p.to_owned()];
     }
-    match std::env::var_os("VIDEO_CORE_FFMPEG") {
-        Some(p) if !p.is_empty() => PathBuf::from(p),
-        _ => PathBuf::from("ffmpeg"),
+    if let Some(p) = env {
+        return vec![p];
     }
+    let mut out = vec![PathBuf::from("ffmpeg")];
+    // Apps started from Finder/Dock get launchd's PATH, without Homebrew's or MacPorts' bin.
+    if os == "macos" {
+        out.extend(["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/local/bin/ffmpeg"].map(PathBuf::from));
+    }
+    out
+}
+
+/// The first of `candidates(explicit)` that is a usable ffmpeg.
+pub fn find(explicit: Option<&Path>) -> Option<Arc<FfmpegInfo>> {
+    candidates(explicit).iter().find_map(|p| probe(p))
 }
 
 /// Runs `path -version` / `path -decoders` once per process; `None` if it is missing, fails, or is
@@ -136,6 +153,16 @@ mod tests {
 
     #[test]
     fn explicit_path_wins() {
-        assert_eq!(candidate(Some(Path::new("/opt/ff"))), PathBuf::from("/opt/ff"));
+        assert_eq!(candidates_for("linux", Some(Path::new("/opt/ff")), Some("/env".into())), [PathBuf::from("/opt/ff")]);
+        assert_eq!(candidates_for("macos", None, Some("/env".into())), [PathBuf::from("/env")]);
+    }
+
+    #[test]
+    fn macos_also_tries_homebrew_and_macports() {
+        let c = candidates_for("macos", None, None);
+        assert_eq!(c[0], PathBuf::from("ffmpeg"));
+        assert!(c.contains(&PathBuf::from("/opt/homebrew/bin/ffmpeg")));
+        assert!(c.contains(&PathBuf::from("/usr/local/bin/ffmpeg")));
+        assert_eq!(candidates_for("linux", None, None), [PathBuf::from("ffmpeg")]);
     }
 }

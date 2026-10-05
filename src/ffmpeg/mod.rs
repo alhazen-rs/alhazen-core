@@ -12,7 +12,9 @@ use std::path::PathBuf;
 pub struct FfmpegConfig {
     /// Register the backend at all.
     pub enabled: bool,
-    /// The `ffmpeg` program. `None`: `$VIDEO_CORE_FFMPEG`, else `ffmpeg` on `PATH`.
+    /// The `ffmpeg` program. `None`: `$VIDEO_CORE_FFMPEG`, else `ffmpeg` on `PATH`, and on macOS
+    /// also Homebrew's and MacPorts' install locations (apps launched from Finder don't get the
+    /// shell's `PATH`).
     pub path: Option<PathBuf>,
     /// Pass `-hwaccel auto` so ffmpeg decodes on the GPU when it can.
     pub hwaccel: bool,
@@ -47,7 +49,7 @@ mod backend {
     use std::sync::{Arc, OnceLock};
 
     use super::FfmpegConfig;
-    use super::locate::{FfmpegInfo, candidate, probe};
+    use super::locate::{FfmpegInfo, find};
     use crate::backend::Backend;
     use crate::decode::{AudioDecoder, VideoDecoder};
     use crate::demux::{Codec, ContainerFormat, Demuxer, StreamInfo, StreamKind};
@@ -68,7 +70,7 @@ mod backend {
         /// The located ffmpeg, probed on first use (never on the open path of natively
         /// decodable media).
         pub fn ffmpeg(&self) -> Option<Arc<FfmpegInfo>> {
-            self.info.get_or_init(|| probe(&candidate(self.config.path.as_deref()))).clone()
+            self.info.get_or_init(|| find(self.config.path.as_deref())).clone()
         }
 
         fn supports(&self, stream: &StreamInfo, kind: StreamKind) -> bool {
