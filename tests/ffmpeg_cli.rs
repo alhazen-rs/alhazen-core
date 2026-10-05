@@ -127,10 +127,7 @@ fn ffmpeg_first_frame(b: &FfmpegCliBackend, name: &str) -> Option<video_core::de
         }
     }
     dec.send_eof();
-    match dec.receive_frame().unwrap() {
-        Some(DecodedFrame::Yuv(f)) => Some(f),
-        None => None,
-    }
+    dec.receive_frame().unwrap().map(|DecodedFrame::Yuv(f)| f)
 }
 
 /// Colour matrix and range come from the stream (via ffmpeg's output), not a guess by height.
