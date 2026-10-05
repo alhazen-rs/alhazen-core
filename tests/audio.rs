@@ -196,12 +196,12 @@ fn aac_audio_only_m4a_plays() {
     until("sound", 5, || (peak(&play_ms(&null, 50)) > 0.05).then_some(()));
 }
 
-/// No AAC decoder at all: neither `native-aac` nor ffmpeg.
+/// No AAC decoder at all: native decoders only (no `native-aac`, ffmpeg or platform decoders).
 #[cfg(not(feature = "native-aac"))]
 fn without_ffmpeg() -> PlayerConfig {
     PlayerConfig {
         audio_output: AudioOutputConfig::Null(NullOutput::new(RATE, 2)),
-        ffmpeg: video_core::FfmpegConfig { enabled: false, ..Default::default() },
+        registry: Some(Arc::new(video_core::backend::Registry::empty_with_native())),
         ..Default::default()
     }
 }

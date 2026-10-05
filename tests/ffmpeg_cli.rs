@@ -141,7 +141,15 @@ fn ffmpeg_frames_carry_the_streams_colour_matrix_and_range() {
         eprintln!("skipped MJPEG: no mjpeg decoder");
         return;
     };
-    assert!(f.full_range, "JPEG video is full range");
+    // ffmpeg ≥ 7 keeps JPEG's full range; older versions convert to limited range. Either way
+    // the tag must match the samples: white above 236 only exists in full range (limited tops
+    // out at 235; lossy MJPEG pulls full-range white a little below 255).
+    let white = *f.planes[0].iter().max().unwrap();
+    if f.full_range {
+        assert!(white > 236, "tagged full range but white is {white}");
+    } else {
+        assert!(white <= 236, "tagged limited range but white is {white}");
+    }
 }
 
 #[test]
