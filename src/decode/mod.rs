@@ -1,12 +1,30 @@
 //! Packets -> decoded pictures.
 
+#[cfg(feature = "native-aac")]
+mod aac;
+mod audio;
+#[cfg(feature = "native")]
+mod channels;
 #[cfg(feature = "native")]
 mod av1;
+#[cfg(feature = "native")]
+mod opus;
+#[cfg(feature = "native")]
+mod opus_multistream;
+#[cfg(feature = "native")]
+mod vorbis;
 
 use std::time::Duration;
 
+#[cfg(feature = "native-aac")]
+pub use aac::AacAudioDecoder;
+pub use audio::{AudioBuffer, AudioDecoder};
 #[cfg(feature = "native")]
 pub use av1::Av1Decoder;
+#[cfg(feature = "native")]
+pub use opus::OpusAudioDecoder;
+#[cfg(feature = "native")]
+pub use vorbis::VorbisAudioDecoder;
 
 use crate::Result;
 use crate::demux::Packet;
