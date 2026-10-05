@@ -56,6 +56,9 @@ pub struct OpusAudioDecoder {
     pre_skip: usize,
     /// Frames still to discard (pre-skip at stream start).
     skip: usize,
+    /// Matroska block times are offset by the codec delay (= pre-skip); presentation time is
+    /// block time minus this, as ffmpeg's decoder reports it.
+    codec_delay: Duration,
     out: VecDeque<AudioBuffer>,
     pcm: Vec<f32>,
 }
@@ -86,6 +89,7 @@ impl OpusAudioDecoder {
             channels,
             pre_skip,
             skip: pre_skip,
+            codec_delay: stream.codec_delay,
             out: VecDeque::new(),
             pcm: vec![0.0; MAX_FRAMES * channels as usize],
         })
@@ -116,7 +120,8 @@ impl AudioDecoder for OpusAudioDecoder {
                     Inner::Multi(_) => to_wave_order(samples, self.channels),
                     Inner::Single(_) => samples,
                 },
-                pts: packet.pts + Duration::from_nanos(drop as u64 * 1_000_000_000 / RATE as u64),
+                pts: (packet.pts + Duration::from_nanos(drop as u64 * 1_000_000_000 / RATE as u64))
+                    .saturating_sub(self.codec_delay),
             });
         }
         Ok(())

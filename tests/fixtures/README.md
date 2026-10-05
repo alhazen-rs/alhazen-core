@@ -31,5 +31,19 @@ head -c 4096 /dev/urandom > not_video.bin
 - `truncated.webm` is the first 20000 bytes of `av1.webm`
 - Audio fixtures: a 440 Hz sine, 2 s (`vorbis_51_center.webm`: 1 s, tone on the centre channel only)
 - `av1_with_audio.webm`: Opus mono 48 kHz; `av1_vorbis.webm`: Vorbis mono 44.1 kHz; `av1_aac.mp4` / `aac_only.m4a`: AAC-LC mono 44.1 kHz
-- `opus_51.webm`: 6-channel (multistream) Opus, which phase 2 rejects at open
+- `opus_51.webm`: 6-channel (multistream) Opus; `opus_51_center.webm`: 1 s, tone on the centre only
 - ffmpeg writes `FlagDefault = 0` on audio tracks
+
+## Timing fixtures
+
+```bash
+ffmpeg -v error -y -f lavfi -t 2 -i 'aevalsrc=0.2*sin(2*PI*(100+400*t)*t):s=48000:d=2' -t 2 -c:a libopus -b:a 96k chirp_opus.webm
+ffmpeg -v error -y -f lavfi -t 2 -i 'aevalsrc=0.2*sin(2*PI*(100+400*t)*t):s=44100:d=2' -t 2 -c:a libvorbis -q:a 6 chirp_vorbis.webm
+ffmpeg -v error -y -f lavfi -t 2 -i testsrc2=size=320x240:rate=30 -f lavfi -t 1 -i sine=frequency=440:sample_rate=48000 -pix_fmt yuv420p -c:v libsvtav1 -preset 10 -g 30 -crf 45 -c:a libopus -b:a 32k av1_short_audio.webm
+```
+
+- `chirp_*.webm`: reference timestamps come from ffmpeg's decoder
+  (`ffprobe -select_streams a:0 -show_entries frame=pts_time,nb_samples`): Opus 0.000/648, 0.014/960, 0.034/960, 0.054/960;
+  Vorbis 0.000/576, 0.013/1024, 0.036/1024, 0.060/1024 (presentation time = Matroska block time − CodecDelay)
+- `av1_short_audio.webm`: 2 s of video but only 1 s of audio
+- Note for zsh: write filter strings literally (or `${VAR}`); `$VAR:s…` is a zsh modifier

@@ -15,6 +15,8 @@ pub struct VorbisAudioDecoder {
     ident: IdentHeader,
     setup: SetupHeader,
     pwr: PreviousWindowRight,
+    /// Presentation time is the Matroska block time minus CodecDelay (as ffmpeg reports it).
+    codec_delay: std::time::Duration,
     out: VecDeque<AudioBuffer>,
 }
 
@@ -28,7 +30,7 @@ impl VorbisAudioDecoder {
         let ident = read_header_ident(headers[0]).map_err(err)?;
         let setup = read_header_setup(headers[2], ident.audio_channels, (ident.blocksize_0, ident.blocksize_1))
             .map_err(err)?;
-        Ok(Self { ident, setup, pwr: PreviousWindowRight::new(), out: VecDeque::new() })
+        Ok(Self { ident, setup, pwr: PreviousWindowRight::new(), codec_delay: stream.codec_delay, out: VecDeque::new() })
     }
 }
 
@@ -44,7 +46,7 @@ impl AudioDecoder for VorbisAudioDecoder {
                 rate: self.ident.audio_sample_rate,
                 channels,
                 samples: to_wave_order(decoded.samples, channels),
-                pts: packet.pts,
+                pts: packet.pts.saturating_sub(self.codec_delay),
             });
         }
         Ok(())

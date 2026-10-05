@@ -178,4 +178,29 @@ pub(crate) mod tests {
         let zc = zero_crossings(&bufs);
         assert!((1_700..=1_830).contains(&zc), "got {zc}");
     }
+
+    /// Decoded buffers must carry the same timestamps as ffmpeg's decoder (the reference) gives
+    /// its frames: Matroska block time minus CodecDelay. Values from
+    /// `ffprobe -select_streams a:0 -show_entries frame=pts_time,nb_samples` on the fixtures;
+    /// Matroska timestamps have 1 ms resolution, hence the 1 ms tolerance.
+    fn assert_matches_reference(path: &str, make: impl FnOnce(&StreamInfo) -> Result<Box<dyn AudioDecoder>>, expected: &[(u64, usize)]) {
+        let (_, bufs) = decode_file(path, make);
+        for (b, &(ms, frames)) in bufs.iter().zip(expected) {
+            let want = Duration::from_millis(ms);
+            assert!(b.pts.abs_diff(want) <= Duration::from_millis(1), "{path}: buffer pts {:?}, reference {want:?}", b.pts);
+            assert_eq!(b.frames(), frames, "{path}: buffer at {:?}", b.pts);
+        }
+    }
+
+    #[test]
+    fn opus_timestamps_match_the_reference_decoder() {
+        let make = |s: &StreamInfo| -> Result<Box<dyn AudioDecoder>> { Ok(Box::new(crate::decode::OpusAudioDecoder::new(s)?)) };
+        assert_matches_reference("tests/fixtures/chirp_opus.webm", make, &[(0, 648), (14, 960), (34, 960), (54, 960)]);
+    }
+
+    #[test]
+    fn vorbis_timestamps_match_the_reference_decoder() {
+        let make = |s: &StreamInfo| -> Result<Box<dyn AudioDecoder>> { Ok(Box::new(crate::decode::VorbisAudioDecoder::new(s)?)) };
+        assert_matches_reference("tests/fixtures/chirp_vorbis.webm", make, &[(0, 576), (13, 1024), (36, 1024), (60, 1024)]);
+    }
 }
