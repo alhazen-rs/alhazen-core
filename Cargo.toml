@@ -5,6 +5,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["video", "player", "decoder", "av1", "vp9"]
+categories = ["multimedia::video", "multimedia::audio"]
+# Test fixtures and scripts stay in the repository (crates.io packages must be small).
+include = ["src/**", "examples/**", "LICENSE", "NOTICE"]
 
 [features]
 default = ["native", "http", "audio-output", "ffmpeg-cli"]

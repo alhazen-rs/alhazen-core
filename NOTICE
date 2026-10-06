@@ -2,8 +2,12 @@ gpui-native-video-player
 Copyright 2026 Mohamed A.
 
 This product includes software from gpui-native-video-player
-(the video-core and gpui-video crates), licensed under the Apache License,
-Version 2.0.
+(the video-core, gpui-video and vp9-mt crates), licensed under the Apache
+License, Version 2.0.
+
+vp9-mt is a modified version of rusty_vp9 0.1.1 by Mata Network
+(https://github.com/Remade-With-Rust/remade_ffmpeg_rs), licensed under the
+Apache License, Version 2.0.
 
 Under section 4(d) of the Apache License, if you distribute a work that
 includes this software, in source or binary form, you must include a
