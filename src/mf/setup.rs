@@ -4,8 +4,7 @@ use crate::demux::Codec;
 
 /// `MF_MT_USER_DATA` for an audio stream: for AAC the part of `HEAACWAVEINFO` after its
 /// `WAVEFORMATEX` (payload type raw, profile/level unknown) followed by the
-/// AudioSpecificConfig; for FLAC the `fLaC` marker and STREAMINFO block; for ALAC the
-/// ALACSpecificConfig ("magic cookie"). `None` when the codec needs none or data is missing.
+/// AudioSpecificConfig; for ALAC the ALACSpecificConfig ("magic cookie"). `None` when the codec needs none or data is missing.
 pub fn audio_user_data(codec: &Codec, extradata: Option<&[u8]>) -> Option<Vec<u8>> {
     match codec {
         Codec::Aac => {
@@ -16,7 +15,8 @@ pub fn audio_user_data(codec: &Codec, extradata: Option<&[u8]>) -> Option<Vec<u8
             v.extend_from_slice(asc);
             Some(v)
         }
-        Codec::Flac => flac_streaminfo(extradata?),
+        // None for FLAC, as Windows' own demuxer does: the frames describe themselves, and the
+        // decoder hangs when given the STREAMINFO header.
         Codec::Alac => extradata.filter(|c| c.len() >= 24).map(|c| c[..24].to_vec()),
         _ => None,
     }
@@ -25,14 +25,15 @@ pub fn audio_user_data(codec: &Codec, extradata: Option<&[u8]>) -> Option<Vec<u8
 /// Bits per sample of a lossless stream (FLAC STREAMINFO, ALAC cookie), which Windows' FLAC and
 /// ALAC decoders require on their input type.
 pub fn audio_bits(codec: &Codec, extradata: Option<&[u8]>) -> Option<u32> {
-    let data = audio_user_data(codec, extradata)?;
-    match codec {
+    if *codec == Codec::Flac {
         // fLaC(4) + block header(4) + STREAMINFO: bits-per-sample − 1 is 5 bits at byte 12 bit 0 ..
         // byte 13 bit 4.
-        Codec::Flac => {
-            let info = data.get(8..)?;
-            Some((((info.get(12)? & 1) << 4 | info.get(13)? >> 4) + 1) as u32)
-        }
+        let info = flac_streaminfo(extradata?)?;
+        let info = info.get(8..)?;
+        return Some((((info.get(12)? & 1) << 4 | info.get(13)? >> 4) + 1) as u32);
+    }
+    let data = audio_user_data(codec, extradata)?;
+    match codec {
         // ALACSpecificConfig: frameLength u32, compatibleVersion u8, bitDepth u8, …
         Codec::Alac => data.get(5).map(|&b| b as u32),
         _ => None,
@@ -80,17 +81,13 @@ mod tests {
     }
 
     #[test]
-    fn flac_user_data_is_marker_and_streaminfo() {
-        // fLaC, STREAMINFO (not last, 34 bytes of 7s), then a PADDING block.
+    fn flac_gets_no_user_data_like_windows_own_demuxer() {
+        // Windows' MKV source gives its FLAC decoder no MF_MT_USER_DATA (the frames describe
+        // themselves); handing it the STREAMINFO header made the decoder hang.
         let mut h = b"fLaC".to_vec();
-        h.extend_from_slice(&[0x00, 0, 0, 34]);
+        h.extend_from_slice(&[0x80, 0, 0, 34]);
         h.extend_from_slice(&[7; 34]);
-        h.extend_from_slice(&[0x81, 0, 0, 2, 0, 0]);
-        let v = audio_user_data(&Codec::Flac, Some(&h)).unwrap();
-        assert_eq!(v.len(), 4 + 4 + 34);
-        assert_eq!(&v[..5], b"fLaC\x80");
-        assert!(v[8..].iter().all(|&b| b == 7));
-        assert!(audio_user_data(&Codec::Flac, Some(b"junk")).is_none());
+        assert!(audio_user_data(&Codec::Flac, Some(&h)).is_none());
     }
 
     #[test]
