@@ -90,7 +90,15 @@ impl AudioLoop {
             }
             let msg = match rx.recv_timeout(POLL) {
                 Ok(m) => m,
-                Err(RecvTimeoutError::Timeout) => continue,
+                // Decoders with delayed output (ffmpeg) produce samples after their packets: collect
+                // them even when no packet comes (demuxing paused by video back-pressure), or the
+                // audio clock, and with it the video, would wait for audio that is already decoded.
+                Err(RecvTimeoutError::Timeout) => {
+                    if !self.drain(shared) {
+                        return;
+                    }
+                    continue;
+                }
                 Err(RecvTimeoutError::Disconnected) => return,
             };
             let keep_going = match msg {

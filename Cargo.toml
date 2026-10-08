@@ -1,7 +1,7 @@
 [package]
 name = "alhazen-core"
 description = "Native media engine for Rust: plays video and audio from files and HTTP, with pure-Rust and OS (GPU) decoders. UI-agnostic."
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.92"
