@@ -7,7 +7,8 @@ use super::sys::*;
 use crate::hw::select::HwCodec;
 use crate::{Error, Result};
 
-/// The CUDA context NVDEC works in (device 0), created on first use and never destroyed.
+/// The CUDA context NVDEC works in (device 0's primary context), created on first use and kept
+/// for the life of the process.
 pub struct Device {
     api: &'static Api,
     ctx: CUcontext,
@@ -26,10 +27,33 @@ pub struct Caps {
     pub min: (u32, u32),
 }
 
+static DEVICE: OnceLock<Option<Device>> = OnceLock::new();
+
 /// The process's NVDEC device, or `None` without NVIDIA's driver or a CUDA device.
 pub fn get() -> Option<&'static Device> {
-    static DEVICE: OnceLock<Option<Device>> = OnceLock::new();
     DEVICE.get_or_init(Device::open).as_ref()
+}
+
+/// The driver and a CUDA device, without creating a context (which would power up the GPU).
+fn device() -> Option<(&'static Api, CUdevice)> {
+    static DEV: OnceLock<Option<CUdevice>> = OnceLock::new();
+    let api = Api::get()?;
+    let dev = DEV.get_or_init(|| {
+        let mut dev = 0;
+        // SAFETY: plain driver calls with a valid out-pointer.
+        unsafe { ((api.cuInit)(0) == CUDA_SUCCESS && (api.cuDeviceGet)(&mut dev, 0) == CUDA_SUCCESS).then_some(dev) }
+    });
+    Some((api, (*dev)?))
+}
+
+/// Whether NVDEC can be used (driver present, a CUDA device exists); creates no context.
+pub fn present() -> bool {
+    device().is_some()
+}
+
+/// Whether the CUDA context exists yet (it is created on first use).
+pub fn created() -> bool {
+    DEVICE.get().is_some_and(|d| d.is_some())
 }
 
 /// NVDEC's id for a video codec we decode with it.
@@ -51,25 +75,14 @@ pub fn check(r: CUresult, what: &str) -> Result<()> {
 
 impl Device {
     fn open() -> Option<Device> {
-        let api = Api::get()?;
-        // SAFETY: plain driver calls with valid out-pointers.
-        unsafe {
-            if (api.cuInit)(0) != CUDA_SUCCESS {
-                return None;
-            }
-            let mut dev = 0;
-            if (api.cuDeviceGet)(&mut dev, 0) != CUDA_SUCCESS {
-                return None;
-            }
-            let mut ctx = std::ptr::null_mut();
-            if (api.cuCtxCreate)(&mut ctx, 0, dev) != CUDA_SUCCESS {
-                return None;
-            }
-            // Created contexts start current on this thread; users push it themselves.
-            let mut popped = std::ptr::null_mut();
-            (api.cuCtxPopCurrent)(&mut popped);
-            Some(Device { api, ctx, caps: Mutex::default() })
+        let (api, dev) = device()?;
+        let mut ctx = std::ptr::null_mut();
+        // SAFETY: valid out-pointer and device. The primary context is the one CUDA code in the
+        // host application shares; retained for the life of the process (never released).
+        if unsafe { (api.cuDevicePrimaryCtxRetain)(&mut ctx, dev) } != CUDA_SUCCESS {
+            return None;
         }
+        Some(Device { api, ctx, caps: Mutex::default() })
     }
 
     pub fn api(&self) -> &'static Api {

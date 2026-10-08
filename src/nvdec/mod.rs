@@ -19,7 +19,16 @@ mod sys;
 /// Whether NVDEC can be used on this machine (driver libraries present, a CUDA device exists).
 pub fn available() -> bool {
     #[cfg(all(target_os = "linux", feature = "nvdec"))]
-    return device::get().is_some();
+    return device::present();
+    #[cfg(not(all(target_os = "linux", feature = "nvdec")))]
+    false
+}
+
+/// Whether NVDEC's CUDA context has been created (it should only be once a video needs it).
+#[doc(hidden)]
+pub fn context_created() -> bool {
+    #[cfg(all(target_os = "linux", feature = "nvdec"))]
+    return device::created();
     #[cfg(not(all(target_os = "linux", feature = "nvdec")))]
     false
 }

@@ -271,7 +271,7 @@ zeroable!(
 pub struct Api {
     pub cuInit: unsafe extern "C" fn(c_uint) -> CUresult,
     pub cuDeviceGet: unsafe extern "C" fn(*mut CUdevice, c_int) -> CUresult,
-    pub cuCtxCreate: unsafe extern "C" fn(*mut CUcontext, c_uint, CUdevice) -> CUresult,
+    pub cuDevicePrimaryCtxRetain: unsafe extern "C" fn(*mut CUcontext, CUdevice) -> CUresult,
     pub cuCtxPushCurrent: unsafe extern "C" fn(CUcontext) -> CUresult,
     pub cuCtxPopCurrent: unsafe extern "C" fn(*mut CUcontext) -> CUresult,
     pub cuMemAllocHost: unsafe extern "C" fn(*mut *mut c_void, usize) -> CUresult,
@@ -319,7 +319,7 @@ impl Api {
             Ok(Api {
                 cuInit: sym!(cuda, "cuInit"),
                 cuDeviceGet: sym!(cuda, "cuDeviceGet"),
-                cuCtxCreate: sym!(cuda, "cuCtxCreate_v2"),
+                cuDevicePrimaryCtxRetain: sym!(cuda, "cuDevicePrimaryCtxRetain"),
                 cuCtxPushCurrent: sym!(cuda, "cuCtxPushCurrent_v2"),
                 cuCtxPopCurrent: sym!(cuda, "cuCtxPopCurrent_v2"),
                 cuMemAllocHost: sym!(cuda, "cuMemAllocHost_v2"),

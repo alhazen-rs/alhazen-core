@@ -194,6 +194,9 @@ Each stream is offered to the backends in priority order; the first that claims 
 
 - `PlayerConfig::prefer_hardware = false` puts `native` before the GPU decoders
   (`media-foundation`, `nvdec`) for VP8/VP9/AV1.
+- **A decoder that can't decode a stream** hands it to the next backend automatically, e.g. a
+  GPU without 10-bit H.264 or 4:4:4 support. GPU decoders don't even take such streams when the
+  file's setup data shows the variant up front.
 - **Automatic fallback:** if a decoder falls behind (more than 100 ms late for 1.5 s), the
   stream switches once to the next backend that can decode it, at the same position.
   `auto_fallback = false` turns this off.
@@ -266,7 +269,9 @@ point. Seeking passes through `Buffering`.
 - **Windows:** Windows 10 or 11. Media Foundation is missing from "N" editions until the
   Media Feature Pack is installed; the engine then falls back to the other backends.
 - **Linux GPU decoding:** an NVIDIA GPU and its proprietary driver; nothing else at build or run
-  time. Without it, playback uses the other backends. (Intel/AMD through VA-API is planned.)
+  time. Without it, playback uses the other backends. (Intel/AMD through VA-API is planned.) The
+  GPU is only woken up once a video needs it, so audio-only playback leaves a laptop's discrete
+  GPU asleep.
 - **ffmpeg** (optional, at runtime): 4.0+. CI tests 6–9 on Linux, Windows and macOS.
 
 ## Performance
