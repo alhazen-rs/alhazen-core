@@ -15,7 +15,7 @@ categories = ["multimedia::video", "multimedia::audio", "multimedia"]
 include = ["src/**", "examples/**", "LICENSE", "NOTICE", "README.md"]
 
 [features]
-default = ["native", "http", "audio-output", "ffmpeg-cli", "media-foundation"]
+default = ["native", "http", "audio-output", "ffmpeg-cli", "media-foundation", "nvdec"]
 # Pure-Rust, permissively licensed decoders: AV1 (rav1d), VP9 (vp9-mt), VP8 (oximedia-codec),
 # ProRes (oxideav-prores), Opus, Vorbis, FLAC (claxon); MP4/MOV demuxing.
 native = ["dep:rav1d", "dep:vp9-mt", "dep:oximedia-codec", "dep:oxideav-prores", "dep:re_mp4", "dep:opus-pure", "dep:lewton", "dep:claxon"]
@@ -27,8 +27,11 @@ http = ["dep:ureq"]
 # for codecs no native decoder handles, or when native decoding is too slow (auto fallback).
 ffmpeg-cli = ["dep:windows"]
 # Windows' own decoders through Media Foundation (Windows only; nothing on other platforms):
-# H.264, HEVC, VP9, AV1 (GPU-accelerated where supported), AAC, MP3, AC-3, E-AC-3, FLAC, ALAC.
+# H.264, HEVC, VP9, AV1 (GPU-accelerated where supported), AAC, MP3, AC-3, E-AC-3, ALAC.
 media-foundation = ["dep:windows"]
+# NVIDIA's GPU decoders on Linux (NVDEC): H.264, HEVC, VP8, VP9, AV1. Loaded at runtime from the
+# driver (nothing linked, no build requirements); nothing on other platforms.
+nvdec = ["dep:libloading"]
 # Sound output through cpal. On Linux this needs ALSA development files (libasound2-dev).
 audio-output = ["dep:cpal"]
 
@@ -62,6 +65,9 @@ rav1d = { version = "1.1.0", optional = true }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 rav1d = { version = "1.1.0", optional = true, default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libloading = { version = "0.9", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", optional = true, features = [

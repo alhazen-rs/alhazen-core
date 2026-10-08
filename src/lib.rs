@@ -13,6 +13,7 @@ pub mod hw;
 mod player;
 pub mod mf;
 pub mod nal;
+pub mod nvdec;
 mod scale;
 pub mod source;
 
