@@ -210,3 +210,81 @@ fn streams_outside_the_gpus_size_limits_are_not_claimed() {
     assert!(!backend.supports_video(&stream(Codec::H264, 8192, 8192)), "above H.264's 4096x4096 maximum");
     assert!(backend.supports_video(&stream(Codec::Av1, 0, 0)), "unknown size: let the decoder decide");
 }
+
+#[test]
+fn output_hint_scales_on_the_gpu() {
+    if !gpu() {
+        return;
+    }
+    let frames = decode("av1.webm", Some((160, 160)));
+    assert!(frames.iter().all(|f| (f.width, f.height) == (160, 120)), "{:?}", (frames[0].width, frames[0].height));
+    let frames = decode("hevc_10bit.mp4", Some((4000, 4000)));
+    assert!(frames.iter().all(|f| (f.width, f.height) == (320, 240)), "never enlarged");
+}
+
+#[test]
+fn output_hint_change_applies_at_the_next_keyframe() {
+    if !gpu() {
+        return;
+    }
+    // av1.webm has keyframes at 0 and 1 s (frame 30).
+    let mut d = demuxer("av1.webm");
+    let s = video(d.as_ref());
+    let mut dec = NvdecVideoDecoder::new(&s).unwrap();
+    let mut frames = vec![];
+    let mut sent = 0;
+    while let Some(p) = d.next_packet().unwrap() {
+        if p.stream != s.id {
+            continue;
+        }
+        if sent == 10 {
+            dec.set_output_hint(Some((160, 120))); // window shrinks mid-GOP
+        }
+        dec.send_packet(&p).unwrap();
+        sent += 1;
+        while let Some(DecodedFrame::Yuv(f)) = dec.receive_frame().unwrap() {
+            frames.push(f);
+        }
+    }
+    dec.send_eof();
+    while let Some(DecodedFrame::Yuv(f)) = dec.receive_frame().unwrap() {
+        frames.push(f);
+    }
+    assert_eq!(frames.len(), 60);
+    // The new size applies when the keyframe arrives; a picture already decoded and waiting for
+    // display (here frame 29) comes out at the new size too.
+    assert!(frames[..29].iter().all(|f| f.width == 320), "full size until just before the keyframe");
+    assert!(frames[30..].iter().all(|f| (f.width, f.height) == (160, 120)), "scaled from the keyframe on");
+    // Pictures around the switch are intact: compare with ffmpeg's decode scaled the same way.
+    for i in [29, 30] {
+        let f = &frames[i];
+        let Some(reference) = ffmpeg_frame("av1.webm", i, (f.width, f.height)) else { return };
+        let db = psnr(&f.planes.concat(), &reference);
+        eprintln!("frame {i} at {}x{}: {db:.1} dB", f.width, f.height);
+        assert!(db >= 25.0, "frame {i}: {db:.1} dB (corrupt?)");
+    }
+}
+
+/// ffmpeg's frame `index` scaled to `size`, 8-bit planar 4:2:0, or `None` without ffmpeg.
+fn ffmpeg_frame(name: &str, index: usize, size: (u32, u32)) -> Option<Vec<u8>> {
+    let filter = format!("select=eq(n\\,{index}),scale={}:{}", size.0, size.1);
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i", &fixture(name), "-vf", &filter, "-frames:v", "1", "-pix_fmt", "yuv420p", "-f", "rawvideo", "-"])
+        .output()
+        .ok()?;
+    assert!(out.status.success(), "ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
+    Some(out.stdout)
+}
+
+#[test]
+fn a_hint_below_the_gpus_minimum_still_decodes() {
+    if !gpu() {
+        return;
+    }
+    // A thumbnail-sized view: HEVC's decoder minimum is 144x144, VP9/AV1's 128x128.
+    for name in ["hevc.mkv", "av1.webm", "h264_aac.mp4"] {
+        let frames = decode(name, Some((64, 36)));
+        assert!(!frames.is_empty(), "{name}: no frames");
+        assert!(frames.iter().all(|f| f.width <= 320 && f.height <= 240), "{name}: never enlarged");
+    }
+}
