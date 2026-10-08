@@ -8,7 +8,7 @@ use crate::hw::select::HwCodec;
 use super::super::setup::{audio_bits, audio_user_data, frame_duration};
 use super::mft::{self, Output, err};
 use super::{codecs, runtime};
-use crate::decode::{AudioBuffer, AudioDecoder};
+use crate::decode::{AudioBuffer, AudioDecoder, DelayTrim};
 use crate::demux::{Packet, StreamInfo};
 use crate::{Error, Result};
 
@@ -28,6 +28,8 @@ pub struct MfAudioDecoder {
     stream: StreamInfo,
     state: Option<State>,
     ready: VecDeque<AudioBuffer>,
+    /// The encoder's start-up padding (MP4 edit list): Media Foundation's decoder doesn't drop it.
+    trim: DelayTrim,
 }
 
 // SAFETY: as `MfVideoDecoder`: created lazily on the decode thread, used only through
@@ -36,7 +38,7 @@ unsafe impl Send for MfAudioDecoder {}
 
 impl MfAudioDecoder {
     pub fn new(codec: HwCodec, stream: &StreamInfo) -> Result<Self> {
-        Ok(Self { codec, stream: stream.clone(), state: None, ready: VecDeque::new() })
+        Ok(Self { codec, stream: stream.clone(), state: None, ready: VecDeque::new(), trim: DelayTrim::new(stream.codec_delay) })
     }
 
     pub fn description(&self) -> Option<String> {
@@ -97,7 +99,10 @@ impl MfAudioDecoder {
                     return Ok(false);
                 }
                 let samples = pcm_to_f32(&bytes, s.int_bits);
-                self.ready.push_back(AudioBuffer { rate: s.rate, channels: s.channels, samples, pts });
+                let (rate, channels) = (s.rate, s.channels);
+                if let Some(b) = self.trim.apply(samples, channels, rate, pts) {
+                    self.ready.push_back(b);
+                }
                 Ok(true)
             }
             Output::NeedMoreInput => Ok(false),
@@ -120,6 +125,7 @@ impl AudioDecoder for MfAudioDecoder {
             return Ok(());
         }
         let mft = self.state()?.mft.clone();
+        self.trim.on_packet(packet.pts);
         let duration = frame_duration(&self.stream.codec, self.stream.extradata.as_deref(), self.stream.sample_rate);
         let sample = mft::sample(&packet.data, packet.pts, duration)?;
         // SAFETY: COM call on a live transform.
@@ -147,6 +153,7 @@ impl AudioDecoder for MfAudioDecoder {
 
     fn flush(&mut self) {
         self.ready.clear();
+        self.trim.reset();
         if let Some(s) = &self.state {
             mft::flush(&s.mft);
             let _ = mft::begin_streaming(&s.mft);

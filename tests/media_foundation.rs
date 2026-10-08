@@ -216,3 +216,37 @@ fn seeking_restarts_the_decoder_at_the_target() {
         });
     }
 }
+
+/// AAC through Media Foundation lines up with ffmpeg (which honours the MP4 edit list): the
+/// encoder's start-up padding is trimmed.
+#[test]
+fn aac_padding_is_trimmed() {
+    let Some(reference) = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i", &fixture("h264_aac.mp4"), "-map", "0:a:0", "-f", "f32le", "-"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| o.stdout.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect::<Vec<f32>>())
+    else {
+        eprintln!("skipped: no ffmpeg");
+        return;
+    };
+    let mut d = demuxer("h264_aac.mp4");
+    let s = track(d.as_ref(), StreamKind::Audio);
+    let mut dec = MfAudioDecoder::new(HwCodec::of(&s).unwrap(), &s).unwrap();
+    let (mut ours, mut first) = (vec![], None);
+    while let Some(p) = d.next_packet().unwrap() {
+        if p.stream != s.id {
+            continue;
+        }
+        dec.send_packet(&p).unwrap();
+        while let Some(b) = dec.receive_samples().unwrap() {
+            first.get_or_insert(b.pts);
+            ours.extend(b.samples);
+        }
+    }
+    assert_eq!(first, Some(Duration::ZERO));
+    let n = ours.len().min(reference.len()).min(44_100);
+    let worst = ours[..n].iter().zip(&reference[..n]).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    assert!(worst < 0.01, "not aligned with ffmpeg: worst {worst}");
+}
