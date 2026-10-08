@@ -70,6 +70,15 @@ impl Mp4Demuxer {
                         audio_specific_config(d.profile, d.freq_index, d.chan_conf)
                     })
                 });
+                // Encoder priming (AAC: 1024 frames, HE-AAC: more): the edit list says where the
+                // presentation starts, which is what Matroska calls CodecDelay.
+                let trak = track.trak(&mp4);
+                let skip = trak.edts.as_ref().and_then(|e| e.elst.as_ref()).and_then(|elst| {
+                    leading_skip(elst.entries.iter().map(|e| e.media_time))
+                });
+                if let Some(skip) = skip {
+                    info.codec_delay = ticks(skip as i64, timescale);
+                }
             }
             // re_mp4 only knows a few sample entries; QuickTime ProRes tracks come out as
             // "unknown" with no kind, so read the sample entry's FourCC ourselves.
@@ -370,6 +379,13 @@ fn raw_audio_specific_config(moov: &[u8], track_id: u32) -> Option<Vec<u8>> {
 }
 
 /// The DecSpecificInfo (AudioSpecificConfig) bytes inside an `esds` payload (ISO 14496-1).
+/// The media time the presentation starts at: the first edit-list entry that is not an "empty
+/// edit" (media_time −1, stored as u32::MAX in version 0 or u64::MAX in version 1). `None` for 0
+/// or no such entry.
+fn leading_skip(media_times: impl IntoIterator<Item = u64>) -> Option<u64> {
+    media_times.into_iter().find(|&t| t != u32::MAX as u64 && t != u64::MAX).filter(|&t| t > 0)
+}
+
 fn parse_esds_asc(esds: &[u8]) -> Option<Vec<u8>> {
     parse_esds(esds)?.1
 }
@@ -434,6 +450,27 @@ fn ticks(t: i64, timescale: u64) -> Duration {
 mod tests {
     use super::*;
     use crate::source::FileSource;
+    use std::time::Duration;
+
+    #[test]
+    fn leading_skip_ignores_empty_edits() {
+        assert_eq!(leading_skip([1024]), Some(1024));
+        assert_eq!(leading_skip([u32::MAX as u64, 2048]), Some(2048), "empty edit (v0) then the media");
+        assert_eq!(leading_skip([u64::MAX, 7106]), Some(7106), "empty edit (v1)");
+        assert_eq!(leading_skip([0]), None);
+        assert_eq!(leading_skip([u32::MAX as u64]), None);
+        assert_eq!(leading_skip(Vec::<u64>::new()), None);
+    }
+
+    #[test]
+    fn aac_tracks_report_their_edit_list_skip_as_codec_delay() {
+        // ffmpeg writes elst media_time 1024 (AAC-LC priming) for its AAC tracks.
+        let d = Mp4Demuxer::open(Box::new(FileSource::open("tests/fixtures/h264_aac.mp4").unwrap())).unwrap();
+        let audio = d.streams().iter().find(|s| s.kind == StreamKind::Audio).unwrap();
+        assert_eq!(audio.codec_delay, ticks(1024, 44_100), "same rounding as every MP4 timestamp");
+        let video = d.streams().iter().find(|s| s.kind == StreamKind::Video).unwrap();
+        assert_eq!(video.codec_delay, Duration::ZERO, "video is unchanged");
+    }
 
     fn open() -> Mp4Demuxer {
         Mp4Demuxer::open(Box::new(FileSource::open("tests/fixtures/av1.mp4").unwrap())).unwrap()
