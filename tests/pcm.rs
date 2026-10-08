@@ -44,7 +44,7 @@ fn ffmpeg(name: &str) -> Option<Vec<f32>> {
         .output()
         .ok()?;
     assert!(out.status.success());
-    Some(out.stdout.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
+    Some(out.stdout.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect())
 }
 
 fn check(name: &str) {

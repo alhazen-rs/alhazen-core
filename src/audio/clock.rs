@@ -147,11 +147,21 @@ mod tests {
         clock.resume();
         push_frames(&mut out.producer, &out.shared, &[0.1; 200], || true); // the ring holds 200 ms here
         // 100 ms buffer whose first frame reaches the speaker 30 ms from now.
+        let rendered = std::time::Instant::now();
         null.render_realtime(100, Duration::from_millis(30));
         assert!(clock.now() < Duration::from_millis(5), "nothing audible yet: {:?}", clock.now());
         std::thread::sleep(Duration::from_millis(80));
-        let mid = clock.now();
-        assert!(mid > Duration::from_millis(35) && mid < Duration::from_millis(75), "mid-buffer: {mid:?}");
+        // Expected: time since the callback minus the 30 ms delay, within the 100 ms buffer.
+        // Measured rather than assumed, so a sleep that overruns on a busy machine still checks.
+        let (before, mid, after) = (rendered.elapsed(), clock.now(), rendered.elapsed());
+        let expect = |t: Duration| t.saturating_sub(Duration::from_millis(30)).min(Duration::from_millis(100));
+        let slack = Duration::from_millis(10);
+        assert!(
+            mid + slack >= expect(before) && mid <= expect(after) + slack,
+            "mid-buffer: {mid:?}, expected {:?}..{:?}",
+            expect(before),
+            expect(after)
+        );
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(clock.now(), Duration::from_millis(100), "clamped at the end of what was played");
     }

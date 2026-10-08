@@ -36,6 +36,14 @@ pub enum Codec {
     Opus,
     Vorbis,
     Aac,
+    Mp3,
+    /// Dolby Digital.
+    Ac3,
+    /// Dolby Digital Plus.
+    Eac3,
+    Flac,
+    /// Apple Lossless.
+    Alac,
     /// Uncompressed PCM audio.
     Pcm(PcmFormat),
     Other(String),
@@ -73,6 +81,11 @@ impl Codec {
             "V_PRORES" => Codec::ProRes,
             "A_OPUS" => Codec::Opus,
             "A_VORBIS" => Codec::Vorbis,
+            "A_MPEG/L3" => Codec::Mp3,
+            "A_AC3" => Codec::Ac3,
+            "A_EAC3" => Codec::Eac3,
+            "A_FLAC" => Codec::Flac,
+            "A_ALAC" => Codec::Alac,
             // Bit depth comes from the track's BitDepth element; Matroska 8-bit PCM is unsigned.
             "A_PCM/INT/LIT" => Codec::Pcm(PcmFormat::int(0, false, true)),
             "A_PCM/INT/BIG" => Codec::Pcm(PcmFormat::int(0, true, true)),
@@ -94,6 +107,10 @@ impl Codec {
             "apco" | "apcs" | "apcn" | "apch" | "ap4h" | "ap4x" => Codec::ProRes,
             "Opus" | "opus" => Codec::Opus,
             "mp4a" => Codec::Aac,
+            "ac-3" => Codec::Ac3,
+            "ec-3" => Codec::Eac3,
+            "fLaC" => Codec::Flac,
+            "alac" => Codec::Alac,
             _ => Codec::Other(s.to_owned()),
         }
     }
@@ -236,6 +253,15 @@ mod tests {
         assert_eq!(Codec::from_mp4_codec_string("avc1.64001f"), Codec::H264);
         assert_eq!(Codec::from_mp4_codec_string("xyz1"), Codec::Other("xyz1".into()));
         assert_eq!(Codec::from_matroska_id("V_PRORES"), Codec::ProRes);
+        assert_eq!(Codec::from_matroska_id("A_MPEG/L3"), Codec::Mp3);
+        assert_eq!(Codec::from_matroska_id("A_AC3"), Codec::Ac3);
+        assert_eq!(Codec::from_matroska_id("A_EAC3"), Codec::Eac3);
+        assert_eq!(Codec::from_matroska_id("A_FLAC"), Codec::Flac);
+        assert_eq!(Codec::from_matroska_id("A_ALAC"), Codec::Alac);
+        assert_eq!(Codec::from_mp4_codec_string("ac-3"), Codec::Ac3);
+        assert_eq!(Codec::from_mp4_codec_string("ec-3"), Codec::Eac3);
+        assert_eq!(Codec::from_mp4_codec_string("fLaC"), Codec::Flac);
+        assert_eq!(Codec::from_mp4_codec_string("alac"), Codec::Alac);
         assert_eq!(Codec::from_mp4_codec_string("ap4h"), Codec::ProRes);
         assert_eq!(Codec::Vp9.to_string(), "Vp9");
     }

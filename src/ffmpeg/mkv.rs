@@ -20,6 +20,11 @@ pub fn matroska_codec_id(stream: &StreamInfo) -> Option<String> {
             Codec::Opus => "A_OPUS",
             Codec::Vorbis => "A_VORBIS",
             Codec::Aac => "A_AAC",
+            Codec::Mp3 => "A_MPEG/L3",
+            Codec::Ac3 => "A_AC3",
+            Codec::Eac3 => "A_EAC3",
+            Codec::Flac => "A_FLAC",
+            Codec::Alac => "A_ALAC",
             // Matroska sources keep the original CodecID for codecs we don't model.
             Codec::Other(id) if id.starts_with("V_") || id.starts_with("A_") => id,
             // Native PCM always decodes it; the header writer has no BitDepth element.

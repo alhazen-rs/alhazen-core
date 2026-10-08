@@ -41,8 +41,18 @@ impl Registry {
 
     /// Every backend compiled in through Cargo features, with this ffmpeg configuration.
     pub fn with_ffmpeg(ffmpeg: &crate::FfmpegConfig) -> Self {
+        Self::with_options(ffmpeg, true)
+    }
+
+    /// Every backend compiled in through Cargo features. `prefer_hardware`: platform decoders
+    /// (Media Foundation on Windows) rank ahead of the native ones for codecs both handle.
+    pub fn with_options(ffmpeg: &crate::FfmpegConfig, prefer_hardware: bool) -> Self {
         #[cfg_attr(not(any(feature = "native", feature = "ffmpeg-cli")), allow(unused_mut))]
         let mut r = Self::empty();
+        #[cfg(all(windows, feature = "media-foundation"))]
+        r.register(Arc::new(crate::mf::MfBackend::new(prefer_hardware)));
+        #[cfg(not(all(windows, feature = "media-foundation")))]
+        let _ = prefer_hardware;
         #[cfg(feature = "native")]
         r.register(Arc::new(NativeBackend));
         #[cfg(feature = "ffmpeg-cli")]
@@ -51,6 +61,15 @@ impl Registry {
         }
         #[cfg(not(feature = "ffmpeg-cli"))]
         let _ = ffmpeg;
+        r
+    }
+
+    /// Only the native backend (demuxers and pure-Rust decoders), when compiled in.
+    pub fn empty_with_native() -> Self {
+        #[cfg_attr(not(feature = "native"), allow(unused_mut))]
+        let mut r = Self::empty();
+        #[cfg(feature = "native")]
+        r.register(Arc::new(NativeBackend));
         r
     }
 
@@ -190,7 +209,7 @@ impl Backend for NativeBackend {
     }
     fn supports_audio(&self, stream: &StreamInfo) -> bool {
         use crate::demux::Codec;
-        matches!(stream.codec, Codec::Opus | Codec::Vorbis | Codec::Pcm(_))
+        matches!(stream.codec, Codec::Opus | Codec::Vorbis | Codec::Flac | Codec::Pcm(_))
             || (cfg!(feature = "native-aac") && stream.codec == Codec::Aac)
     }
     fn open_audio_decoder(&self, stream: &StreamInfo) -> Result<Box<dyn AudioDecoder>> {
@@ -198,6 +217,7 @@ impl Backend for NativeBackend {
         Ok(match stream.codec {
             Codec::Opus => Box::new(crate::decode::OpusAudioDecoder::new(stream)?),
             Codec::Vorbis => Box::new(crate::decode::VorbisAudioDecoder::new(stream)?),
+            Codec::Flac => Box::new(crate::decode::FlacAudioDecoder::new(stream)?),
             Codec::Pcm(_) => Box::new(crate::decode::PcmAudioDecoder::new(stream)?),
             #[cfg(feature = "native-aac")]
             Codec::Aac => Box::new(crate::decode::AacAudioDecoder::new(stream)?),
@@ -264,7 +284,8 @@ mod tests {
     #[cfg(feature = "native")]
     #[test]
     fn native_backend_does_not_claim_h264() {
-        let r = Registry::with_ffmpeg(&crate::FfmpegConfig { enabled: false, ..Default::default() });
+        // Native only: platform decoders (Media Foundation) and ffmpeg may claim H.264.
+        let r = Registry::empty_with_native();
         let h264 = StreamInfo::new(1, StreamKind::Video, Codec::H264);
         assert!(matches!(
             r.open_video_decoder(&h264, 1, None),

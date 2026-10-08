@@ -10,6 +10,8 @@ mod error;
 pub mod ffmpeg;
 pub mod frame;
 mod player;
+pub mod mf;
+pub mod nal;
 mod scale;
 pub mod source;
 
