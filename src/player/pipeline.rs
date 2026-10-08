@@ -335,6 +335,7 @@ impl DecodeLoop {
             return true;
         }
         self.waiting_for_keyframe = false;
+        self.decoder.set_output_hint(shared.max_output_size());
         let start = Instant::now();
         let sent = self.decoder.send_packet(&p);
         self.busy += start.elapsed();
@@ -543,6 +544,35 @@ mod tests {
             Ok(None)
         }
         fn flush(&mut self) {}
+    }
+
+    /// Records the output hints it is given.
+    struct HintRecorder(Arc<Mutex<Vec<Option<(u32, u32)>>>>);
+    impl VideoDecoder for HintRecorder {
+        fn send_packet(&mut self, _: &Packet) -> Result<()> {
+            Ok(())
+        }
+        fn receive_frame(&mut self) -> Result<Option<DecodedFrame>> {
+            Ok(None)
+        }
+        fn flush(&mut self) {}
+        fn set_output_hint(&mut self, max: Option<(u32, u32)>) {
+            self.0.lock().unwrap().push(max);
+        }
+    }
+
+    #[test]
+    fn decoders_get_the_display_size_before_each_packet() {
+        let shared = shared(Arc::new(MockClock::new()));
+        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+        let hints = Arc::new(Mutex::new(Vec::new()));
+        let mut decode = DecodeLoop::new(Box::new(HintRecorder(hints.clone())), pool);
+        let packet = || Packet { stream: 1, pts: Duration::ZERO, keyframe: true, data: vec![0], generation: 0 };
+        shared.max_output_size.store(crate::player::pack_size(Some((1280, 720))), Ordering::Relaxed);
+        assert!(decode.on_packet(&shared, packet()));
+        shared.max_output_size.store(crate::player::pack_size(None), Ordering::Relaxed);
+        assert!(decode.on_packet(&shared, packet()));
+        assert_eq!(*hints.lock().unwrap(), vec![Some((1280, 720)), None]);
     }
 
     fn shared(clock: Arc<MockClock>) -> Shared {

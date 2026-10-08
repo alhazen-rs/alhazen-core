@@ -138,4 +138,8 @@ pub trait VideoDecoder: Send {
     /// No more packets until the next `flush`: decoders with delayed output (an external
     /// process) make `receive_frame` wait for and return the rest, then `Ok(None)`.
     fn send_eof(&mut self) {}
+    /// The largest frame size wanted (usually the display size in device pixels), so decoders
+    /// that can scale cheaply (NVDEC's hardware scaler) produce frames no larger. Frames may
+    /// still come out larger; the pipeline scales those down. Called before every packet.
+    fn set_output_hint(&mut self, _max: Option<(u32, u32)>) {}
 }
