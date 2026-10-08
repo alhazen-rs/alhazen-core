@@ -62,8 +62,8 @@ pub fn header(stream: &StreamInfo) -> Option<Vec<u8>> {
 
     let mut info = Vec::new();
     element(&mut info, &[0x2A, 0xD7, 0xB1], &uint(1_000_000)); // TimestampScale: 1 ms
-    element(&mut info, &[0x4D, 0x80], b"video-core"); // MuxingApp
-    element(&mut info, &[0x57, 0x41], b"video-core"); // WritingApp
+    element(&mut info, &[0x4D, 0x80], b"alhazen-core"); // MuxingApp
+    element(&mut info, &[0x57, 0x41], b"alhazen-core"); // WritingApp
     element(&mut out, &[0x15, 0x49, 0xA9, 0x66], &info);
 
     let mut track = Vec::new();

@@ -1,16 +1,18 @@
 [package]
-name = "video-core"
-description = "Pluggable video decoding pipeline (sources, demuxers, decoders, clock) with no UI dependency"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-rust-version.workspace = true
-repository.workspace = true
-readme = "../../README.md"
-keywords = ["video", "player", "decoder", "av1", "vp9"]
-categories = ["multimedia::video", "multimedia::audio"]
+name = "alhazen-core"
+description = "Native media engine for Rust: plays video and audio from files and HTTP, with pure-Rust and OS (GPU) decoders. UI-agnostic."
+version = "0.2.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.92"
+repository = "https://github.com/alhazen-rs/alhazen-core"
+homepage = "https://github.com/alhazen-rs"
+documentation = "https://docs.rs/alhazen-core"
+readme = "README.md"
+keywords = ["video", "audio", "media", "player", "decoder"]
+categories = ["multimedia::video", "multimedia::audio", "multimedia"]
 # Test fixtures and scripts stay in the repository (crates.io packages must be small).
-include = ["src/**", "examples/**", "LICENSE", "NOTICE"]
+include = ["src/**", "examples/**", "LICENSE", "NOTICE", "README.md"]
 
 [features]
 default = ["native", "http", "audio-output", "ffmpeg-cli", "media-foundation"]
@@ -38,7 +40,7 @@ rayon = "1.12"
 yuv = { version = "0.8.19", features = ["rayon"] }
 log = "0.4"
 libc = "0.2"
-vp9-mt = { workspace = true, optional = true }
+vp9-mt = { version = "0.1.1", optional = true }
 oximedia-codec = { version = "0.2.1", default-features = false, features = ["vp8"], optional = true }
 oxideav-prores = { version = "0.1.1", optional = true }
 re_mp4 = { version = "0.5.1", optional = true }
@@ -80,3 +82,11 @@ windows = { version = "0.62", optional = true, features = [
 md-5 = "0.10"
 tiny_http = "0.12"
 url = "2.5"
+
+# Decoders are unusably slow unoptimized (tests play real-time video), so they are optimized
+# even in debug builds. Apps using alhazen-core should do the same (see the README).
+[profile.dev.package.rav1d]
+opt-level = 3
+
+[profile.dev.package.vp9-mt]
+opt-level = 3

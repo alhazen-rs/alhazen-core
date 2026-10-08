@@ -4,7 +4,7 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::thread;
 
-use video_core::source::{HttpSource, MediaSource};
+use alhazen_core::source::{HttpSource, MediaSource};
 
 /// Serves `bytes` forever; honors `Range: bytes=N-` only if `ranges` is true.
 fn serve(bytes: Vec<u8>, ranges: bool) -> String {
@@ -77,7 +77,7 @@ fn server_without_ranges_rewinds_only_within_cached_head() {
 #[test]
 fn player_plays_over_http() {
     use std::time::{Duration, Instant};
-    use video_core::{Player, PlayerConfig, Source};
+    use alhazen_core::{Player, PlayerConfig, Source};
     let url = serve(fixture_bytes(), true);
     let player = Player::open(Source::parse(&url).unwrap(), PlayerConfig::default()).unwrap();
     let start = Instant::now();
@@ -91,7 +91,7 @@ fn player_plays_over_http() {
 #[test]
 fn player_plays_from_server_without_ranges() {
     use std::time::{Duration, Instant};
-    use video_core::{Player, PlayerConfig, Source};
+    use alhazen_core::{Player, PlayerConfig, Source};
     let url = serve(fixture_bytes(), false);
     let player = Player::open(Source::parse(&url).unwrap(), PlayerConfig::default()).unwrap();
     let start = Instant::now();
@@ -106,8 +106,8 @@ fn player_plays_from_server_without_ranges() {
 fn seeking_a_non_seekable_stream_is_refused_without_killing_the_player() {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    use video_core::clock::MockClock;
-    use video_core::{Player, PlayerConfig, PlayerEvent, PlayerState, Source};
+    use alhazen_core::clock::MockClock;
+    use alhazen_core::{Player, PlayerConfig, PlayerEvent, PlayerState, Source};
     let url = serve(fixture_bytes(), false);
     let clock = Arc::new(MockClock::new());
     let config = PlayerConfig { clock: Some(clock.clone()), ..Default::default() };
@@ -167,7 +167,7 @@ fn serve_stalling(bytes: Vec<u8>, stall_after: usize) -> String {
 #[test]
 fn dropping_player_with_stalled_http_read_returns_promptly() {
     use std::time::Duration;
-    use video_core::{Player, PlayerConfig, Source};
+    use alhazen_core::{Player, PlayerConfig, Source};
     let url = serve_stalling(fixture_bytes(), 30_000);
     let player = Player::open(Source::parse(&url).unwrap(), PlayerConfig::default()).unwrap();
     thread::sleep(Duration::from_millis(300)); // let the demux thread block in the stalled read

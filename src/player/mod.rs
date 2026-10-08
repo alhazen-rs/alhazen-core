@@ -120,7 +120,7 @@ impl Default for PlayerConfig {
 /// How to get a decoder for a codec the build cannot play, for warnings.
 fn codec_hint(codec: &demux::Codec) -> &'static str {
     match codec {
-        demux::Codec::Aac => " (install ffmpeg, or enable video-core's `native-aac` feature)",
+        demux::Codec::Aac => " (install ffmpeg, or enable alhazen-core's `native-aac` feature)",
         demux::Codec::H264 | demux::Codec::Hevc => " (install ffmpeg)",
         _ => "",
     }

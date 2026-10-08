@@ -1,6 +1,6 @@
 use std::fmt;
 
-/// Every error `video-core` can produce.
+/// Every error `alhazen-core` can produce.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("I/O error: {0}")]

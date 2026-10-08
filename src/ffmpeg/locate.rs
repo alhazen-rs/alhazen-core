@@ -30,14 +30,14 @@ impl FfmpegInfo {
     }
 }
 
-/// Which `ffmpeg` programs to try, in order: `explicit`, else `$VIDEO_CORE_FFMPEG`, else `ffmpeg`
+/// Which `ffmpeg` programs to try, in order: `explicit`, else `$ALHAZEN_FFMPEG`, else `ffmpeg`
 /// on `PATH` and then the standard install locations that `PATH` may lack.
 pub fn candidates(explicit: Option<&Path>) -> Vec<PathBuf> {
-    let env = std::env::var_os("VIDEO_CORE_FFMPEG").filter(|p| !p.is_empty()).map(PathBuf::from);
+    let env = std::env::var_os("ALHAZEN_FFMPEG").filter(|p| !p.is_empty()).map(PathBuf::from);
     candidates_for(std::env::consts::OS, explicit, env)
 }
 
-/// `candidates` for a given OS, explicit path and `$VIDEO_CORE_FFMPEG` value.
+/// `candidates` for a given OS, explicit path and `$ALHAZEN_FFMPEG` value.
 pub fn candidates_for(os: &str, explicit: Option<&Path>, env: Option<PathBuf>) -> Vec<PathBuf> {
     if let Some(p) = explicit {
         return vec![p.to_owned()];
@@ -151,7 +151,7 @@ mod tests {
 
     #[test]
     fn missing_binary_is_none() {
-        assert!(probe(Path::new("/nonexistent/ffmpeg-for-video-core-tests")).is_none());
+        assert!(probe(Path::new("/nonexistent/ffmpeg-for-alhazen-core-tests")).is_none());
     }
 
     #[test]

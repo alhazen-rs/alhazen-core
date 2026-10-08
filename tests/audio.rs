@@ -5,8 +5,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use video_core::audio::{AudioOutputConfig, NullOutput};
-use video_core::{Player, PlayerConfig, PlayerEvent, PlayerState, Source};
+use alhazen_core::audio::{AudioOutputConfig, NullOutput};
+use alhazen_core::{Player, PlayerConfig, PlayerEvent, PlayerState, Source};
 
 const RATE: u32 = 48_000;
 
@@ -201,7 +201,7 @@ fn aac_audio_only_m4a_plays() {
 fn without_ffmpeg() -> PlayerConfig {
     PlayerConfig {
         audio_output: AudioOutputConfig::Null(NullOutput::new(RATE, 2)),
-        registry: Some(Arc::new(video_core::backend::Registry::empty_with_native())),
+        registry: Some(Arc::new(alhazen_core::backend::Registry::empty_with_native())),
         ..Default::default()
     }
 }
@@ -283,15 +283,15 @@ fn audio_after_a_seek_onto_a_keyframe_is_already_converged() {
     // Opus needs 80 ms of pre-roll. Seeking exactly onto the 1.0 s keyframe must still give the
     // same audio as decoding straight through. Reference: the decoder's own output at 1.0 s.
     let reference = {
-        let mut d = video_core::demux::MatroskaDemuxer::open(Box::new(
-            video_core::source::FileSource::open(format!("{}/tests/fixtures/av1_with_audio.webm", env!("CARGO_MANIFEST_DIR")))
+        let mut d = alhazen_core::demux::MatroskaDemuxer::open(Box::new(
+            alhazen_core::source::FileSource::open(format!("{}/tests/fixtures/av1_with_audio.webm", env!("CARGO_MANIFEST_DIR")))
                 .unwrap(),
         ))
         .unwrap();
-        use video_core::decode::AudioDecoder;
-        use video_core::demux::{Demuxer, StreamKind};
+        use alhazen_core::decode::AudioDecoder;
+        use alhazen_core::demux::{Demuxer, StreamKind};
         let a = d.streams().iter().find(|s| s.kind == StreamKind::Audio).unwrap().clone();
-        let mut dec = video_core::decode::OpusAudioDecoder::new(&a).unwrap();
+        let mut dec = alhazen_core::decode::OpusAudioDecoder::new(&a).unwrap();
         let mut mono = Vec::new();
         while let Some(p) = d.next_packet().unwrap() {
             if p.stream == a.id {

@@ -4,9 +4,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use video_core::audio::AudioOutputConfig;
-use video_core::clock::MockClock;
-use video_core::{Error, Player, PlayerConfig, PlayerEvent, PlayerState, Source};
+use alhazen_core::audio::AudioOutputConfig;
+use alhazen_core::clock::MockClock;
+use alhazen_core::{Error, Player, PlayerConfig, PlayerEvent, PlayerState, Source};
 
 fn fixture(name: &str) -> Source {
     Source::parse(&format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()

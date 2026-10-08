@@ -5,10 +5,10 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use video_core::audio::{AudioOutputConfig, NullOutput};
-use video_core::backend::Registry;
-use video_core::demux::StreamKind;
-use video_core::{Player, PlayerConfig, Source};
+use alhazen_core::audio::{AudioOutputConfig, NullOutput};
+use alhazen_core::backend::Registry;
+use alhazen_core::demux::StreamKind;
+use alhazen_core::{Player, PlayerConfig, Source};
 
 fn fixture(name: &str) -> String {
     format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
@@ -18,8 +18,8 @@ fn fixture(name: &str) -> String {
 fn native(name: &str) -> (u32, u16, Vec<f32>) {
     let source = Source::parse(&fixture(name)).unwrap();
     let mut src = source.open().unwrap();
-    let format = video_core::demux::probe(src.as_mut()).unwrap().unwrap();
-    let registry = Registry::with_ffmpeg(&video_core::FfmpegConfig { enabled: false, ..Default::default() });
+    let format = alhazen_core::demux::probe(src.as_mut()).unwrap().unwrap();
+    let registry = Registry::with_ffmpeg(&alhazen_core::FfmpegConfig { enabled: false, ..Default::default() });
     let mut demuxer = registry.open_demuxer(&source, format, src, None).unwrap();
     let stream = demuxer.streams().iter().find(|s| s.kind == StreamKind::Audio).expect("an audio track").clone();
     let mut dec = registry.open_audio_decoder(&stream, None).unwrap();

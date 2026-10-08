@@ -5,9 +5,9 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use video_core::demux::{Demuxer, Mp4Demuxer, StreamKind};
-use video_core::nal::{AnnexB, ParamSetFormat};
-use video_core::source::FileSource;
+use alhazen_core::demux::{Demuxer, Mp4Demuxer, StreamKind};
+use alhazen_core::nal::{AnnexB, ParamSetFormat};
+use alhazen_core::source::FileSource;
 
 fn fixture(name: &str) -> String {
     format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))

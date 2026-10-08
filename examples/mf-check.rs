@@ -13,18 +13,18 @@ fn main() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     use std::time::{Duration, Instant};
-    use video_core::backend::Registry;
-    use video_core::decode::{AudioDecoder, DecodedFrame, VideoDecoder};
-    use video_core::demux::StreamKind;
-    use video_core::mf::select::MfCodec;
-    use video_core::mf::{MfAudioDecoder, MfVideoDecoder};
-    use video_core::Source;
+    use alhazen_core::backend::Registry;
+    use alhazen_core::decode::{AudioDecoder, DecodedFrame, VideoDecoder};
+    use alhazen_core::demux::StreamKind;
+    use alhazen_core::mf::select::MfCodec;
+    use alhazen_core::mf::{MfAudioDecoder, MfVideoDecoder};
+    use alhazen_core::Source;
 
     if std::env::args().nth(1).as_deref() == Some("--native-type") {
         native_types(&std::env::args().nth(2).expect("usage: mf-check --native-type <file>"));
         return;
     }
-    let dir = std::env::args().nth(1).unwrap_or_else(|| "crates/video-core/tests/fixtures".into());
+    let dir = std::env::args().nth(1).unwrap_or_else(|| "tests/fixtures".into());
     // (file, track kind, expected frames or audio sample frames, tolerance)
     let cases: &[(&str, StreamKind, usize, usize)] = &[
         ("h264_aac.mp4", StreamKind::Video, 30, 0),
@@ -51,7 +51,7 @@ fn main() {
             let progress = p2;
             let source = Source::parse(&path).map_err(|e| e.to_string())?;
             let mut src = source.open().map_err(|e| e.to_string())?;
-            let format = video_core::demux::probe(src.as_mut()).map_err(|e| e.to_string())?.ok_or("not a media file")?;
+            let format = alhazen_core::demux::probe(src.as_mut()).map_err(|e| e.to_string())?.ok_or("not a media file")?;
             let mut d = Registry::empty_with_native().open_demuxer(&source, format, src, None).map_err(|e| e.to_string())?;
             let s = d.streams().iter().find(|s| s.kind == kind).cloned().ok_or("no such track")?;
             let codec = MfCodec::of(&s).ok_or("not a Media Foundation codec")?;

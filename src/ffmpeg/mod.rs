@@ -17,7 +17,7 @@ use std::path::PathBuf;
 pub struct FfmpegConfig {
     /// Register the backend at all.
     pub enabled: bool,
-    /// The `ffmpeg` program. `None`: `$VIDEO_CORE_FFMPEG`, else `ffmpeg` on `PATH`, and on macOS
+    /// The `ffmpeg` program. `None`: `$ALHAZEN_FFMPEG`, else `ffmpeg` on `PATH`, and on macOS
     /// also Homebrew's and MacPorts' install locations (apps launched from Finder don't get the
     /// shell's `PATH`).
     pub path: Option<PathBuf>,
@@ -160,7 +160,7 @@ mod backend {
         #[test]
         fn nonexistent_ffmpeg_claims_nothing() {
             let b = FfmpegCliBackend::new(FfmpegConfig {
-                path: Some("/nonexistent/ffmpeg-for-video-core-tests".into()),
+                path: Some("/nonexistent/ffmpeg-for-alhazen-core-tests".into()),
                 ..FfmpegConfig::default()
             });
             let h264 = StreamInfo::new(1, StreamKind::Video, Codec::H264);

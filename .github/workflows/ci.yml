@@ -1,0 +1,79 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+env:
+  # No debug info in test builds: keeps the runners' disks from filling up.
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev pkg-config ffmpeg nasm
+      # ffmpeg for the ffmpeg-cli backend tests (they print a note and pass without it).
+      - name: ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+      - name: ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
+      - name: VP9 conformance vectors (cached)
+        uses: actions/cache@v4
+        with:
+          path: target/vp9-vectors
+          key: vp9-vectors-${{ hashFiles('scripts/fetch_vp9_vectors.py') }}
+      - run: python3 scripts/fetch_vp9_vectors.py target/vp9-vectors
+      - run: cargo test --locked
+        timeout-minutes: 40
+      # vp9-mt through the engine: libvpx MD5s at 1/2/4/8/16 threads, optimized.
+      - run: cargo test --test vp9_conformance --release --locked
+        env:
+          VP9_VECTORS_DIR: target/vp9-vectors
+      # Reduced builds: HTTP only; headless without sound output; the opt-in MPL-2.0 AAC decoder.
+      - run: cargo test --no-default-features --features http --locked
+      - run: cargo test --no-default-features --features native,http --locked
+      - run: cargo test --features native-aac --locked
+      # The default build must stay permissive: no MPL/GPL/LGPL dependency unless it is offered
+      # under a permissive alternative ("X OR MIT"). Symphonia (MPL-2.0) is only for `native-aac`.
+      - name: Permissive licenses only by default
+        shell: bash
+        run: |
+          # Capture first: a failing `cargo tree` must fail the step, not pass it vacuously.
+          tree=$(cargo tree -e normal --prefix none --format '{p} | {l}' --locked)
+          bad=$(grep -E '\| .*\b(MPL|GPL|LGPL)-' <<<"$tree" | grep -v ' OR ' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::alhazen-core has copyleft dependencies in its default build:"
+            echo "$bad"
+            exit 1
+          fi
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo clippy --no-default-features --all-targets --locked -- -D warnings
+      - run: cargo clippy --no-default-features --features ffmpeg-cli --all-targets --locked -- -D warnings
+      - run: cargo clippy --features native-aac --all-targets --locked -- -D warnings
+      # Windows: Media Foundation decoders on the runner (software only; no GPU there), and a
+      # release mf-check.exe to run on a real Windows machine.
+      - name: Media Foundation check
+        if: always() && runner.os == 'Windows'
+        run: |
+          cargo build --release --locked --example mf-check
+          target/release/examples/mf-check.exe tests/fixtures
+      - uses: actions/upload-artifact@v4
+        if: always() && runner.os == 'Windows'
+        with:
+          name: mf-check-windows
+          path: target/release/examples/mf-check.exe

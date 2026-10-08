@@ -4,8 +4,8 @@
 #![cfg(feature = "native")]
 
 use md5::{Digest, Md5};
-use video_core::demux::{Demuxer, MatroskaDemuxer, StreamKind};
-use video_core::source::FileSource;
+use alhazen_core::demux::{Demuxer, MatroskaDemuxer, StreamKind};
+use alhazen_core::source::FileSource;
 
 fn packets(path: &std::path::Path) -> Vec<Vec<u8>> {
     let mut d = MatroskaDemuxer::open(Box::new(FileSource::open(path).unwrap())).unwrap();

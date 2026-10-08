@@ -1,11 +1,11 @@
-gpui-native-video-player
+alhazen-core
 Copyright 2026 Mohamed A.
 
-This product includes software from gpui-native-video-player
-(the video-core, gpui-video and vp9-mt crates), licensed under the Apache
-License, Version 2.0.
+This product includes alhazen-core (https://github.com/alhazen-rs/alhazen-core),
+licensed under the Apache License, Version 2.0.
 
-vp9-mt is a modified version of rusty_vp9 0.1.1 by Mata Network
+alhazen-core uses vp9-mt (https://github.com/alhazen-rs/vp9-mt), a modified
+version of rusty_vp9 0.1.1 by Mata Network
 (https://github.com/Remade-With-Rust/remade_ffmpeg_rs), licensed under the
 Apache License, Version 2.0.
 

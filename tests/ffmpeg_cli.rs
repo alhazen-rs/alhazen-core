@@ -5,13 +5,13 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use video_core::audio::{AudioOutputConfig, NullOutput};
-use video_core::backend::Backend;
-use video_core::decode::{DecodedFrame, PixelLayout};
-use video_core::demux::{Demuxer, MatroskaDemuxer, Mp4Demuxer, StreamKind};
-use video_core::ffmpeg::FfmpegCliBackend;
-use video_core::source::FileSource;
-use video_core::{Error, FfmpegConfig, Player, PlayerConfig, PlayerState, Source};
+use alhazen_core::audio::{AudioOutputConfig, NullOutput};
+use alhazen_core::backend::Backend;
+use alhazen_core::decode::{DecodedFrame, PixelLayout};
+use alhazen_core::demux::{Demuxer, MatroskaDemuxer, Mp4Demuxer, StreamKind};
+use alhazen_core::ffmpeg::FfmpegCliBackend;
+use alhazen_core::source::FileSource;
+use alhazen_core::{Error, FfmpegConfig, Player, PlayerConfig, PlayerState, Source};
 
 const RATE: u32 = 48_000;
 
@@ -111,11 +111,11 @@ fn frames_keep_their_timestamps_when_ffmpeg_skips_some() {
 }
 
 /// The first frame ffmpeg decodes from `name`'s video track.
-fn ffmpeg_first_frame(b: &FfmpegCliBackend, name: &str) -> Option<video_core::decode::YuvFrame> {
+fn ffmpeg_first_frame(b: &FfmpegCliBackend, name: &str) -> Option<alhazen_core::decode::YuvFrame> {
     let source = Source::parse(&fixture_path(name)).unwrap();
     let mut src = source.open().unwrap();
-    let format = video_core::demux::probe(src.as_mut()).unwrap().unwrap();
-    let mut d = video_core::backend::Registry::with_defaults().open_demuxer(&source, format, src, None).unwrap();
+    let format = alhazen_core::demux::probe(src.as_mut()).unwrap().unwrap();
+    let mut d = alhazen_core::backend::Registry::with_defaults().open_demuxer(&source, format, src, None).unwrap();
     let stream = d.streams().iter().find(|s| s.kind == StreamKind::Video).unwrap().clone();
     if !b.supports_video(&stream) {
         return None;
@@ -136,7 +136,7 @@ fn ffmpeg_frames_carry_the_streams_colour_matrix_and_range() {
     let Some(b) = backend() else { return };
     let f = ffmpeg_first_frame(&b, "h264_bt709.mp4").unwrap();
     // 320x240 would be guessed BT.601; the stream says BT.709.
-    assert_eq!((f.matrix, f.full_range), (video_core::decode::ColorMatrix::Bt709, false));
+    assert_eq!((f.matrix, f.full_range), (alhazen_core::decode::ColorMatrix::Bt709, false));
     let Some(f) = ffmpeg_first_frame(&b, "mjpeg_full_range.mkv") else {
         eprintln!("skipped MJPEG: no mjpeg decoder");
         return;
@@ -287,11 +287,11 @@ fn ffmpeg_installed_later_is_found() {
     if backend().is_none() {
         return;
     }
-    let dir = std::env::temp_dir().join(format!("video-core-late-ffmpeg-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("alhazen-core-late-ffmpeg-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("ffmpeg");
     let b = FfmpegCliBackend::new(FfmpegConfig { path: Some(script.clone()), hwaccel: false, ..Default::default() });
-    let h264 = video_core::demux::StreamInfo::new(1, StreamKind::Video, video_core::demux::Codec::H264);
+    let h264 = alhazen_core::demux::StreamInfo::new(1, StreamKind::Video, alhazen_core::demux::Codec::H264);
     assert!(!b.supports_video(&h264), "not installed yet");
     std::fs::write(&script, "#!/bin/sh\nexec ffmpeg \"$@\"\n").unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -304,7 +304,7 @@ fn ffmpeg_installed_later_is_found() {
 fn missing_ffmpeg_means_unsupported_codec_not_a_hang() {
     let config = PlayerConfig {
         audio_output: AudioOutputConfig::Disabled,
-        ffmpeg: FfmpegConfig { path: Some(PathBuf::from("/nonexistent/ffmpeg-for-video-core-tests")), ..Default::default() },
+        ffmpeg: FfmpegConfig { path: Some(PathBuf::from("/nonexistent/ffmpeg-for-alhazen-core-tests")), ..Default::default() },
         ..Default::default()
     };
     match Player::open(Source::parse(&fixture_path("hevc.mkv")).unwrap(), config) {
@@ -322,7 +322,7 @@ fn ffmpeg_killed_mid_stream_is_an_error_not_a_hang() {
     if backend().is_none() {
         return;
     }
-    let dir = std::env::temp_dir().join(format!("video-core-dying-ffmpeg-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("alhazen-core-dying-ffmpeg-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("ffmpeg");
     std::fs::write(
@@ -366,17 +366,17 @@ fn ffmpeg_killed_mid_stream_is_an_error_not_a_hang() {
 #[test]
 fn ffmpeg_that_stops_reading_is_an_error_not_a_hang() {
     use std::os::unix::fs::PermissionsExt;
-    use video_core::demux::Packet;
+    use alhazen_core::demux::Packet;
     if backend().is_none() {
         return;
     }
-    let dir = std::env::temp_dir().join(format!("video-core-stuck-ffmpeg-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("alhazen-core-stuck-ffmpeg-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("ffmpeg");
     std::fs::write(&script, "#!/bin/sh\ncase \"$2\" in -version|-decoders) exec ffmpeg \"$@\";; esac\nexec sleep 60\n").unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     let b = FfmpegCliBackend::new(FfmpegConfig { path: Some(script), hwaccel: false, ..Default::default() });
-    let mut stream = video_core::demux::StreamInfo::new(1, StreamKind::Video, video_core::demux::Codec::H264);
+    let mut stream = alhazen_core::demux::StreamInfo::new(1, StreamKind::Video, alhazen_core::demux::Codec::H264);
     (stream.width, stream.height) = (320, 240);
     let mut dec = b.open_video_decoder(&stream, 1).unwrap();
     let start = Instant::now();
@@ -401,7 +401,7 @@ fn ffmpeg_that_stops_reading_is_an_error_not_a_hang() {
 #[test]
 fn native_media_never_runs_ffmpeg() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = std::env::temp_dir().join(format!("video-core-spy-ffmpeg-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("alhazen-core-spy-ffmpeg-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let (script, marker) = (dir.join("ffmpeg"), dir.join("ran"));
     std::fs::write(&script, format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 1\n", marker.display())).unwrap();

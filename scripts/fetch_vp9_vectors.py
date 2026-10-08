@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Downloads the libvpx VP9 conformance vectors used by `video-core/tests/vp9_conformance.rs`.
+"""Downloads the libvpx VP9 conformance vectors used by `tests/vp9_conformance.rs`.
 
 Usage: scripts/fetch_vp9_vectors.py [DIR]   (default: target/vp9-vectors)
-Then:  VP9_VECTORS_DIR=DIR cargo test -p video-core --test vp9_conformance
+Then:  VP9_VECTORS_DIR=DIR cargo test --test vp9_conformance
 Files already present are kept, so CI can cache DIR.
 """
 import os, sys, urllib.request
