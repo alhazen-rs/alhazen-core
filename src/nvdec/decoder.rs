@@ -446,7 +446,7 @@ impl Inner {
         let buf = unsafe { std::slice::from_raw_parts(self.host.ptr, row * (h + ch) as usize) };
         let (luma, chroma) = buf.split_at(row * h as usize);
         // P016 samples are little-endian 16-bit with the value in the high bits: keep the high byte.
-        let y: Vec<u8> = if bps == 1 { luma.to_vec() } else { luma.chunks_exact(2).map(|c| c[1]).collect() };
+        let y: Vec<u8> = if bps == 1 { luma.to_vec() } else { luma.as_chunks::<2>().0.iter().map(|c| c[1]).collect() };
         let cw = cw as usize;
         let (mut u, mut v) = (vec![0u8; cw * ch as usize], vec![0u8; cw * ch as usize]);
         // Chroma rows hold `cw` interleaved U,V pairs; filled row by row so the loop vectorizes.

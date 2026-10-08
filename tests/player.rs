@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alhazen_core::audio::AudioOutputConfig;
-use alhazen_core::clock::MockClock;
+use alhazen_core::clock::{Clock, MockClock};
 use alhazen_core::{Error, Player, PlayerConfig, PlayerEvent, PlayerState, Source};
 
 fn fixture(name: &str) -> Source {
@@ -55,27 +55,21 @@ fn plays_through_in_order_and_ends() {
         player.play();
         let mut seen = Vec::new();
         let start = Instant::now();
-        // Real-time pace: a faster clock than the decoder can follow makes the player skip late
-        // frames on purpose (catch-up), which is not what this test is about. The clock starts
-        // with the first frame, as a viewer sees it: on slow machines (CI's macOS runners) the
-        // decoder's start-up would otherwise make the first frames late and skipped.
-        let mut last = Instant::now();
+        // The clock follows the frames: each new frame moves it to when the next one is due
+        // (30 fps). No frame is ever late, however slow the machine (CI's shared runners), so
+        // catch-up skipping, which this test is not about, never kicks in.
         while player.state() != PlayerState::Ended {
             assert!(start.elapsed() < Duration::from_secs(10), "{name}: never ended");
             if let Some(f) = player.current_frame()
                 && seen.last() != Some(&f.pts())
             {
                 seen.push(f.pts());
+                clock.set(f.pts() + Duration::from_millis(34));
             }
-            let now = Instant::now();
-            if !seen.is_empty() {
-                clock.advance(now - last);
-            }
-            last = now;
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(seen.windows(2).all(|w| w[0] < w[1]), "{name}: frames out of order");
-        assert!(seen.len() >= 55, "{name}: only {} distinct frames shown", seen.len());
+        assert_eq!(seen.len(), 60, "{name}: every frame shown, none skipped");
         assert!(events.try_iter().any(|e| matches!(e, PlayerEvent::Ended)));
     }
 }
