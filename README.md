@@ -27,7 +27,7 @@ if let Some(frame) = player.current_frame() { /* draw it */ }
 ## Features
 
 - **Plays out of the box, on every platform:** AV1, VP9 (multi-threaded), VP8, ProRes, Opus,
-  Vorbis, FLAC and PCM in pure Rust, under permissive licences.
+  Vorbis, FLAC, AAC (LC, HE-AAC v1/v2) and PCM in pure Rust, under permissive licences.
 - **The OS's own decoders on Windows:** H.264, HEVC, VP9 and AV1 on the GPU, plus AAC, MP3,
   AC-3, E-AC-3 and ALAC, through Media Foundation. Nothing to install; Windows covers the
   codec licences.
@@ -39,7 +39,8 @@ if let Some(frame) = player.current_frame() { /* draw it */ }
 - **Files and the web:** local files, `file://`, and HTTP(S) streaming with `Range` seeking and
   automatic reconnects.
 - **A/V sync done right:** audio drives the clock; video follows, drops late frames and catches
-  up after stalls.
+  up after stalls. The encoder's start-up padding (MP4 edit lists, Matroska CodecDelay) is
+  trimmed, so sound lines up with the picture.
 - **Smooth on big files:** frames are scaled to the size you display them at before colour
   conversion, and a decoder that can't keep up hands over to a faster one automatically.
 
@@ -170,7 +171,7 @@ stream's BT.601/BT.709 matrix and range.
 | Vorbis | ✅ lewton | | ✅ |
 | FLAC | ✅ claxon | | ✅ |
 | PCM (8–32-bit int, 32/64-bit float) | ✅ | | ✅ |
-| AAC (LC, HE) | opt-in `native-aac` (MPL-2.0) | ✅ | ✅ |
+| AAC (LC, HE-AAC v1/v2) | ✅ rusty_aac | ✅ | ✅ |
 | MP3 | | ✅ | ✅ |
 | AC-3, E-AC-3 | | ✅ | ✅ |
 | ALAC | | ✅ | ✅ |
@@ -219,7 +220,7 @@ ffmpeg behind a Chocolatey/Scoop shim.
 | `ffmpeg-cli` | ✅ | The runtime ffmpeg backend. Costs nothing when ffmpeg isn't installed. |
 | `media-foundation` | ✅ | Windows' decoders. Compiles to nothing on other platforms. |
 | `nvdec` | ✅ | NVIDIA GPU decoding on Linux (NVDEC), loaded from the driver at runtime. Compiles to nothing on other platforms. |
-| `native-aac` | | AAC-LC through Symphonia. **MPL-2.0**: closed-source apps are fine, but changes to Symphonia's own files must be shared. |
+| `native-aac` | ✅ | AAC (LC, Main, LTP, HE-AAC v1/v2) through rusty_aac (pure Rust, Apache-2.0). |
 
 ## Configuration
 
@@ -310,7 +311,9 @@ alhazen-core, include the [NOTICE](NOTICE) text (Apache-2.0 §4(d)), for example
 "Licenses" screen.
 
 The default build depends only on permissively licensed crates (MIT, Apache-2.0, BSD).
-`native-aac` adds Symphonia (MPL-2.0). `ffmpeg-cli` links nothing: ffmpeg's licence applies to
+AAC patents: AAC-LC's have largely expired; HE-AAC and Parametric Stereo patents may still apply in
+some countries, and rusty_aac's licence grants no patent rights. Apps with that concern can turn
+off `native-aac`. `ffmpeg-cli` links nothing: ffmpeg's licence applies to
 the ffmpeg program the user installed, not to your app; don't bundle an ffmpeg build without
 checking its licence and patent terms.
 

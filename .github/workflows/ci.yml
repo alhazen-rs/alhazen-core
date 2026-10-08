@@ -38,18 +38,25 @@ jobs:
           path: target/vp9-vectors
           key: vp9-vectors-${{ hashFiles('scripts/fetch_vp9_vectors.py') }}
       - run: python3 scripts/fetch_vp9_vectors.py target/vp9-vectors
+      - name: AAC conformance vectors (cached)
+        uses: actions/cache@v4
+        with:
+          path: target/aac-vectors
+          key: aac-vectors-${{ hashFiles('scripts/fetch_aac_vectors.py') }}
+      - run: python3 scripts/fetch_aac_vectors.py target/aac-vectors
       - run: cargo test --locked
         timeout-minutes: 40
+        env:
+          AAC_VECTORS_DIR: target/aac-vectors
       # vp9-mt through the engine: libvpx MD5s at 1/2/4/8/16 threads, optimized.
       - run: cargo test --test vp9_conformance --release --locked
         env:
           VP9_VECTORS_DIR: target/vp9-vectors
-      # Reduced builds: HTTP only; headless without sound output; the opt-in MPL-2.0 AAC decoder.
+      # Reduced builds: HTTP only; headless without sound output or AAC.
       - run: cargo test --no-default-features --features http --locked
       - run: cargo test --no-default-features --features native,http --locked
-      - run: cargo test --features native-aac --locked
       # The default build must stay permissive: no MPL/GPL/LGPL dependency unless it is offered
-      # under a permissive alternative ("X OR MIT"). Symphonia (MPL-2.0) is only for `native-aac`.
+      # under a permissive alternative ("X OR MIT").
       - name: Permissive licenses only by default
         shell: bash
         run: |
@@ -64,7 +71,7 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo clippy --no-default-features --all-targets --locked -- -D warnings
       - run: cargo clippy --no-default-features --features ffmpeg-cli --all-targets --locked -- -D warnings
-      - run: cargo clippy --features native-aac --all-targets --locked -- -D warnings
+      - run: cargo clippy --no-default-features --features native,http --all-targets --locked -- -D warnings
       # Windows: Media Foundation decoders on the runner (software only; no GPU there), and a
       # release mf-check.exe to run on a real Windows machine.
       - name: Media Foundation check
