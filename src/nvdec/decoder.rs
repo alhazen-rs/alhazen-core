@@ -264,11 +264,22 @@ impl Drop for NvdecVideoDecoder {
 }
 
 impl Inner {
+    /// Destroys the decoder and forgets its setup, so the next format announcement creates a new
+    /// one (also after a failed creation).
     fn destroy_decoder(&mut self) {
         if !self.decoder.is_null() {
             // SAFETY: a live decoder, destroyed once (context current).
             unsafe { (self.dev.api().cuvidDestroyDecoder)(self.decoder) };
             self.decoder = std::ptr::null_mut();
+        }
+        self.setup = None;
+    }
+
+    fn live_decoder(&self) -> Result<CUvideodecoder> {
+        if self.decoder.is_null() {
+            Err(Error::Decode("NVDEC: no decoder for this part of the stream".into()))
+        } else {
+            Ok(self.decoder)
         }
     }
 
@@ -355,13 +366,15 @@ impl Inner {
     }
 
     fn on_decode(&mut self, pic: *mut CUVIDPICPARAMS) -> Result<()> {
+        let decoder = self.live_decoder()?;
         // SAFETY: `pic` comes from the parser for this decoder; context current.
-        check(unsafe { (self.dev.api().cuvidDecodePicture)(self.decoder, pic) }, "decode")
+        check(unsafe { (self.dev.api().cuvidDecodePicture)(decoder, pic) }, "decode")
     }
 
     /// A picture is due for display: copy it out (scaled) and queue it.
     fn on_display(&mut self, disp: &CUVIDPARSERDISPINFO) -> Result<()> {
         let s = self.setup.ok_or_else(|| Error::Decode("NVDEC: picture before format".into()))?;
+        let decoder = self.live_decoder()?;
         let api = self.dev.api();
         let mut proc: CUVIDPROCPARAMS = zeroed();
         proc.progressive_frame = disp.progressive_frame;
@@ -370,12 +383,12 @@ impl Inner {
         let (mut dptr, mut pitch) = (0, 0);
         // SAFETY: valid picture index from the parser; out-pointers valid; context current.
         check(
-            unsafe { (api.cuvidMapVideoFrame64)(self.decoder, disp.picture_index, &mut dptr, &mut pitch, &mut proc) },
+            unsafe { (api.cuvidMapVideoFrame64)(decoder, disp.picture_index, &mut dptr, &mut pitch, &mut proc) },
             "map frame",
         )?;
         let copied = self.copy_out(dptr, pitch as usize, &s);
         // SAFETY: unmaps the frame mapped above.
-        unsafe { (api.cuvidUnmapVideoFrame64)(self.decoder, dptr) };
+        unsafe { (api.cuvidUnmapVideoFrame64)(decoder, dptr) };
         copied?;
         let pts = Duration::from_nanos(disp.timestamp.max(0) as u64 * 100);
         let frame = self.to_frame(&s, pts);
@@ -466,6 +479,9 @@ impl Inner {
 unsafe fn callback(user: *mut c_void, f: impl FnOnce(&mut Inner) -> Result<c_int>) -> c_int {
     // SAFETY: as documented on this function.
     let inner = unsafe { &mut *(user as *mut Inner) };
+    if inner.error.is_some() {
+        return 0; // an earlier callback in this call failed: stop here
+    }
     match f(inner) {
         Ok(n) => n,
         Err(e) => {

@@ -390,3 +390,40 @@ fn variants_known_from_setup_data_are_not_offered_to_the_gpu() {
         assert_eq!(backend.supports_video(&video(d.as_ref())), claimed, "{name}");
     }
 }
+
+/// The middle part is wider than the GPU decodes: creating the decoder for it fails. Decoding
+/// must resume once the stream is decodable again (the pipeline flushes and waits for a keyframe
+/// after an error, as here).
+#[test]
+fn recovers_after_a_part_the_gpu_cannot_decode() {
+    if !gpu() {
+        return;
+    }
+    let mut d = demuxer("vp9_too_wide.webm");
+    let s = video(d.as_ref());
+    let mut dec = NvdecVideoDecoder::new(&s).unwrap();
+    let (mut frames, mut errors, mut skip_to_keyframe) = (vec![], 0, false);
+    while let Some(p) = d.next_packet().unwrap() {
+        if p.stream != s.id || (skip_to_keyframe && !p.keyframe) {
+            continue;
+        }
+        skip_to_keyframe = false;
+        if dec.send_packet(&p).is_err() {
+            errors += 1;
+            dec.flush();
+            skip_to_keyframe = true;
+            continue;
+        }
+        while let Some(DecodedFrame::Yuv(f)) = dec.receive_frame().unwrap() {
+            frames.push(f.pts);
+        }
+    }
+    dec.send_eof();
+    while let Some(DecodedFrame::Yuv(f)) = dec.receive_frame().unwrap() {
+        frames.push(f.pts);
+    }
+    let after = frames.iter().filter(|p| **p >= Duration::from_millis(1000)).count();
+    eprintln!("{} frames, {errors} errors, {after} after the wide part", frames.len());
+    assert!(errors > 0, "the wide part can't be decoded");
+    assert_eq!(after, 15, "decoding resumes when the stream is decodable again");
+}

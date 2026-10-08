@@ -142,3 +142,15 @@ ffmpeg -v error -y $S -pix_fmt yuv444p -c:v libvpx-vp9 -deadline realtime -g 30 
 
 - `h264_10bit.mkv`: H.264 High 10 ("Hi10P"); `hevc_444.mkv`: HEVC Range Extensions 4:4:4;
   `vp9_444.webm`: VP9 profile 1 (4:4:4). 30 frames each, 320×240.
+
+## Too wide for the GPU, then back (NVDEC recovery)
+
+```bash
+for spec in "a 320x240" "b 8448x128" "c 320x240"; do n=${spec%% *}; sz=${spec##* }
+  ffmpeg -v error -y -f lavfi -i testsrc2=size=$sz:rate=30 -t 0.5 -pix_fmt yuv420p -c:v libvpx-vp9 -deadline realtime -g 15 -b:v 200k $n.ivf
+done
+printf "file 'a.ivf'\nfile 'b.ivf'\nfile 'c.ivf'\n" > list.txt
+ffmpeg -v error -y -f concat -safe 0 -i list.txt -c copy vp9_too_wide.webm
+```
+
+- `vp9_too_wide.webm`: 15 frames 320×240, 15 at 8448×128 (wider than NVDEC's 8192), 15 at 320×240.
