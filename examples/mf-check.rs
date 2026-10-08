@@ -38,7 +38,6 @@ fn main() {
         ("mp3.mp4", StreamKind::Audio, 24_000, 4096),
         ("ac3.mkv", StreamKind::Audio, 24_000, 4096),
         ("eac3.mkv", StreamKind::Audio, 24_000, 4096),
-        ("flac.mkv", StreamKind::Audio, 24_000, 4096),
         ("alac.m4a", StreamKind::Audio, 24_000, 4096),
     ];
     let mut failed = 0;

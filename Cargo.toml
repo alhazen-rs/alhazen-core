@@ -9,8 +9,8 @@ rust-version.workspace = true
 [features]
 default = ["native", "http", "audio-output", "ffmpeg-cli", "media-foundation"]
 # Pure-Rust, permissively licensed decoders: AV1 (rav1d), VP9 (vp9-mt), VP8 (oximedia-codec),
-# ProRes (oxideav-prores), Opus, Vorbis; MP4/MOV demuxing.
-native = ["dep:rav1d", "dep:vp9-mt", "dep:oximedia-codec", "dep:oxideav-prores", "dep:re_mp4", "dep:opus-pure", "dep:lewton"]
+# ProRes (oxideav-prores), Opus, Vorbis, FLAC (claxon); MP4/MOV demuxing.
+native = ["dep:rav1d", "dep:vp9-mt", "dep:oximedia-codec", "dep:oxideav-prores", "dep:re_mp4", "dep:opus-pure", "dep:lewton", "dep:claxon"]
 # AAC-LC via Symphonia. Symphonia is MPL-2.0 (file-level copyleft): apps may stay closed-source,
 # but changes to Symphonia's own files must be shared. Off by default for that reason.
 native-aac = ["dep:symphonia-codec-aac", "dep:symphonia-core"]
@@ -39,6 +39,7 @@ re_mp4 = { version = "0.5.1", optional = true }
 ureq = { version = "3.4", optional = true }
 opus-pure = { version = "0.2.2", optional = true }
 lewton = { version = "0.10.2", optional = true }
+claxon = { version = "0.4.3", optional = true }
 rubato = "5"
 fast_image_resize = { version = "6", features = ["rayon"] }
 rtrb = "0.4"

@@ -18,6 +18,8 @@ mod prores;
 #[cfg(feature = "native")]
 mod opus_multistream;
 #[cfg(feature = "native")]
+mod flac;
+#[cfg(feature = "native")]
 mod vorbis;
 #[cfg(feature = "native")]
 mod vp8;
@@ -33,6 +35,8 @@ pub use audio::{AudioBuffer, AudioDecoder};
 pub use av1::Av1Decoder;
 #[cfg(feature = "native")]
 pub use opus::OpusAudioDecoder;
+#[cfg(feature = "native")]
+pub use flac::FlacAudioDecoder;
 #[cfg(feature = "native")]
 pub use vorbis::VorbisAudioDecoder;
 #[cfg(feature = "native")]

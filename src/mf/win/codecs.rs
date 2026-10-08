@@ -26,7 +26,6 @@ pub fn ids(codec: MfCodec) -> (GUID, GUID, GUID) {
         MfCodec::Mp3 => audio(MFAudioFormat_MP3),
         MfCodec::Ac3 => audio(MFAudioFormat_Dolby_AC3),
         MfCodec::Eac3 => audio(MFAudioFormat_Dolby_DDPlus),
-        MfCodec::Flac => audio(MFAudioFormat_FLAC),
         MfCodec::Alac => audio(MFAudioFormat_ALAC),
     }
 }

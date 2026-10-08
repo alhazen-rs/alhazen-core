@@ -14,7 +14,6 @@ pub enum MfCodec {
     Mp3,
     Ac3,
     Eac3,
-    Flac,
     Alac,
 }
 
@@ -29,7 +28,6 @@ impl MfCodec {
             (StreamKind::Audio, Codec::Mp3) => MfCodec::Mp3,
             (StreamKind::Audio, Codec::Ac3) => MfCodec::Ac3,
             (StreamKind::Audio, Codec::Eac3) => MfCodec::Eac3,
-            (StreamKind::Audio, Codec::Flac) => MfCodec::Flac,
             (StreamKind::Audio, Codec::Alac) => MfCodec::Alac,
             _ => return None,
         })

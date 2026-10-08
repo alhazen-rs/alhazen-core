@@ -15,23 +15,14 @@ pub fn audio_user_data(codec: &Codec, extradata: Option<&[u8]>) -> Option<Vec<u8
             v.extend_from_slice(asc);
             Some(v)
         }
-        // None for FLAC, as Windows' own demuxer does: the frames describe themselves, and the
-        // decoder hangs when given the STREAMINFO header.
         Codec::Alac => extradata.filter(|c| c.len() >= 24).map(|c| c[..24].to_vec()),
         _ => None,
     }
 }
 
-/// Bits per sample of a lossless stream (FLAC STREAMINFO, ALAC cookie), which Windows' FLAC and
-/// ALAC decoders require on their input type.
+/// Bits per sample of an ALAC stream (from its cookie), which Windows' ALAC decoder requires on
+/// its input type.
 pub fn audio_bits(codec: &Codec, extradata: Option<&[u8]>) -> Option<u32> {
-    if *codec == Codec::Flac {
-        // fLaC(4) + block header(4) + STREAMINFO: bits-per-sample − 1 is 5 bits at byte 12 bit 0 ..
-        // byte 13 bit 4.
-        let info = flac_streaminfo(extradata?)?;
-        let info = info.get(8..)?;
-        return Some((((info.get(12)? & 1) << 4 | info.get(13)? >> 4) + 1) as u32);
-    }
     let data = audio_user_data(codec, extradata)?;
     match codec {
         // ALACSpecificConfig: frameLength u32, compatibleVersion u8, bitDepth u8, …
@@ -53,20 +44,6 @@ pub fn frame_duration(codec: &Codec, extradata: Option<&[u8]>, rate: u32) -> Opt
     }
 }
 
-/// `fLaC` + the STREAMINFO metadata block (header + 34 bytes) from a Matroska/MP4 FLAC header.
-fn flac_streaminfo(header: &[u8]) -> Option<Vec<u8>> {
-    let blocks = header.strip_prefix(b"fLaC")?;
-    // Metadata block header: last-flag + type (7 bits), 24-bit length. STREAMINFO is type 0, first.
-    let (kind, len) = (blocks.first()? & 0x7F, u32::from_be_bytes([0, *blocks.get(1)?, *blocks.get(2)?, *blocks.get(3)?]));
-    if kind != 0 || len != 34 {
-        return None;
-    }
-    let mut v = b"fLaC".to_vec();
-    v.push(0x80); // last metadata block
-    v.extend_from_slice(&blocks[1..4 + 34]);
-    Some(v)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,25 +58,7 @@ mod tests {
     }
 
     #[test]
-    fn flac_gets_no_user_data_like_windows_own_demuxer() {
-        // Windows' MKV source gives its FLAC decoder no MF_MT_USER_DATA (the frames describe
-        // themselves); handing it the STREAMINFO header made the decoder hang.
-        let mut h = b"fLaC".to_vec();
-        h.extend_from_slice(&[0x80, 0, 0, 34]);
-        h.extend_from_slice(&[7; 34]);
-        assert!(audio_user_data(&Codec::Flac, Some(&h)).is_none());
-    }
-
-    #[test]
-    fn lossless_bit_depth_and_alac_frame_duration() {
-        // STREAMINFO with 24 bits per sample: byte 12 bit 0 = 1, byte 13 high nibble = 0x7 (23).
-        let mut h = b"fLaC".to_vec();
-        h.extend_from_slice(&[0x80, 0, 0, 34]);
-        let mut info = [0u8; 34];
-        info[12] = 0x01;
-        info[13] = 0x70;
-        h.extend_from_slice(&info);
-        assert_eq!(audio_bits(&Codec::Flac, Some(&h)), Some(24));
+    fn alac_bit_depth_and_frame_duration() {
         let mut cookie = [0u8; 24];
         cookie[..4].copy_from_slice(&4096u32.to_be_bytes());
         cookie[5] = 16;
@@ -111,10 +70,8 @@ mod tests {
     #[cfg(feature = "native")]
     #[test]
     fn reads_the_fixtures_setup_data() {
-        use crate::demux::{Demuxer, MatroskaDemuxer, Mp4Demuxer};
+        use crate::demux::{Demuxer, Mp4Demuxer};
         use crate::source::FileSource;
-        let flac = MatroskaDemuxer::open(Box::new(FileSource::open("tests/fixtures/flac.mkv").unwrap())).unwrap();
-        assert_eq!(audio_bits(&Codec::Flac, flac.streams()[0].extradata.as_deref()), Some(16));
         let alac = Mp4Demuxer::open(Box::new(FileSource::open("tests/fixtures/alac.m4a").unwrap())).unwrap();
         let s = &alac.streams()[0];
         assert_eq!(audio_bits(&Codec::Alac, s.extradata.as_deref()), Some(16));

@@ -209,7 +209,7 @@ impl Backend for NativeBackend {
     }
     fn supports_audio(&self, stream: &StreamInfo) -> bool {
         use crate::demux::Codec;
-        matches!(stream.codec, Codec::Opus | Codec::Vorbis | Codec::Pcm(_))
+        matches!(stream.codec, Codec::Opus | Codec::Vorbis | Codec::Flac | Codec::Pcm(_))
             || (cfg!(feature = "native-aac") && stream.codec == Codec::Aac)
     }
     fn open_audio_decoder(&self, stream: &StreamInfo) -> Result<Box<dyn AudioDecoder>> {
@@ -217,6 +217,7 @@ impl Backend for NativeBackend {
         Ok(match stream.codec {
             Codec::Opus => Box::new(crate::decode::OpusAudioDecoder::new(stream)?),
             Codec::Vorbis => Box::new(crate::decode::VorbisAudioDecoder::new(stream)?),
+            Codec::Flac => Box::new(crate::decode::FlacAudioDecoder::new(stream)?),
             Codec::Pcm(_) => Box::new(crate::decode::PcmAudioDecoder::new(stream)?),
             #[cfg(feature = "native-aac")]
             Codec::Aac => Box::new(crate::decode::AacAudioDecoder::new(stream)?),
