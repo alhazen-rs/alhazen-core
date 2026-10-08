@@ -178,9 +178,7 @@ impl VideoDecoder for NvdecVideoDecoder {
         let dev = self.inner().dev;
         let _current = dev.push()?;
         self.ensure_parser()?;
-        if packet.keyframe {
-            self.inner().apply_retarget();
-        }
+        self.inner().apply_retarget();
         let mut data = std::mem::take(&mut self.scratch);
         data.clear();
         if let Some(a) = &self.annexb {
@@ -347,8 +345,9 @@ impl Inner {
         check(unsafe { (self.dev.api().cuvidReconfigureDecoder)(self.decoder, &mut info) }, "reconfigure decoder")
     }
 
-    /// Applies a changed output hint before a keyframe (context current). If the driver refuses,
-    /// the old size stays; the pipeline's CPU scaler still produces the right size.
+    /// Applies a changed output hint before the next packet (context current): the hardware
+    /// scaler works when pictures are read out, so changing it mid-GOP is safe. If the driver
+    /// refuses, the old size stays; the pipeline's CPU scaler still produces the right size.
     fn apply_retarget(&mut self) {
         if !self.retarget || self.decoder.is_null() {
             return;

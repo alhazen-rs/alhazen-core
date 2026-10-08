@@ -223,11 +223,12 @@ fn output_hint_scales_on_the_gpu() {
 }
 
 #[test]
-fn output_hint_change_applies_at_the_next_keyframe() {
+fn output_hint_changes_apply_from_the_next_packet() {
     if !gpu() {
         return;
     }
-    // av1.webm has keyframes at 0 and 1 s (frame 30).
+    // av1.webm has keyframes at 0 and 1 s (frame 30). The window shrinks mid-GOP at packet 10
+    // and grows back (e.g. fullscreen) mid-GOP at packet 40: neither waits for a keyframe.
     let mut d = demuxer("av1.webm");
     let s = video(d.as_ref());
     let mut dec = NvdecVideoDecoder::new(&s).unwrap();
@@ -237,8 +238,10 @@ fn output_hint_change_applies_at_the_next_keyframe() {
         if p.stream != s.id {
             continue;
         }
-        if sent == 10 {
-            dec.set_output_hint(Some((160, 120))); // window shrinks mid-GOP
+        match sent {
+            10 => dec.set_output_hint(Some((160, 120))),
+            40 => dec.set_output_hint(None),
+            _ => {}
         }
         dec.send_packet(&p).unwrap();
         sent += 1;
@@ -251,12 +254,15 @@ fn output_hint_change_applies_at_the_next_keyframe() {
         frames.push(f);
     }
     assert_eq!(frames.len(), 60);
-    // The new size applies when the keyframe arrives; a picture already decoded and waiting for
-    // display (here frame 29) comes out at the new size too.
-    assert!(frames[..29].iter().all(|f| f.width == 320), "full size until just before the keyframe");
-    assert!(frames[30..].iter().all(|f| (f.width, f.height) == (160, 120)), "scaled from the keyframe on");
-    // Pictures around the switch are intact: compare with ffmpeg's decode scaled the same way.
-    for i in [29, 30] {
+    let widths: Vec<u32> = frames.iter().map(|f| f.width).collect();
+    eprintln!("{widths:?}");
+    // Pictures already decoded and waiting for display when the size changes come out at the
+    // new size, so allow two frames of slack around each change.
+    assert!(widths[..8].iter().all(|&w| w == 320), "full size before the shrink");
+    assert!(widths[12..38].iter().all(|&w| w == 160), "small soon after the shrink, mid-GOP");
+    assert!(widths[42..].iter().all(|&w| w == 320), "full size soon after growing, mid-GOP");
+    // Pictures around both switches are intact: compare with ffmpeg's decode scaled the same way.
+    for i in (8..13).chain(38..43) {
         let f = &frames[i];
         let Some(reference) = ffmpeg_frame("av1.webm", i, (f.width, f.height)) else { return };
         let db = psnr(&f.planes.concat(), &reference);
