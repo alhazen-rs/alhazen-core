@@ -49,8 +49,8 @@ fn vp9_conformance_vectors_match_libvpx_at_every_thread_count() {
         eprintln!("skipped: set VP9_VECTORS_DIR (see scripts/fetch_vp9_vectors.py)");
         return;
     };
-    // Tests run in the crate directory; a relative path means the workspace root.
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(dir);
+    // A relative path is relative to the repository root (tests run there anyway).
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
     let dir = dir.display().to_string();
     let mut vectors: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
