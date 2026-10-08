@@ -302,9 +302,15 @@ fn ffmpeg_installed_later_is_found() {
 
 #[test]
 fn missing_ffmpeg_means_unsupported_codec_not_a_hang() {
+    // Native + ffmpeg-cli only: a platform GPU decoder (NVDEC, Media Foundation) would decode
+    // HEVC and hide what this test checks.
+    let mut registry = alhazen_core::backend::Registry::empty_with_native();
+    let missing = FfmpegConfig { path: Some(PathBuf::from("/nonexistent/ffmpeg-for-alhazen-core-tests")), ..Default::default() };
+    registry.register(std::sync::Arc::new(FfmpegCliBackend::new(missing.clone())));
     let config = PlayerConfig {
         audio_output: AudioOutputConfig::Disabled,
-        ffmpeg: FfmpegConfig { path: Some(PathBuf::from("/nonexistent/ffmpeg-for-alhazen-core-tests")), ..Default::default() },
+        ffmpeg: missing,
+        registry: Some(std::sync::Arc::new(registry)),
         ..Default::default()
     };
     match Player::open(Source::parse(&fixture_path("hevc.mkv")).unwrap(), config) {

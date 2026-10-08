@@ -118,3 +118,15 @@ ffmpeg -v error -y -f lavfi -i testsrc2=size=320x240:rate=30 -t 0.2 -pix_fmt yuv
 
 - `h264_bt709.mp4`: 320×240 tagged BT.709 (a height-based guess would say BT.601)
 - `mjpeg_full_range.mkv`: full-range (JPEG) MJPEG; Matroska `Colour/Range` = 2
+
+## Resolution change (NVDEC)
+
+```bash
+ffmpeg -v error -y -f lavfi -i testsrc2=size=320x240:rate=30 -t 1 -pix_fmt yuv420p -c:v libvpx-vp9 -g 30 -deadline realtime -b:v 200k a.ivf
+ffmpeg -v error -y -f lavfi -i testsrc2=size=640x360:rate=30 -t 1 -pix_fmt yuv420p -c:v libvpx-vp9 -g 30 -deadline realtime -b:v 300k b.ivf
+printf "file 'a.ivf'\nfile 'b.ivf'\n" > list.txt
+ffmpeg -v error -y -f concat -safe 0 -i list.txt -c copy vp9_size_change.webm
+```
+
+- `vp9_size_change.webm`: one VP9 track, 30 frames at 320×240 then 30 at 640×360 (a keyframe with
+  the new size at 1 s).

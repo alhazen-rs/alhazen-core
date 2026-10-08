@@ -546,8 +546,10 @@ mod tests {
         fn flush(&mut self) {}
     }
 
+    type Hints = Arc<Mutex<Vec<Option<(u32, u32)>>>>;
+
     /// Records the output hints it is given.
-    struct HintRecorder(Arc<Mutex<Vec<Option<(u32, u32)>>>>);
+    struct HintRecorder(Hints);
     impl VideoDecoder for HintRecorder {
         fn send_packet(&mut self, _: &Packet) -> Result<()> {
             Ok(())

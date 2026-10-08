@@ -1,7 +1,8 @@
 //! The parts of NVIDIA's NVDEC (`cuviddec.h`, `nvcuvid.h`) and CUDA driver (`cuda.h`) APIs we
 //! use, transcribed from NVIDIA's MIT-licensed headers and loaded at runtime: nothing is linked,
 //! so building needs no NVIDIA SDK and the program runs on machines without NVIDIA drivers.
-#![allow(non_camel_case_types, non_snake_case)]
+// Names follow NVIDIA's headers, so the C documentation applies as written.
+#![allow(non_camel_case_types, non_snake_case, clippy::upper_case_acronyms)]
 
 use std::ffi::{c_int, c_short, c_uchar, c_uint, c_ulong, c_ulonglong, c_ushort, c_void};
 use std::sync::OnceLock;

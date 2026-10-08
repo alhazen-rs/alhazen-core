@@ -45,13 +45,17 @@ impl Registry {
     }
 
     /// Every backend compiled in through Cargo features. `prefer_hardware`: platform decoders
-    /// (Media Foundation on Windows) rank ahead of the native ones for codecs both handle.
+    /// (Media Foundation on Windows, NVDEC on Linux) rank ahead of the native ones for codecs both handle.
     pub fn with_options(ffmpeg: &crate::FfmpegConfig, prefer_hardware: bool) -> Self {
         #[cfg_attr(not(any(feature = "native", feature = "ffmpeg-cli")), allow(unused_mut))]
         let mut r = Self::empty();
         #[cfg(all(windows, feature = "media-foundation"))]
         r.register(Arc::new(crate::mf::MfBackend::new(prefer_hardware)));
-        #[cfg(not(all(windows, feature = "media-foundation")))]
+        #[cfg(all(target_os = "linux", feature = "nvdec"))]
+        if crate::nvdec::available() {
+            r.register(Arc::new(crate::nvdec::NvdecBackend::new(prefer_hardware)));
+        }
+        #[cfg(not(any(all(windows, feature = "media-foundation"), all(target_os = "linux", feature = "nvdec"))))]
         let _ = prefer_hardware;
         #[cfg(feature = "native")]
         r.register(Arc::new(NativeBackend));

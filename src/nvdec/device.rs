@@ -101,10 +101,8 @@ impl Device {
         c.nBitDepthMinus8 = bit_depth.checked_sub(8)?;
         // SAFETY: `c` is a valid in/out struct; the context is current.
         let ok = unsafe { (self.api.cuvidGetDecoderCaps)(&mut c) } == CUDA_SUCCESS;
-        (ok && c.bIsSupported != 0).then(|| Caps {
-            max: (c.nMaxWidth, c.nMaxHeight),
-            min: (c.nMinWidth as u32, c.nMinHeight as u32),
-        })
+        (ok && c.bIsSupported != 0)
+            .then_some(Caps { max: (c.nMaxWidth, c.nMaxHeight), min: (c.nMinWidth as u32, c.nMinHeight as u32) })
     }
 }
 

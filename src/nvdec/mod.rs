@@ -5,6 +5,14 @@
 mod device;
 pub mod size;
 #[cfg(all(target_os = "linux", feature = "nvdec"))]
+mod backend;
+#[cfg(all(target_os = "linux", feature = "nvdec"))]
+mod decoder;
+#[cfg(all(target_os = "linux", feature = "nvdec"))]
+pub use backend::NvdecBackend;
+#[cfg(all(target_os = "linux", feature = "nvdec"))]
+pub use decoder::NvdecVideoDecoder;
+#[cfg(all(target_os = "linux", feature = "nvdec"))]
 mod sys;
 
 /// Whether NVDEC can be used on this machine (driver libraries present, a CUDA device exists).
