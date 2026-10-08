@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use super::super::select::{self, Catalogue, MfCodec};
+use crate::hw::select::{self, Catalogue, HwCodec};
 use super::{codecs, device, mft, runtime};
 use crate::backend::Backend;
 use crate::decode::{AudioDecoder, VideoDecoder};
@@ -15,8 +15,11 @@ use crate::{Error, Result};
 struct Installed;
 
 impl Catalogue for Installed {
-    fn has_decoder(&self, codec: MfCodec, hardware_only: bool) -> bool {
-        static FOUND: OnceLock<Mutex<HashMap<MfCodec, bool>>> = OnceLock::new();
+    fn has_decoder(&self, codec: HwCodec, hardware_only: bool) -> bool {
+        if codec == HwCodec::Vp8 {
+            return false; // our VP8 decoder is used on Windows, as before NVDEC existed
+        }
+        static FOUND: OnceLock<Mutex<HashMap<HwCodec, bool>>> = OnceLock::new();
         let found = *FOUND.get_or_init(Default::default).lock().unwrap().entry(codec).or_insert_with(|| {
             runtime::com_init();
             if runtime::ensure_started().is_err() {
@@ -57,14 +60,14 @@ impl Backend for MfBackend {
         select::claims(stream, &Installed, self.prefer_hardware)
     }
     fn open_video_decoder(&self, stream: &StreamInfo, _threads: usize) -> Result<Box<dyn VideoDecoder>> {
-        let codec = MfCodec::of(stream).ok_or(Error::Unsupported("codec"))?;
+        let codec = HwCodec::of(stream).ok_or(Error::Unsupported("codec"))?;
         Ok(Box::new(super::MfVideoDecoder::new(codec, stream, true)?))
     }
     fn supports_audio(&self, stream: &StreamInfo) -> bool {
         select::claims(stream, &Installed, self.prefer_hardware)
     }
     fn open_audio_decoder(&self, stream: &StreamInfo) -> Result<Box<dyn AudioDecoder>> {
-        let codec = MfCodec::of(stream).ok_or(Error::Unsupported("codec"))?;
+        let codec = HwCodec::of(stream).ok_or(Error::Unsupported("codec"))?;
         Ok(Box::new(super::MfAudioDecoder::new(codec, stream)?))
     }
 }

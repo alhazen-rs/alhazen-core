@@ -9,7 +9,7 @@ use alhazen_core::audio::{AudioOutputConfig, NullOutput};
 use alhazen_core::backend::Registry;
 use alhazen_core::decode::{AudioDecoder, DecodedFrame, VideoDecoder};
 use alhazen_core::demux::{Demuxer, StreamInfo, StreamKind};
-use alhazen_core::mf::select::MfCodec;
+use alhazen_core::hw::select::HwCodec;
 use alhazen_core::mf::{MfAudioDecoder, MfVideoDecoder};
 use alhazen_core::{FfmpegConfig, Player, PlayerConfig, PlayerState, Source};
 
@@ -33,7 +33,7 @@ fn track(d: &dyn Demuxer, kind: StreamKind) -> StreamInfo {
 fn decode_video(name: &str) -> Option<(Vec<Duration>, (u32, u32), String)> {
     let mut d = demuxer(name);
     let s = track(d.as_ref(), StreamKind::Video);
-    let codec = MfCodec::of(&s).unwrap();
+    let codec = HwCodec::of(&s).unwrap();
     let mut dec = MfVideoDecoder::new(codec, &s, true).unwrap();
     let (mut pts, mut size) = (vec![], (0, 0));
     while let Some(p) = d.next_packet().unwrap() {
@@ -91,7 +91,7 @@ fn vp9_and_av1() {
 fn decode_audio(name: &str) -> Option<(usize, u32, u16, f32)> {
     let mut d = demuxer(name);
     let s = track(d.as_ref(), StreamKind::Audio);
-    let codec = MfCodec::of(&s).unwrap();
+    let codec = HwCodec::of(&s).unwrap();
     let mut dec = MfAudioDecoder::new(codec, &s).unwrap();
     let (mut frames, mut rate, mut channels, mut peak) = (0, 0, 0, 0f32);
     let mut take = |b: alhazen_core::decode::AudioBuffer| {

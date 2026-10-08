@@ -3,29 +3,30 @@
 use windows::Win32::Media::MediaFoundation::*;
 use windows::core::GUID;
 
-use super::super::select::MfCodec;
+use crate::hw::select::HwCodec;
 
 /// Output subtypes we accept, in order of preference.
-pub fn outputs(codec: MfCodec) -> &'static [GUID] {
+pub fn outputs(codec: HwCodec) -> &'static [GUID] {
     match codec {
-        MfCodec::H264 | MfCodec::Hevc | MfCodec::Vp9 | MfCodec::Av1 => &[MFVideoFormat_NV12, MFVideoFormat_P010],
+        HwCodec::H264 | HwCodec::Hevc | HwCodec::Vp8 | HwCodec::Vp9 | HwCodec::Av1 => &[MFVideoFormat_NV12, MFVideoFormat_P010],
         _ => &[MFAudioFormat_Float, MFAudioFormat_PCM],
     }
 }
 
 /// (transform category, major type, input subtype).
-pub fn ids(codec: MfCodec) -> (GUID, GUID, GUID) {
+pub fn ids(codec: HwCodec) -> (GUID, GUID, GUID) {
     let video = |s| (MFT_CATEGORY_VIDEO_DECODER, MFMediaType_Video, s);
     let audio = |s| (MFT_CATEGORY_AUDIO_DECODER, MFMediaType_Audio, s);
     match codec {
-        MfCodec::H264 => video(MFVideoFormat_H264),
-        MfCodec::Hevc => video(MFVideoFormat_HEVC),
-        MfCodec::Vp9 => video(MFVideoFormat_VP90),
-        MfCodec::Av1 => video(MFVideoFormat_AV1),
-        MfCodec::Aac => audio(MFAudioFormat_AAC),
-        MfCodec::Mp3 => audio(MFAudioFormat_MP3),
-        MfCodec::Ac3 => audio(MFAudioFormat_Dolby_AC3),
-        MfCodec::Eac3 => audio(MFAudioFormat_Dolby_DDPlus),
-        MfCodec::Alac => audio(MFAudioFormat_ALAC),
+        HwCodec::H264 => video(MFVideoFormat_H264),
+        HwCodec::Hevc => video(MFVideoFormat_HEVC),
+        HwCodec::Vp8 => video(MFVideoFormat_VP80),
+        HwCodec::Vp9 => video(MFVideoFormat_VP90),
+        HwCodec::Av1 => video(MFVideoFormat_AV1),
+        HwCodec::Aac => audio(MFAudioFormat_AAC),
+        HwCodec::Mp3 => audio(MFAudioFormat_MP3),
+        HwCodec::Ac3 => audio(MFAudioFormat_Dolby_AC3),
+        HwCodec::Eac3 => audio(MFAudioFormat_Dolby_DDPlus),
+        HwCodec::Alac => audio(MFAudioFormat_ALAC),
     }
 }

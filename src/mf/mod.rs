@@ -3,7 +3,8 @@
 //!
 //! `select` and `setup` are platform-independent (tested everywhere); the rest is Windows-only.
 
-pub mod select;
+/// Kept as `mf::select` for existing users; the rules are shared with NVDEC.
+pub use crate::hw::select;
 pub mod setup;
 
 #[cfg(all(windows, feature = "media-foundation"))]

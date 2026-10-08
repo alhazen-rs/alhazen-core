@@ -9,6 +9,7 @@ pub mod demux;
 mod error;
 pub mod ffmpeg;
 pub mod frame;
+pub mod hw;
 mod player;
 pub mod mf;
 pub mod nal;

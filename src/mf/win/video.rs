@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::core::{GUID, Interface};
 
-use super::super::select::MfCodec;
+use crate::hw::select::HwCodec;
 use super::mft::{self, Output, err};
 use super::{codecs, device, runtime};
 use crate::decode::{ColorMatrix, DecodedFrame, PixelLayout, VideoDecoder, YuvFrame, chroma_size};
@@ -34,7 +34,7 @@ struct State {
 }
 
 pub struct MfVideoDecoder {
-    codec: MfCodec,
+    codec: HwCodec,
     stream: StreamInfo,
     allow_gpu: bool,
     annexb: Option<AnnexB>,
@@ -49,10 +49,10 @@ pub struct MfVideoDecoder {
 unsafe impl Send for MfVideoDecoder {}
 
 impl MfVideoDecoder {
-    pub fn new(codec: MfCodec, stream: &StreamInfo, allow_gpu: bool) -> Result<Self> {
+    pub fn new(codec: HwCodec, stream: &StreamInfo, allow_gpu: bool) -> Result<Self> {
         let annexb = match codec {
-            MfCodec::H264 | MfCodec::Hevc => {
-                let format = if codec == MfCodec::H264 { ParamSetFormat::Avcc } else { ParamSetFormat::Hvcc };
+            HwCodec::H264 | HwCodec::Hevc => {
+                let format = if codec == HwCodec::H264 { ParamSetFormat::Avcc } else { ParamSetFormat::Hvcc };
                 // Without a configuration record the stream is already Annex B (or broken).
                 stream.extradata.as_deref().and_then(|c| AnnexB::from_config(format, c))
             }

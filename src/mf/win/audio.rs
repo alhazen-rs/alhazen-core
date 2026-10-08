@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 
 use windows::Win32::Media::MediaFoundation::*;
 
-use super::super::select::MfCodec;
+use crate::hw::select::HwCodec;
 use super::super::setup::{audio_bits, audio_user_data, frame_duration};
 use super::mft::{self, Output, err};
 use super::{codecs, runtime};
@@ -24,7 +24,7 @@ struct State {
 }
 
 pub struct MfAudioDecoder {
-    codec: MfCodec,
+    codec: HwCodec,
     stream: StreamInfo,
     state: Option<State>,
     ready: VecDeque<AudioBuffer>,
@@ -35,7 +35,7 @@ pub struct MfAudioDecoder {
 unsafe impl Send for MfAudioDecoder {}
 
 impl MfAudioDecoder {
-    pub fn new(codec: MfCodec, stream: &StreamInfo) -> Result<Self> {
+    pub fn new(codec: HwCodec, stream: &StreamInfo) -> Result<Self> {
         Ok(Self { codec, stream: stream.clone(), state: None, ready: VecDeque::new() })
     }
 
@@ -64,7 +64,7 @@ impl MfAudioDecoder {
                 if s.channels > 0 {
                     t.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, s.channels as u32).map_err(err("channels"))?;
                 }
-                if self.codec == MfCodec::Aac {
+                if self.codec == HwCodec::Aac {
                     t.SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0).map_err(err("aac payload"))?;
                 }
                 if let Some(bits) = audio_bits(&s.codec, s.extradata.as_deref()) {

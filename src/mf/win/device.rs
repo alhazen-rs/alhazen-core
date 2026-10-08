@@ -13,7 +13,7 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Media::MediaFoundation::{IMFDXGIDeviceManager, MFCreateDXGIDeviceManager};
 use windows::core::{GUID, Interface};
 
-use super::super::select::MfCodec;
+use crate::hw::select::HwCodec;
 
 /// The device, its Media Foundation device manager, and the GPU's decoder profiles.
 pub struct Gpu {
@@ -73,19 +73,19 @@ fn create() -> windows::core::Result<Gpu> {
 
 impl Gpu {
     /// Whether the GPU decodes `codec` (its main DXVA profile).
-    pub fn decodes(&self, codec: MfCodec) -> bool {
+    pub fn decodes(&self, codec: HwCodec) -> bool {
         profiles(codec).iter().any(|p| self.profiles.contains(&p.to_u128()))
     }
 }
 
 /// DXVA decoder profile GUIDs per codec (any one suffices).
-fn profiles(codec: MfCodec) -> &'static [GUID] {
+fn profiles(codec: HwCodec) -> &'static [GUID] {
     use windows::Win32::Graphics::Direct3D11::*;
     match codec {
-        MfCodec::H264 => &[D3D11_DECODER_PROFILE_H264_VLD_NOFGT, D3D11_DECODER_PROFILE_H264_VLD_FGT],
-        MfCodec::Hevc => &[D3D11_DECODER_PROFILE_HEVC_VLD_MAIN, D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10],
-        MfCodec::Vp9 => &[D3D11_DECODER_PROFILE_VP9_VLD_PROFILE0, D3D11_DECODER_PROFILE_VP9_VLD_10BIT_PROFILE2],
-        MfCodec::Av1 => &[D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0],
+        HwCodec::H264 => &[D3D11_DECODER_PROFILE_H264_VLD_NOFGT, D3D11_DECODER_PROFILE_H264_VLD_FGT],
+        HwCodec::Hevc => &[D3D11_DECODER_PROFILE_HEVC_VLD_MAIN, D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10],
+        HwCodec::Vp9 => &[D3D11_DECODER_PROFILE_VP9_VLD_PROFILE0, D3D11_DECODER_PROFILE_VP9_VLD_10BIT_PROFILE2],
+        HwCodec::Av1 => &[D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0],
         _ => &[],
     }
 }
