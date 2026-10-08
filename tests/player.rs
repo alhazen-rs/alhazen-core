@@ -56,7 +56,9 @@ fn plays_through_in_order_and_ends() {
         let mut seen = Vec::new();
         let start = Instant::now();
         // Real-time pace: a faster clock than the decoder can follow makes the player skip late
-        // frames on purpose (catch-up), which is not what this test is about.
+        // frames on purpose (catch-up), which is not what this test is about. The clock starts
+        // with the first frame, as a viewer sees it: on slow machines (CI's macOS runners) the
+        // decoder's start-up would otherwise make the first frames late and skipped.
         let mut last = Instant::now();
         while player.state() != PlayerState::Ended {
             assert!(start.elapsed() < Duration::from_secs(10), "{name}: never ended");
@@ -66,7 +68,9 @@ fn plays_through_in_order_and_ends() {
                 seen.push(f.pts());
             }
             let now = Instant::now();
-            clock.advance(now - last);
+            if !seen.is_empty() {
+                clock.advance(now - last);
+            }
             last = now;
             std::thread::sleep(Duration::from_millis(1));
         }
