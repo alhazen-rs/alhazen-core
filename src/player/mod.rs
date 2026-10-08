@@ -84,7 +84,8 @@ pub struct PlayerConfig {
     /// How the `ffmpeg-cli` backend finds ffmpeg (ignored when `registry` is set).
     pub ffmpeg: crate::FfmpegConfig,
     /// When video decoding cannot keep up with playback, switch (once) to the next backend that
-    /// supports the stream, in practice `ffmpeg-cli` with hardware decoding.
+    /// supports the stream, in practice `ffmpeg-cli` with hardware decoding. (A decoder that
+    /// can't decode the stream at all is always replaced, whatever this says.)
     pub auto_fallback: bool,
     /// Largest frame size wanted, in pixels (usually the display area in device pixels). Larger
     /// frames are scaled down before colour conversion. `None`: full size. Change it while
@@ -447,12 +448,13 @@ impl Player {
             video.as_ref().zip(video_decoder).map(|(v, (backend, decoder))| pipeline::VideoPipe {
                 stream: v.id,
                 decoder,
-                fallback: config.auto_fallback.then(|| pipeline::Fallback {
+                fallback: Some(pipeline::Fallback {
                     registry: registry.clone(),
                     stream: v.clone(),
                     threads: config.decoder_threads,
                     order: config.backend_order.clone(),
                     current: backend,
+                    speed: config.auto_fallback,
                 }),
             }),
             audio_pipe,

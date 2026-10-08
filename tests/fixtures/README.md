@@ -130,3 +130,15 @@ ffmpeg -v error -y -f concat -safe 0 -i list.txt -c copy vp9_size_change.webm
 
 - `vp9_size_change.webm`: one VP9 track, 30 frames at 320×240 then 30 at 640×360 (a keyframe with
   the new size at 1 s).
+
+## Stream variants GPUs often can't decode (NVDEC fallback)
+
+```bash
+S="-f lavfi -i testsrc2=size=320x240:rate=30 -t 1"
+ffmpeg -v error -y $S -pix_fmt yuv420p10le -c:v libx264 -profile:v high10 -g 30 -crf 30 h264_10bit.mkv
+ffmpeg -v error -y $S -pix_fmt yuv444p -c:v libx265 -x265-params log-level=error -g 30 -crf 30 hevc_444.mkv
+ffmpeg -v error -y $S -pix_fmt yuv444p -c:v libvpx-vp9 -deadline realtime -g 30 -b:v 200k vp9_444.webm
+```
+
+- `h264_10bit.mkv`: H.264 High 10 ("Hi10P"); `hevc_444.mkv`: HEVC Range Extensions 4:4:4;
+  `vp9_444.webm`: VP9 profile 1 (4:4:4). 30 frames each, 320×240.

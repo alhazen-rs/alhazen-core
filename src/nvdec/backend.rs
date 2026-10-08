@@ -9,6 +9,7 @@ use crate::{Error, Result};
 
 use super::decoder::NvdecVideoDecoder;
 use super::device;
+use super::profile::{self, Chroma, Format};
 
 /// What the GPU decodes (8-bit 4:2:0 suffices to claim; a 10-bit stream the GPU lacks fails at
 /// the first packet and falls back to the next backend).
@@ -21,17 +22,20 @@ impl Catalogue for Gpu {
     }
 }
 
-/// Whether the stream's size is within what the GPU decodes (an unknown size, 0×0, passes: the
-/// decoder then reports a size it can't handle as an error, and playback falls back).
+/// Whether the GPU decodes this stream's variant: its bit depth and 4:2:0 chroma when the setup
+/// data says (else assumed 8-bit 4:2:0), and its size when known. Anything missed here fails at
+/// the first keyframe and playback falls back to the next backend.
 fn fits(stream: &StreamInfo) -> bool {
-    let (w, h) = (stream.width, stream.height);
-    if w == 0 || h == 0 {
-        return true;
+    let format = profile::format(stream).unwrap_or(Format { bit_depth: 8, chroma: Chroma::Yuv420 });
+    if format.chroma != Chroma::Yuv420 {
+        return false;
     }
     let caps = HwCodec::of(stream)
         .and_then(device::cuda_codec)
-        .and_then(|c| device::get().and_then(|d| d.caps(c, 8)));
-    caps.is_some_and(|c| w >= c.min.0 && h >= c.min.1 && w <= c.max.0 && h <= c.max.1)
+        .and_then(|c| device::get().and_then(|d| d.caps(c, format.bit_depth)));
+    let Some(c) = caps else { return false };
+    let (w, h) = (stream.width, stream.height);
+    (w == 0 || h == 0) || (w >= c.min.0 && h >= c.min.1 && w <= c.max.0 && h <= c.max.1)
 }
 
 /// NVIDIA's GPU decoders on Linux.

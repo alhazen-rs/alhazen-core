@@ -44,7 +44,8 @@ pub(crate) struct VideoPipe {
     pub fallback: Option<Fallback>,
 }
 
-/// What the decode thread needs to open another backend's decoder for the same stream.
+/// What the decode thread needs to open another backend's decoder for the same stream: used
+/// when the decoder can't decode the stream at all (always), or can't keep up (`speed`).
 pub(crate) struct Fallback {
     pub registry: Arc<Registry>,
     pub stream: StreamInfo,
@@ -52,6 +53,8 @@ pub(crate) struct Fallback {
     pub order: Option<Vec<&'static str>>,
     /// The backend currently decoding (never chosen as its own fallback).
     pub current: &'static str,
+    /// Also switch when decoding is too slow (`PlayerConfig::auto_fallback`).
+    pub speed: bool,
 }
 
 /// Everything the audio thread needs.
@@ -265,8 +268,11 @@ struct DecodeLoop {
     held: Option<YuvFrame>,
     errors: u32,
     waiting_for_keyframe: bool,
-    /// Set until the one allowed switch to a faster backend has happened.
+    /// Set until the one allowed switch to another backend has happened.
     fallback: Option<Fallback>,
+    /// The current decoder has produced a frame (an error before that means it can't decode
+    /// this stream at all).
+    decoded_any: bool,
     monitor: SpeedMonitor,
     /// Time spent inside the decoder since the last decoded frame.
     busy: Duration,
@@ -286,6 +292,7 @@ impl DecodeLoop {
             errors: 0,
             waiting_for_keyframe: false,
             fallback: None,
+            decoded_any: false,
             monitor: SpeedMonitor::new(),
             busy: Duration::ZERO,
             last_shown: None,
@@ -348,6 +355,14 @@ impl DecodeLoop {
     fn on_decode_error(&mut self, shared: &Shared, e: Error) -> bool {
         self.errors += 1;
         log::warn!("video decode error ({}/{MAX_DECODE_ERRORS}): {e}", self.errors);
+        // A decoder that fails before its first frame (e.g. a GPU given a profile it lacks) or
+        // keeps failing hands the stream to the next backend that supports it.
+        if (!self.decoded_any || self.errors >= MAX_DECODE_ERRORS)
+            && self.switch_backend(shared, &format!("can't decode this video ({e})"))
+        {
+            self.errors = 0;
+            return true;
+        }
         if self.errors >= MAX_DECODE_ERRORS {
             shared.fail(e);
             return false;
@@ -365,6 +380,7 @@ impl DecodeLoop {
             match received {
                 Ok(Some(DecodedFrame::Yuv(f))) => {
                     self.errors = 0;
+                    self.decoded_any = true;
                     if !self.on_frame(shared, f) {
                         return false;
                     }
@@ -394,7 +410,7 @@ impl DecodeLoop {
     /// Feeds the speed monitor (only while actually playing) and switches backend, once, when
     /// decoding has been too slow for too long.
     fn check_speed(&mut self, shared: &Shared, cost: Duration, pts: Duration) {
-        if self.fallback.is_none() {
+        if !self.fallback.as_ref().is_some_and(|f| f.speed) {
             return;
         }
         if shared.state() != PlayerState::Playing {
@@ -408,20 +424,22 @@ impl DecodeLoop {
         let behind = shared.queue.len() <= 1;
         self.monitor.record_drops(now, shared.queue.dropped(), behind);
         if self.monitor.too_slow(now) {
-            self.switch_backend(shared);
+            self.switch_backend(shared, "decoding is too slow for this video");
         }
     }
 
-    fn switch_backend(&mut self, shared: &Shared) {
-        let Some(f) = self.fallback.take() else { return };
+    /// Moves the stream to the next backend that supports it (once). Returns whether it did.
+    fn switch_backend(&mut self, shared: &Shared, why: &str) -> bool {
+        let Some(f) = self.fallback.take() else { return false };
         let codec = &f.stream.codec;
         match f.registry.open_video_decoder_except(&f.stream, f.threads, f.order.as_deref(), Some(f.current)) {
             Ok((name, decoder)) => {
                 let _ = shared.events.send(PlayerEvent::Warning(format!(
-                    "{} {codec} decoding is too slow for this video; switching to {name}",
+                    "{} {codec} {why}; switching to {name}",
                     f.current
                 )));
                 self.decoder = decoder;
+                self.decoded_any = false;
                 *shared.video_backend.lock().unwrap() = Some(name);
                 if shared.seekable {
                     // Restart decoding from where playback is: the demuxer goes back to the
@@ -431,13 +449,15 @@ impl DecodeLoop {
                 } else {
                     self.waiting_for_keyframe = true;
                 }
+                true
             }
             Err(e) => {
-                log::info!("{codec} decoding is too slow, and no other backend can take over: {e}");
+                log::info!("{} {codec} {why}, and no other backend can take over: {e}", f.current);
                 let _ = shared.events.send(PlayerEvent::Warning(format!(
-                    "{} {codec} decoding is too slow for this video, and no faster decoder is available",
+                    "{} {codec} {why}, and no other decoder is available",
                     f.current
                 )));
+                false
             }
         }
     }
@@ -563,6 +583,43 @@ mod tests {
         }
     }
 
+    /// Fails on every packet, like a GPU decoder given a stream variant it can't decode.
+    struct Broken;
+    impl VideoDecoder for Broken {
+        fn send_packet(&mut self, _: &Packet) -> Result<()> {
+            Err(Error::Decode("cannot start".into()))
+        }
+        fn receive_frame(&mut self) -> Result<Option<DecodedFrame>> {
+            Ok(None)
+        }
+        fn flush(&mut self) {}
+    }
+
+    #[test]
+    fn a_decoder_that_cannot_start_hands_over_to_the_next_backend() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut shared = shared(Arc::new(MockClock::new()));
+        shared.events = tx;
+        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+        let mut registry = Registry::empty();
+        registry.register(Arc::new(Spare));
+        let mut decode = DecodeLoop::new(Box::new(Broken), pool);
+        decode.fallback = Some(Fallback {
+            registry: Arc::new(registry),
+            stream: StreamInfo::new(1, crate::demux::StreamKind::Video, crate::demux::Codec::H264),
+            threads: 1,
+            order: None,
+            current: "broken",
+            speed: false, // not about speed: this decoder can't play the stream at all
+        });
+        let packet = Packet { stream: 1, pts: Duration::ZERO, keyframe: true, data: vec![0], generation: 0 };
+        assert!(decode.on_packet(&shared, packet));
+        assert!(decode.fallback.is_none(), "switched");
+        assert_eq!(*shared.video_backend.lock().unwrap(), Some("spare"));
+        assert!(!shared.state().is_error());
+        assert!(rx.try_iter().any(|e| matches!(e, PlayerEvent::Warning(w) if w.contains("spare"))));
+    }
+
     #[test]
     fn decoders_get_the_display_size_before_each_packet() {
         let shared = shared(Arc::new(MockClock::new()));
@@ -663,6 +720,7 @@ mod tests {
             threads: 1,
             order: None,
             current: "slow",
+            speed: true,
         });
         let start = Instant::now();
         let mut pts = Duration::ZERO;

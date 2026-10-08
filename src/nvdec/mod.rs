@@ -3,6 +3,7 @@
 
 #[cfg(all(target_os = "linux", feature = "nvdec"))]
 mod device;
+pub mod profile;
 pub mod size;
 #[cfg(all(target_os = "linux", feature = "nvdec"))]
 mod backend;

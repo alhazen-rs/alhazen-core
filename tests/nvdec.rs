@@ -346,3 +346,47 @@ fn seeking_restarts_at_the_target() {
         wait("frame at target", || p.current_frame().is_some_and(|f| f.pts() <= t && f.pts() + Duration::from_millis(34) > t));
     }
 }
+
+/// Variants NVDEC can't decode (here: 10-bit H.264, 4:4:4 HEVC and VP9) must still play, through
+/// the next backend that can: a regression found in review (they showed no picture at all).
+#[test]
+fn variants_the_gpu_cannot_decode_still_play() {
+    if !gpu() {
+        return;
+    }
+    let ffmpeg = Command::new("ffmpeg").arg("-version").output().is_ok();
+    for name in ["h264_10bit.mkv", "hevc_444.mkv", "vp9_444.webm"] {
+        if !ffmpeg && name != "vp9_444.webm" {
+            eprintln!("skipped {name}: needs ffmpeg");
+            continue;
+        }
+        let config = PlayerConfig { audio_output: AudioOutputConfig::Disabled, ..Default::default() };
+        let p = Player::open(Source::parse(&fixture(name)).unwrap(), config).unwrap();
+        p.play();
+        let start = std::time::Instant::now();
+        let mut shown = std::collections::BTreeSet::new();
+        while start.elapsed() < Duration::from_secs(5) && shown.len() < 20 {
+            if let Some(f) = p.current_frame() {
+                shown.insert(f.pts());
+            }
+            assert!(!p.state().is_error(), "{name}: {:?}", p.state());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        eprintln!("{name}: {} frames via {:?}", shown.len(), p.stats().video_backend);
+        assert!(shown.len() >= 20, "{name}: only {} frames shown", shown.len());
+        assert_ne!(p.stats().video_backend, Some("nvdec"), "{name}");
+    }
+}
+
+#[test]
+fn variants_known_from_setup_data_are_not_offered_to_the_gpu() {
+    if !gpu() {
+        return;
+    }
+    use alhazen_core::backend::Backend;
+    let backend = alhazen_core::nvdec::NvdecBackend::new(true);
+    for (name, claimed) in [("h264_aac.mp4", true), ("hevc_10bit.mp4", true), ("h264_10bit.mkv", false), ("hevc_444.mkv", false)] {
+        let d = demuxer(name);
+        assert_eq!(backend.supports_video(&video(d.as_ref())), claimed, "{name}");
+    }
+}

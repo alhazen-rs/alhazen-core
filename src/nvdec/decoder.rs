@@ -69,7 +69,12 @@ pub struct NvdecVideoDecoder {
     av1_config: Option<Vec<u8>>,
     send_av1_config: bool,
     scratch: Vec<u8>,
+    /// Packets sent since the first keyframe (after a start or flush); `None` before it.
+    since_keyframe: Option<u32>,
 }
+
+/// Packets after a keyframe by which the parser must have announced the stream format.
+const FORMAT_WITHIN_PACKETS: u32 = 3;
 
 // SAFETY: the decoder is used through `&mut self` only; the CUDA context is pushed around every
 // call, so the thread that makes a call does not matter. `inner` is owned by this value.
@@ -109,6 +114,7 @@ impl NvdecVideoDecoder {
             send_av1_config: av1_config.is_some(),
             av1_config,
             scratch: Vec::new(),
+            since_keyframe: None,
         })
     }
 
@@ -188,7 +194,18 @@ impl VideoDecoder for NvdecVideoDecoder {
         }
         let result = self.parse(&data, CUVID_PKT_TIMESTAMP, packet.pts);
         self.scratch = data;
-        result
+        result?;
+        // NVIDIA's parser silently skips stream variants it can't decode (e.g. VP9 profile 1,
+        // 4:4:4) instead of reporting them. It announces the format once the first picture is
+        // complete, i.e. within a few packets of a keyframe; if it hasn't, it never will.
+        self.since_keyframe = match self.since_keyframe {
+            None if packet.keyframe => Some(0),
+            n => n.map(|n| n + 1),
+        };
+        if self.since_keyframe.is_some_and(|n| n >= FORMAT_WITHIN_PACKETS) && self.inner().setup.is_none() {
+            return Err(Error::Decode("NVDEC can't decode this stream variant".into()));
+        }
+        Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Option<DecodedFrame>> {
@@ -204,6 +221,7 @@ impl VideoDecoder for NvdecVideoDecoder {
         inner.frames.clear();
         inner.error = None;
         self.send_av1_config = self.av1_config.is_some();
+        self.since_keyframe = None;
     }
 
     fn send_eof(&mut self) {
