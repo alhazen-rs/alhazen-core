@@ -31,6 +31,9 @@ if let Some(frame) = player.current_frame() { /* draw it */ }
 - **The OS's own decoders on Windows:** H.264, HEVC, VP9 and AV1 on the GPU, plus AAC, MP3,
   AC-3, E-AC-3 and ALAC, through Media Foundation. Nothing to install; Windows covers the
   codec licences.
+- **NVIDIA GPUs on Linux:** H.264, HEVC, VP8, VP9 and AV1 (8- and 10-bit) decode on the GPU
+  through NVDEC, scaled to your display size on the GPU. Loaded from the driver at runtime:
+  nothing to install or build.
 - **Everything else through the user's ffmpeg, if they have one:** found at runtime and run as
   a separate program, so nothing is linked and ffmpeg's licence never touches your app.
 - **Files and the web:** local files, `file://`, and HTTP(S) streaming with `Range` seeking and
@@ -142,17 +145,18 @@ Raw elementary streams (a bare `.mp3`, `.aac`, `.flac`, `.h264`) need a containe
 
 ### Video
 
-| Codec | Pure Rust (all platforms) | Windows (Media Foundation) | User's ffmpeg |
-|---|---|---|---|
-| AV1 | ✅ rav1d | ✅ GPU¹ | ✅ |
-| VP9 | ✅ vp9-mt, multi-threaded | ✅ GPU¹ | ✅ |
-| VP8 | ✅ oximedia-codec | | ✅ |
-| Apple ProRes (422, 4444, interlaced) | ✅ oxideav-prores | | ✅ |
-| H.264 / AVC | | ✅ GPU or software | ✅ |
-| H.265 / HEVC | | ✅ GPU² | ✅ |
-| MJPEG, MPEG-4 Part 2, others | | | ✅ |
+| Codec | Pure Rust (all platforms) | Windows (Media Foundation) | Linux, NVIDIA (NVDEC) | User's ffmpeg |
+|---|---|---|---|---|
+| AV1 | ✅ rav1d | ✅ GPU¹ | ✅ GPU¹ | ✅ |
+| VP9 | ✅ vp9-mt, multi-threaded | ✅ GPU¹ | ✅ GPU¹ | ✅ |
+| VP8 | ✅ oximedia-codec | | ✅ GPU¹ | ✅ |
+| Apple ProRes (422, 4444, interlaced) | ✅ oxideav-prores | | | ✅ |
+| H.264 / AVC | | ✅ GPU or software | ✅ GPU | ✅ |
+| H.265 / HEVC | | ✅ GPU² | ✅ GPU | ✅ |
+| MJPEG, MPEG-4 Part 2, others | | | | ✅ |
 
-¹ Used when the GPU decodes it; otherwise the pure-Rust decoder is used (see `prefer_hardware`).
+¹ Used when the GPU decodes it and `prefer_hardware` is on (the default); otherwise the pure-Rust
+decoder is used.
 ² Needs the HEVC Video Extensions from the Microsoft Store (preinstalled on many PCs).
 
 8- and 10-bit video is supported. Frames are delivered as 8-bit BGRA, converted with the
@@ -184,10 +188,12 @@ Each stream is offered to the backends in priority order; the first that claims 
 | Backend | Platforms | Claims |
 |---|---|---|
 | `media-foundation` | Windows | H.264/HEVC/audio whenever Windows has a decoder. VP9/AV1 only with a GPU decoder (Windows' software ones are no faster than ours). |
+| `nvdec` | Linux, NVIDIA | Video the GPU decodes at the stream's size. VP8/VP9/AV1 only with `prefer_hardware` (otherwise after `native`). |
 | `native` | all | The pure-Rust decoders. |
 | `ffmpeg-cli` | all | Whatever the user's `ffmpeg -decoders` lists. GPU decoding with `-hwaccel auto`. |
 
-- `PlayerConfig::prefer_hardware = false` puts `native` before `media-foundation` for VP9/AV1.
+- `PlayerConfig::prefer_hardware = false` puts `native` before the GPU decoders
+  (`media-foundation`, `nvdec`) for VP8/VP9/AV1.
 - **Automatic fallback:** if a decoder falls behind (more than 100 ms late for 1.5 s), the
   stream switches once to the next backend that can decode it, at the same position.
   `auto_fallback = false` turns this off.
@@ -209,6 +215,7 @@ ffmpeg behind a Chocolatey/Scoop shim.
 | `audio-output` | ✅ | Sound through the default output device (`cpal`). Without it, audio is ignored and video runs on the system clock. |
 | `ffmpeg-cli` | ✅ | The runtime ffmpeg backend. Costs nothing when ffmpeg isn't installed. |
 | `media-foundation` | ✅ | Windows' decoders. Compiles to nothing on other platforms. |
+| `nvdec` | ✅ | NVIDIA GPU decoding on Linux (NVDEC), loaded from the driver at runtime. Compiles to nothing on other platforms. |
 | `native-aac` | | AAC-LC through Symphonia. **MPL-2.0**: closed-source apps are fine, but changes to Symphonia's own files must be shared. |
 
 ## Configuration
@@ -258,6 +265,8 @@ point. Seeking passes through `Buffering`.
 - **Linux with `audio-output`:** ALSA headers (`libasound2-dev` / `alsa-lib`).
 - **Windows:** Windows 10 or 11. Media Foundation is missing from "N" editions until the
   Media Feature Pack is installed; the engine then falls back to the other backends.
+- **Linux GPU decoding:** an NVIDIA GPU and its proprietary driver; nothing else at build or run
+  time. Without it, playback uses the other backends. (Intel/AMD through VA-API is planned.)
 - **ffmpeg** (optional, at runtime): 4.0+. CI tests 6–9 on Linux, Windows and macOS.
 
 ## Performance
@@ -266,6 +275,8 @@ point. Seeking passes through `Buffering`.
   bit-identical to libvpx: 45 fps vs 17.5 fps single-threaded on a 4K 10-bit stream.
 - **GPU on Windows:** H.264/HEVC/VP9/AV1 decode on the GPU's video engine; frames are copied
   back once (NV12/P010) and converted on the CPU.
+- **GPU on Linux (NVIDIA):** frames are decoded *and scaled to the display size* on the GPU, so
+  only display-sized frames are copied back and converted.
 - **Scale first:** a 4K frame shown at 1280×720 is scaled down in YUV before conversion.
 - **Catch-up:** after a stall, frames more than 50 ms late are skipped (one is still shown per
   100 ms), so video rejoins the audio quickly.

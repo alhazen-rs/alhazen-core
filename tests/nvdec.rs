@@ -288,3 +288,61 @@ fn a_hint_below_the_gpus_minimum_still_decodes() {
         assert!(frames.iter().all(|f| f.width <= 320 && f.height <= 240), "{name}: never enlarged");
     }
 }
+
+use alhazen_core::audio::AudioOutputConfig;
+use alhazen_core::{FfmpegConfig, Player, PlayerConfig};
+
+fn player(name: &str, prefer_hardware: bool) -> Player {
+    let config = PlayerConfig {
+        audio_output: AudioOutputConfig::Disabled,
+        ffmpeg: FfmpegConfig { enabled: false, ..Default::default() },
+        prefer_hardware,
+        ..Default::default()
+    };
+    Player::open(Source::parse(&fixture(name)).unwrap(), config).unwrap()
+}
+
+fn wait(what: &str, mut f: impl FnMut() -> bool) {
+    let start = std::time::Instant::now();
+    while !f() {
+        assert!(start.elapsed() < Duration::from_secs(10), "{what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn the_player_decodes_on_the_gpu_by_default() {
+    if !gpu() {
+        return;
+    }
+    for name in ["h264_aac.mp4", "vp9_profile0.webm", "av1.webm"] {
+        let p = player(name, true);
+        assert_eq!(p.stats().video_backend, Some("nvdec"), "{name}");
+        p.play();
+        wait("a frame", || p.current_frame().is_some());
+    }
+}
+
+#[test]
+fn without_prefer_hardware_vp9_and_av1_stay_native() {
+    if !gpu() {
+        return;
+    }
+    assert_eq!(player("vp9_profile0.webm", false).stats().video_backend, Some("native"));
+    assert_eq!(player("av1.webm", false).stats().video_backend, Some("native"));
+    assert_eq!(player("h264_aac.mp4", false).stats().video_backend, Some("nvdec"), "no native H.264");
+}
+
+#[test]
+fn seeking_restarts_at_the_target() {
+    if !gpu() {
+        return;
+    }
+    let p = player("h264_aac.mp4", true);
+    wait("first frame", || p.current_frame().is_some());
+    for target in [700u64, 200, 500] {
+        let t = Duration::from_millis(target);
+        p.seek(t);
+        wait("frame at target", || p.current_frame().is_some_and(|f| f.pts() <= t && f.pts() + Duration::from_millis(34) > t));
+    }
+}
