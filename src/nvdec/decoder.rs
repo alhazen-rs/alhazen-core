@@ -132,7 +132,7 @@ impl NvdecVideoDecoder {
         let mut params: CUVIDPARSERPARAMS = zeroed();
         params.CodecType = self.codec;
         params.ulMaxNumDecodeSurfaces = 1; // the sequence callback returns the real number
-        params.ulClockRate = 10_000_000; // timestamps in 100 ns units
+        params.ulClockRate = 1_000_000_000; // timestamps in nanoseconds: exact round trips
         params.ulMaxDisplayDelay = 1;
         params.pUserData = self.inner as *mut c_void;
         params.pfnSequenceCallback = Some(on_sequence);
@@ -150,7 +150,7 @@ impl NvdecVideoDecoder {
         packet.flags = flags;
         packet.payload_size = payload.len() as c_ulong;
         packet.payload = if payload.is_empty() { std::ptr::null() } else { payload.as_ptr() };
-        packet.timestamp = (pts.as_nanos() / 100) as CUvideotimestamp;
+        packet.timestamp = pts.as_nanos() as CUvideotimestamp;
         // SAFETY: the parser is live; `payload` outlives the call; no reference to `inner` is
         // held across it (the callbacks make their own).
         let r = unsafe { (api.cuvidParseVideoData)(self.parser, &mut packet) };
@@ -389,7 +389,7 @@ impl Inner {
         // SAFETY: unmaps the frame mapped above.
         unsafe { (api.cuvidUnmapVideoFrame64)(decoder, dptr) };
         copied?;
-        let pts = Duration::from_nanos(disp.timestamp.max(0) as u64 * 100);
+        let pts = Duration::from_nanos(disp.timestamp.max(0) as u64);
         let frame = self.to_frame(&s, pts);
         self.frames.push_back(frame);
         Ok(())

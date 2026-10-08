@@ -158,9 +158,15 @@ fn two_decoders_on_two_threads() {
     if !gpu() {
         return;
     }
-    let a = std::thread::spawn(|| decode("av1.webm", None).len());
-    let b = std::thread::spawn(|| decode("h264_aac.mp4", None).len());
-    assert_eq!((a.join().unwrap(), b.join().unwrap()), (60, 30));
+    let a = std::thread::spawn(|| decode("av1.webm", None));
+    let b = std::thread::spawn(|| decode("h264_aac.mp4", None));
+    let (a, b) = (a.join().unwrap(), b.join().unwrap());
+    assert_eq!((a.len(), b.len()), (60, 30));
+    // Each thread got its own pictures, intact (bit-exact vs ffmpeg for these 8-bit streams).
+    for (name, frames) in [("av1.webm", &a), ("h264_aac.mp4", &b)] {
+        let Some(reference) = ffmpeg_first_frame(name) else { return };
+        assert_eq!(psnr(&frames[0].planes.concat(), &reference), f64::INFINITY, "{name}");
+    }
 }
 
 #[test]
@@ -432,4 +438,21 @@ fn recovers_after_a_part_the_gpu_cannot_decode() {
     eprintln!("{} frames, {errors} errors, {after} after the wide part", frames.len());
     assert!(errors > 0, "the wide part can't be decoded");
     assert_eq!(after, 15, "decoding resumes when the stream is decodable again");
+}
+
+/// Frames keep their packets' timestamps exactly (no rounding through NVDEC's clock).
+#[test]
+fn timestamps_round_trip_exactly() {
+    if !gpu() {
+        return;
+    }
+    for name in ["h264_aac.mp4", "av1.webm", "hevc.mkv"] {
+        let mut d = demuxer(name);
+        let s = video(d.as_ref());
+        let packets: std::collections::BTreeSet<Duration> =
+            std::iter::from_fn(|| d.next_packet().unwrap()).filter(|p| p.stream == s.id).map(|p| p.pts).collect();
+        let frames = decode(name, None);
+        let odd: Vec<_> = frames.iter().map(|f| f.pts).filter(|p| !packets.contains(p)).take(3).collect();
+        assert!(odd.is_empty(), "{name}: frame timestamps not from any packet: {odd:?}");
+    }
 }
