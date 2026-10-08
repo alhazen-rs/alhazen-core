@@ -154,3 +154,11 @@ ffmpeg -v error -y -f concat -safe 0 -i list.txt -c copy vp9_too_wide.webm
 ```
 
 - `vp9_too_wide.webm`: 15 frames 320×240, 15 at 8448×128 (wider than NVDEC's 8192), 15 at 320×240.
+
+## AAC 5.1 (channel order)
+
+```bash
+ffmpeg -v error -y -f lavfi -i "sine=frequency=440:sample_rate=48000" -t 1 -af "pan=5.1|FL=0*c0|FR=0*c0|FC=c0|LFE=0*c0|BL=0*c0|BR=0*c0" -c:a aac -b:a 192k aac_51_center.mp4
+```
+
+- `aac_51_center.mp4`: AAC-LC 5.1, 1 s, the tone only on the centre channel.

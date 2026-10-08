@@ -214,7 +214,7 @@ fn h264_aac_plays_to_the_end_in_sync() {
     let null = NullOutput::new(RATE, 2);
     let config = PlayerConfig { decoder_threads: 2, audio_output: AudioOutputConfig::Null(null.clone()), ..Default::default() };
     let player = Player::open(Source::parse(&fixture_path("h264_aac.mp4")).unwrap(), config).unwrap();
-    assert!(player.has_video() && player.has_audio(), "AAC goes to ffmpeg when native-aac is off");
+    assert!(player.has_video() && player.has_audio(), "H.264 goes to ffmpeg; AAC to native-aac or ffmpeg");
     player.play();
     let mut checked = 0;
     until("end of playback", 20, || {
