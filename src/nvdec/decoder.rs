@@ -414,19 +414,16 @@ impl Inner {
         let row = w as usize * bps;
         // SAFETY: `copy_out` filled `row * (h + ch)` bytes of the buffer.
         let buf = unsafe { std::slice::from_raw_parts(self.host.ptr, row * (h + ch) as usize) };
-        let sample = |i: usize| if bps == 2 { buf[2 * i + 1] } else { buf[i] };
-        let y: Vec<u8> = if bps == 1 {
-            buf[..row * h as usize].to_vec()
-        } else {
-            (0..(w * h) as usize).map(sample).collect()
-        };
-        let (mut u, mut v) = (Vec::with_capacity((cw * ch) as usize), Vec::with_capacity((cw * ch) as usize));
-        let base = w as usize * h as usize; // chroma starts after the luma samples
-        for r in 0..ch as usize {
-            for c in 0..cw as usize {
-                let i = base + r * w as usize + 2 * c;
-                u.push(sample(i));
-                v.push(sample(i + 1));
+        let (luma, chroma) = buf.split_at(row * h as usize);
+        // P016 samples are little-endian 16-bit with the value in the high bits: keep the high byte.
+        let y: Vec<u8> = if bps == 1 { luma.to_vec() } else { luma.chunks_exact(2).map(|c| c[1]).collect() };
+        let cw = cw as usize;
+        let (mut u, mut v) = (vec![0u8; cw * ch as usize], vec![0u8; cw * ch as usize]);
+        // Chroma rows hold `cw` interleaved U,V pairs; filled row by row so the loop vectorizes.
+        for ((src, u), v) in chroma.chunks_exact(row).zip(u.chunks_exact_mut(cw)).zip(v.chunks_exact_mut(cw)) {
+            for ((pair, u), v) in src[..cw * 2 * bps].chunks_exact(2 * bps).zip(u).zip(v) {
+                *u = pair[bps - 1];
+                *v = pair[2 * bps - 1];
             }
         }
         let display_height = s.display_size().1;
@@ -435,7 +432,7 @@ impl Inner {
             height: h,
             layout: PixelLayout::I420,
             planes: [y, u, v],
-            strides: [w as usize, cw as usize, cw as usize],
+            strides: [w as usize, cw, cw],
             matrix: s.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(display_height)),
             full_range: s.full_range,
             pts,
