@@ -26,6 +26,9 @@ mod vp8;
 #[cfg(feature = "native")]
 mod vp9;
 
+mod delay;
+pub(crate) use delay::DelayTrim;
+
 use std::time::Duration;
 
 #[cfg(feature = "native-aac")]
