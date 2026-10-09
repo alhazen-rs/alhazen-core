@@ -361,3 +361,55 @@ fn a_jump_to_the_live_edge_leaves_no_gap_in_playback_time() {
     assert!(gaps.iter().all(|g| *g < Duration::from_millis(1100)), "keyframes 1 s apart, a skipped segment leaves no hole: {video:?}");
 }
 
+
+#[test]
+fn formats_are_announced_again_after_a_seek() {
+    // A format change in flight when a seek happens may never reach the decoder (the player drops
+    // stale messages): after a seek the demuxer announces both formats again.
+    let server = Server::dir(root());
+    let mut d = demux(&server.url("ts/index.m3u8"));
+    for _ in 0..10 {
+        d.next_packet().unwrap();
+        assert!(d.take_stream_update().is_none(), "nothing changes while playing");
+    }
+    d.seek(Duration::from_secs(3)).unwrap();
+    let mut announced = BTreeSet::new();
+    for _ in 0..40 {
+        let p = d.next_packet().unwrap().unwrap();
+        if let Some(u) = d.take_stream_update() {
+            assert_eq!(u.id, p.stream);
+            announced.insert(u.id);
+        }
+    }
+    assert_eq!(announced, BTreeSet::from([1, 2]));
+}
+
+#[test]
+fn the_player_seeks_in_a_vod_stream_and_plays_on() {
+    let server = Server::dir(root());
+    let null = NullOutput::new(48_000, 2);
+    let config = PlayerConfig { audio_output: AudioOutputConfig::Null(null.clone()), decoder_threads: 2, ..Default::default() };
+    let player = Player::open(Source::parse(&server.url("ts/index.m3u8")).unwrap(), config).unwrap();
+    assert!(player.is_seekable());
+    player.play();
+    let start = Instant::now();
+    let (mut pulled, mut seeked, mut after) = (0usize, false, Vec::new());
+    while start.elapsed() < Duration::from_secs(30) && !matches!(player.state(), PlayerState::Ended | PlayerState::Error(_)) {
+        if let Some(f) = player.current_frame()
+            && seeked
+            && after.last() != Some(&f.pts())
+        {
+            after.push(f.pts());
+        }
+        if !seeked && start.elapsed() > Duration::from_secs(1) {
+            player.seek(Duration::from_secs(4));
+            seeked = true;
+        }
+        let due = (start.elapsed().as_secs_f64() * 48_000.0) as usize;
+        null.pull(due - pulled);
+        pulled = due;
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(player.state(), PlayerState::Ended, "{:?}", player.debug_snapshot());
+    assert!(after.iter().any(|p| *p >= Duration::from_secs(5)), "played on after the seek: {after:?}");
+}

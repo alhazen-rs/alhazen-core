@@ -532,6 +532,9 @@ impl Demuxer for HlsDemuxer {
         }
         self.main.wait_key = has_video;
         self.selection.returned = target;
+        // A format change still on its way to a decoder is dropped with the other stale messages
+        // of a seek: announce every format again so the decoders surely match the new packets.
+        self.reported.clear();
         self.fill_all()?;
         Ok(self.main.pending.as_ref().or(self.audio.as_ref().and_then(|a| a.pending.as_ref())).map_or(target, |p| p.pts))
     }
