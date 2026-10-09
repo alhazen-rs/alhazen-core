@@ -41,7 +41,7 @@ pub use mp4::Mp4Demuxer;
 pub use ogg::OggDemuxer;
 #[cfg(feature = "native")]
 pub use ts::TsDemuxer;
-#[cfg(feature = "native")]
+#[cfg(feature = "hls")]
 pub(crate) use ts::is_ts as ts_is_ts;
 #[cfg(feature = "native")]
 pub use wav::WavDemuxer;
@@ -49,7 +49,7 @@ pub use wav::WavDemuxer;
 use crate::Result;
 use crate::source::MediaSource;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StreamKind {
     Video,
     Audio,

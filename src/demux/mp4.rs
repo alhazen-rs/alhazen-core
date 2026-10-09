@@ -64,7 +64,15 @@ impl Mp4Demuxer {
             let edit_skip = trak.edts.as_ref().and_then(|e| e.elst.as_ref()).and_then(|elst| {
                 leading_skip(elst.entries.iter().map(|e| e.media_time))
             });
+            // Fragmented files (fMP4, HLS/DASH segments): re_mp4 does not normalise fragment
+            // times, so a video edit list (the B-frame delay) is applied here, to every sample.
+            let fragmented = trak.mdia.minf.stbl.stsz.sample_count == 0 && !track.samples.is_empty();
+            let shift = match (kind, edit_skip) {
+                (StreamKind::Video, Some(skip)) if fragmented => skip as i64,
+                _ => 0,
+            };
             if kind == StreamKind::Video
+                && !fragmented
                 && let Some(skip) = edit_skip
             {
                 let stbl = &trak.mdia.minf.stbl;
@@ -145,8 +153,8 @@ impl Mp4Demuxer {
                 stream: track.track_id,
                 offset: s.offset,
                 size: s.size,
-                pts: ticks(s.composition_timestamp, s.timescale.max(1)),
-                dts: ticks(s.decode_timestamp, s.timescale.max(1)),
+                pts: ticks(s.composition_timestamp - shift, s.timescale.max(1)),
+                dts: ticks(s.decode_timestamp - shift, s.timescale.max(1)),
                 keyframe: s.is_sync,
             });
             match info.codec {

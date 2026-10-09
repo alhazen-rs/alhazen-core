@@ -381,6 +381,9 @@ pub struct Player {
     _audio_guard: Option<Box<dyn Send + Sync>>,
     /// Tags and cover art read when the media was opened.
     metadata: Option<Metadata>,
+    /// HLS: variants and their selection.
+    #[cfg(feature = "hls")]
+    hls: Option<Arc<crate::hls::HlsControl>>,
 }
 
 impl Player {
@@ -390,11 +393,35 @@ impl Player {
         let registry = config.registry.clone().unwrap_or_else(|| Arc::new(Registry::with_options(&config.ffmpeg, config.prefer_hardware)));
         let order = config.backend_order.as_deref();
 
+        if let Source::Adaptive(url) = &source {
+            return Self::open_adaptive(url, registry, config);
+        }
         let mut src = source.open()?;
         let seekable = src.is_seekable() && !src.is_live();
         let format = demux::probe(src.as_mut())?.ok_or(Error::UnsupportedContainer)?;
         let demuxer = registry.open_demuxer(&source, format, src, order)?;
         Self::open_demuxer_inner(demuxer, seekable, registry, config)
+    }
+
+    /// HLS (`.m3u8`); DASH is not supported yet.
+    fn open_adaptive(url: &url::Url, registry: Arc<Registry>, config: PlayerConfig) -> Result<Player> {
+        if !url.path().to_ascii_lowercase().ends_with(".m3u8") {
+            return Err(Error::Unsupported("DASH (.mpd) streams"));
+        }
+        #[cfg(feature = "hls")]
+        {
+            let demuxer = crate::hls::HlsDemuxer::open(url, &registry)?;
+            let control = demuxer.control();
+            let seekable = !demuxer.is_live();
+            let mut player = Self::open_demuxer_inner(Box::new(demuxer), seekable, registry, config)?;
+            player.hls = Some(control);
+            Ok(player)
+        }
+        #[cfg(not(feature = "hls"))]
+        {
+            let _ = (registry, config);
+            Err(Error::Unsupported("HLS (enable the `hls` feature)"))
+        }
     }
 
     /// Plays from a ready demuxer (tests, and demuxers not reached through `Source`).
@@ -520,6 +547,8 @@ impl Player {
             seekable,
             _audio_guard: audio_guard,
             metadata,
+            #[cfg(feature = "hls")]
+            hls: None,
         };
         if config.autoplay {
             player.play();
@@ -698,6 +727,10 @@ impl Player {
 impl Drop for Player {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::SeqCst);
+        #[cfg(feature = "hls")]
+        if let Some(h) = &self.hls {
+            h.shut_down();
+        }
         self.shared.queue.close();
         // Threads poll the shutdown flag every few ms, except while blocked in I/O (e.g. a
         // stalled HTTP read). Never let that block the caller, which is usually the UI thread:

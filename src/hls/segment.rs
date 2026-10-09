@@ -4,6 +4,7 @@
 //! packed-audio ID3 timestamp plus the frame's offset. The HLS demuxer maps them onto the
 //! playlist's timeline.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use crate::demux::{self, Codec, ContainerFormat, Demuxer, StreamInfo, StreamKind};
@@ -67,6 +68,8 @@ pub(crate) struct SegmentDemuxer {
     /// Packed audio: the ID3 timestamp added to the reader's times.
     offset: Duration,
     update: Option<StreamInfo>,
+    /// Packets read ahead by `first_raw`, with the format update each came with.
+    peeked: VecDeque<(RawPacket, Option<StreamInfo>)>,
 }
 
 impl SegmentDemuxer {
@@ -94,7 +97,7 @@ impl SegmentDemuxer {
             }
             None => return Err(Error::Demux("HLS segment of unknown format".into())),
         };
-        let mut d = Self { streams: Vec::new(), inner, offset, update: None };
+        let mut d = Self { streams: Vec::new(), inner, offset, update: None, peeked: VecDeque::new() };
         let all = d.inner.get().streams().to_vec();
         for kind in [StreamKind::Video, StreamKind::Audio] {
             if let Some(s) = all.iter().find(|s| s.kind == kind && !matches!(s.codec, Codec::Other(_))) {
@@ -107,7 +110,34 @@ impl SegmentDemuxer {
         Ok(d)
     }
 
+    /// The earliest timestamp among the first packets of each stream (what the segment's start
+    /// on the timeline corresponds to).
+    pub fn first_raw(&mut self) -> Result<Option<Duration>> {
+        const LOOK_AHEAD: usize = 64;
+        while self.peeked.len() < LOOK_AHEAD
+            && !self.streams.iter().all(|s| self.peeked.iter().any(|(p, _)| p.kind == s.kind))
+        {
+            match self.read()? {
+                Some(p) => {
+                    let u = self.update.take();
+                    self.peeked.push_back((p, u));
+                }
+                None => break,
+            }
+        }
+        let mut firsts = self.streams.iter().filter_map(|s| self.peeked.iter().find(|(p, _)| p.kind == s.kind).map(|(p, _)| p.raw));
+        Ok(firsts.by_ref().min())
+    }
+
     pub fn next(&mut self) -> Result<Option<RawPacket>> {
+        if let Some((p, u)) = self.peeked.pop_front() {
+            self.update = u;
+            return Ok(Some(p));
+        }
+        self.read()
+    }
+
+    fn read(&mut self) -> Result<Option<RawPacket>> {
         loop {
             let Some(p) = self.inner.get().next_packet()? else { return Ok(None) };
             let update = self.inner.get().take_stream_update();
@@ -204,7 +234,9 @@ mod tests {
         let packets = all(d);
         let first_video = packets.iter().find(|p| p.kind == StreamKind::Video).unwrap();
         assert!(first_video.keyframe);
-        assert!(first_video.raw >= Duration::from_millis(1900), "the second segment starts near 2 s: {:?}", first_video.raw);
+        // x265 put this keyframe at 1.96 s; the video edit list (2 frames of B-frame delay) is
+        // applied, so it is presented at 1.88 s.
+        assert!(first_video.raw.abs_diff(Duration::from_millis(1880)) < Duration::from_millis(5), "{:?}", first_video.raw);
         assert!(packets.iter().filter(|p| p.kind == StreamKind::Video).count() >= 50);
     }
 

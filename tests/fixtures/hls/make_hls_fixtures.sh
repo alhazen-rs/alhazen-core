@@ -52,3 +52,39 @@ for k in range(len(glob.glob("packed/raw*.aac"))):
 open("packed/index.m3u8", "w").write("\n".join(lines + ["#EXT-X-ENDLIST", ""]))
 PY
 rm packed/raw*.aac
+
+# Master playlist: two H.264 variants (640x360, 320x180) without audio, and the audio as a
+# separate rendition (EXT-X-MEDIA TYPE=AUDIO), 1 s segments, 6 s.
+rm -rf multi && mkdir multi
+ffmpeg -v error -y -f lavfi -t 6 -i "$(v 640x360)" -f lavfi -t 6 -i "$(a)" \
+  -filter_complex "[0:v]split=2[hi][lo0];[lo0]scale=320:180[lo]" -map "[hi]" -map "[lo]" -map 1:a \
+  -c:v libx264 -g 25 -pix_fmt yuv420p -x264-params log-level=error:scenecut=0 -b:v:0 600k -b:v:1 150k \
+  -c:a aac -b:a 64k -ac 1 \
+  -var_stream_map "v:0,agroup:aud,name:hi v:1,agroup:aud,name:lo a:0,agroup:aud,default:yes,language:en,name:audio" \
+  -master_pl_name master.m3u8 -f hls -hls_time 1 -hls_playlist_type vod \
+  -hls_segment_filename 'multi/%v/seg%d.ts' multi/%v/index.m3u8
+
+# AES-128: the TS fixture encrypted with a fixed key and IV.
+rm -rf aes && mkdir aes
+printf '0123456789abcdef' > aes/key.bin
+printf 'key.bin\naes/key.bin\n000102030405060708090a0b0c0d0e0f\n' > aes/keyinfo
+ffmpeg -v error -y -f lavfi -t 3 -i "$(v 320x180)" -f lavfi -t 3 -i "$(a)" \
+  -c:v libx264 -g 25 -pix_fmt yuv420p -x264-params log-level=error:scenecut=0 -c:a aac -b:a 64k -ac 1 \
+  -hls_key_info_file aes/keyinfo -f hls -hls_time 1 -hls_playlist_type vod \
+  -hls_segment_filename 'aes/seg%d.ts' aes/index.m3u8
+rm aes/keyinfo
+
+# A discontinuity: 3 s of the TS fixture, then a separate encode at another size (its clock
+# starts over).
+rm -rf disc && mkdir disc
+ffmpeg -v error -y -f lavfi -t 3 -i "$(v 160x90)" -f lavfi -t 3 -i "sine=frequency=880:sample_rate=48000" \
+  -c:v libx264 -g 25 -pix_fmt yuv420p -x264-params log-level=error:scenecut=0 -c:a aac -b:a 64k -ac 1 \
+  -f hls -hls_time 1 -hls_playlist_type vod -hls_segment_filename 'disc/b%d.ts' disc/b.m3u8
+{
+  printf '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n'
+  for i in 0 1 2; do printf '#EXTINF:1.000000,\n../ts/seg%d.ts\n' $i; done
+  printf '#EXT-X-DISCONTINUITY\n'
+  grep -A1 '^#EXTINF' disc/b.m3u8 | grep -v '^--$'
+  printf '#EXT-X-ENDLIST\n'
+} > disc/index.m3u8
+rm disc/b.m3u8

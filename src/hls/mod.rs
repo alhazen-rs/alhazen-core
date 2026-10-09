@@ -3,6 +3,10 @@
 #![allow(dead_code)]
 
 pub mod playlist;
+mod demuxer;
+pub(crate) mod timeline;
+
+pub use demuxer::{AudioRendition, HlsControl, HlsDemuxer, Variant, VariantInfo};
 pub(crate) mod abr;
 pub(crate) mod crypto;
 pub(crate) mod segment;
