@@ -3,7 +3,7 @@
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::time::Duration;
 
-use super::{Codec, Demuxer, Packet, PcmFormat, StreamInfo, StreamKind};
+use super::{Codec, Demuxer, Metadata, Packet, PcmFormat, StreamInfo, StreamKind};
 use crate::source::MediaSource;
 use crate::{Error, Result};
 
@@ -24,6 +24,7 @@ pub struct Mp4Demuxer {
     samples: Vec<SampleRef>,
     cursor: usize,
     video_track: Option<u32>,
+    metadata: Option<Metadata>,
 }
 
 impl Mp4Demuxer {
@@ -32,10 +33,16 @@ impl Mp4Demuxer {
             return Err(Error::Unsupported("MP4 from a non-seekable source"));
         }
         let size = src.byte_len().ok_or(Error::Unsupported("MP4 from a source of unknown length"))?;
-        let mp4 = re_mp4::Mp4::read(BufReader::new(&mut src), size)
-            .map_err(|e| Error::Demux(format!("mp4: {e}")))?;
         // re_mp4 keeps only three fields of the AAC config; read the real bytes ourselves.
-        let moov = read_moov(src.as_mut(), size).unwrap_or_default();
+        let (moov_start, moov) = read_moov(src.as_mut(), size).unwrap_or_default();
+        let mut meta = Metadata::default();
+        super::tags::mp4::parse_moov_tags(&moov, &mut meta);
+        // re_mp4 rejects iTunes tag data it doesn't know (a PNG cover, type 14): it never sees
+        // `moov/udta`, whose tags were just read above.
+        let hide = udta_offset(&moov).map(|at| moov_start + at + 4);
+        src.seek(SeekFrom::Start(0))?;
+        let mp4 = re_mp4::Mp4::read(BufReader::new(HideBox { src: src.as_mut(), hide, pos: 0 }), size)
+            .map_err(|e| Error::Demux(format!("mp4: {e}")))?;
 
         let mut streams = Vec::new();
         let mut samples = Vec::new();
@@ -158,13 +165,17 @@ impl Mp4Demuxer {
         }
         let samples = interleave_by_time(samples);
         let video_track = streams.iter().find(|s| s.kind == StreamKind::Video).map(|s| s.id);
-        Ok(Self { src, streams, samples, cursor: 0, video_track })
+        Ok(Self { src, streams, samples, cursor: 0, video_track, metadata: (!meta.is_empty()).then_some(meta) })
     }
 }
 
 impl Demuxer for Mp4Demuxer {
     fn streams(&self) -> &[StreamInfo] {
         &self.streams
+    }
+
+    fn metadata(&self) -> Option<&Metadata> {
+        self.metadata.as_ref()
     }
 
     fn next_packet(&mut self) -> Result<Option<Packet>> {
@@ -227,8 +238,59 @@ fn interleave_by_time(mut samples: Vec<SampleRef>) -> Vec<SampleRef> {
     samples
 }
 
-/// The whole `moov` box (top-level boxes are walked by header, `mdat` is never read).
-fn read_moov(src: &mut dyn MediaSource, size: u64) -> Option<Vec<u8>> {
+/// Offset, within `moov`'s body, of its `udta` child box.
+fn udta_offset(moov: &[u8]) -> Option<u64> {
+    let mut at = 0usize;
+    while at + 8 <= moov.len() {
+        let size = match u32::from_be_bytes(moov[at..at + 4].try_into().ok()?) as usize {
+            1 => u64::from_be_bytes(moov.get(at + 8..at + 16)?.try_into().ok()?) as usize,
+            0 => moov.len() - at,
+            s => s,
+        };
+        if &moov[at + 4..at + 8] == b"udta" {
+            return Some(at as u64);
+        }
+        if size < 8 {
+            return None;
+        }
+        at += size;
+    }
+    None
+}
+
+/// A reader over the file with the 4 bytes at `hide` (a box type) read as `free`.
+struct HideBox<'a> {
+    src: &'a mut dyn MediaSource,
+    hide: Option<u64>,
+    pos: u64,
+}
+
+impl Read for HideBox<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.src.read(buf)?;
+        if let Some(hide) = self.hide {
+            for (i, &b) in b"free".iter().enumerate() {
+                let at = hide + i as u64;
+                if (self.pos..self.pos + n as u64).contains(&at) {
+                    buf[(at - self.pos) as usize] = b;
+                }
+            }
+        }
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for HideBox<'_> {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        self.pos = self.src.seek(to)?;
+        Ok(self.pos)
+    }
+}
+
+/// The body of the top-level `moov` box (top-level boxes are walked by header, `mdat` is never
+/// read), and the file offset where it starts.
+fn read_moov(src: &mut dyn MediaSource, size: u64) -> Option<(u64, Vec<u8>)> {
     let mut pos = 0u64;
     while pos + 8 <= size {
         src.seek(SeekFrom::Start(pos)).ok()?;
@@ -253,7 +315,7 @@ fn read_moov(src: &mut dyn MediaSource, size: u64) -> Option<Vec<u8>> {
             }
             let mut moov = vec![0u8; body as usize];
             src.read_exact(&mut moov).ok()?;
-            return Some(moov);
+            return Some((pos + header, moov));
         }
         pos += len;
     }

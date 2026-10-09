@@ -481,3 +481,32 @@ fn ogg_seeks_land_near_the_target_in_long_files() {
         assert_seek(&path, t, Exact::Db(min_db));
     }
 }
+
+// ---- Tags in MP4 and Matroska ----
+
+fn assert_test_tags(name: &str, m: &alhazen_core::Metadata) {
+    assert_eq!((m.title.as_deref(), m.artist.as_deref(), m.album.as_deref()), (Some("Test Title"), Some("Test Artist"), Some("Test Album")), "{name}");
+    assert_eq!((m.album_artist.as_deref(), m.track, m.year, m.genre.as_deref()), (Some("Test Album Artist"), Some(3), Some(2024), Some("Rock")), "{name}");
+    let cover = m.cover.as_ref().unwrap_or_else(|| panic!("{name}: cover"));
+    assert_eq!(cover.mime, "image/png", "{name}");
+    assert_eq!(&cover.data[..], &std::fs::read(fixture("cover.png")).unwrap()[..], "{name}");
+}
+
+#[test]
+fn mp4_ilst_tags_and_cover() {
+    let d = open("m4a_tagged.m4a");
+    assert_test_tags("m4a_tagged.m4a", d.metadata().expect("ilst"));
+}
+
+#[test]
+fn matroska_tags_and_attached_cover() {
+    let d = open("mka_tagged.mka");
+    assert_test_tags("mka_tagged.mka", d.metadata().expect("Tags"));
+}
+
+#[test]
+fn files_without_tags_have_no_metadata() {
+    for name in ["av1.mp4", "av1.webm"] {
+        assert_eq!(open(name).metadata(), None, "{name}");
+    }
+}

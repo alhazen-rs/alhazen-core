@@ -2,6 +2,8 @@
 
 pub(crate) mod id3;
 #[cfg(feature = "native")]
+pub(crate) mod mp4;
+#[cfg(feature = "native")]
 pub(crate) mod riff;
 #[cfg(feature = "native")]
 pub(crate) mod vorbis;

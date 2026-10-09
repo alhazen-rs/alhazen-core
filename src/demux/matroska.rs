@@ -4,7 +4,8 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use super::ebml::{EbmlReader, Header, id};
-use super::{Codec, Demuxer, Packet, StreamInfo, StreamKind};
+use super::metadata::{CoverPick, Field, MAX_PICTURE, MAX_TEXT};
+use super::{Codec, Demuxer, Metadata, Packet, StreamInfo, StreamKind};
 use crate::source::MediaSource;
 use crate::{Error, Result};
 
@@ -29,6 +30,15 @@ pub struct MatroskaDemuxer {
     pending: VecDeque<Packet>,
     /// Per-track DefaultDuration, used to timestamp laced frames after the first.
     default_durations: HashMap<u32, Duration>,
+    metadata: Option<Metadata>,
+}
+
+/// Where SeekHead says the elements that may follow the clusters are (relative to the segment).
+#[derive(Default)]
+struct SeekTargets {
+    cues: Option<u64>,
+    tags: Option<u64>,
+    attachments: Option<u64>,
 }
 
 impl MatroskaDemuxer {
@@ -56,15 +66,31 @@ impl MatroskaDemuxer {
             video_track: None,
             pending: VecDeque::new(),
             default_durations: HashMap::new(),
+            metadata: None,
         };
-        let mut cues_pos = None;
+        let mut seek = SeekTargets::default();
         let mut duration_ticks = None;
+        let (mut meta, mut covers, mut segment_title) = (Metadata::default(), CoverPick::default(), None);
+        let (mut have_tags, mut have_attachments) = (false, false);
         loop {
             let start = d.r.position();
             let h = d.r.read_header()?.ok_or_else(|| demux("no Cluster found"))?;
             match h.id {
-                id::SEEK_HEAD => cues_pos = d.parse_seek_head(h)?.or(cues_pos),
-                id::INFO => duration_ticks = d.parse_info(h)?,
+                id::SEEK_HEAD => {
+                    let s = d.parse_seek_head(h)?;
+                    seek.cues = s.cues.or(seek.cues);
+                    seek.tags = s.tags.or(seek.tags);
+                    seek.attachments = s.attachments.or(seek.attachments);
+                }
+                id::INFO => duration_ticks = d.parse_info(h, &mut segment_title)?,
+                id::TAGS => {
+                    d.parse_tags(h, &mut meta)?;
+                    have_tags = true;
+                }
+                id::ATTACHMENTS => {
+                    d.parse_attachments(h, &mut covers)?;
+                    have_attachments = true;
+                }
                 id::TRACKS => d.parse_tracks(h)?,
                 id::CUES => d.parse_cues(h)?,
                 id::CLUSTER => {
@@ -84,7 +110,7 @@ impl MatroskaDemuxer {
         d.video_track = d.streams.iter().find(|s| s.kind == StreamKind::Video).map(|s| s.id);
         if d.cues.is_empty()
             && d.r.is_seekable()
-            && let Some(rel) = cues_pos
+            && let Some(rel) = seek.cues
         {
             // Cues usually sit after the clusters; read them, then come back.
             d.r.seek_to(d.segment_start + rel)?;
@@ -95,11 +121,34 @@ impl MatroskaDemuxer {
             }
             d.r.seek_to(d.first_cluster)?;
         }
+        if d.r.is_seekable() {
+            // Tags and attachments written after the clusters (ffmpeg puts its Tags there).
+            let mut moved = false;
+            for (rel, want, done) in [(seek.tags, id::TAGS, have_tags), (seek.attachments, id::ATTACHMENTS, have_attachments)] {
+                let Some(rel) = rel.filter(|_| !done) else { continue };
+                d.r.seek_to(d.segment_start + rel)?;
+                moved = true;
+                match d.r.read_header()? {
+                    Some(h) if h.id == want && want == id::TAGS => d.parse_tags(h, &mut meta)?,
+                    Some(h) if h.id == want => d.parse_attachments(h, &mut covers)?,
+                    _ => {}
+                }
+            }
+            if moved {
+                d.r.seek_to(d.first_cluster)?;
+            }
+        }
+        // Tags win over the segment title.
+        if let Some(title) = segment_title {
+            meta.set(Field::Title, &title);
+        }
+        covers.finish(&mut meta);
+        d.metadata = (!meta.is_empty()).then_some(meta);
         Ok(d)
     }
 
-    fn parse_seek_head(&mut self, h: Header) -> Result<Option<u64>> {
-        let mut cues_pos = None;
+    fn parse_seek_head(&mut self, h: Header) -> Result<SeekTargets> {
+        let mut found = SeekTargets::default();
         let end = h.data_start + known(h)?;
         while self.r.position() < end {
             let seek = self.header()?;
@@ -117,14 +166,93 @@ impl MatroskaDemuxer {
                     _ => self.r.skip(known(c)?)?,
                 }
             }
-            if target == Some(id::CUES as u64) {
-                cues_pos = pos;
+            match target.map(|t| t as u32) {
+                Some(id::CUES) => found.cues = pos,
+                Some(id::TAGS) => found.tags = pos,
+                Some(id::ATTACHMENTS) => found.attachments = pos,
+                _ => {}
             }
         }
-        Ok(cues_pos)
+        Ok(found)
     }
 
-    fn parse_info(&mut self, h: Header) -> Result<Option<f64>> {
+    /// `Tags`: every `SimpleTag` name/value at the top level of each `Tag` (targets are ignored).
+    fn parse_tags(&mut self, h: Header, meta: &mut Metadata) -> Result<()> {
+        let end = h.data_start + known(h)?;
+        while self.r.position() < end {
+            let tag = self.header()?;
+            if tag.id != id::TAG {
+                self.r.skip(known(tag)?)?;
+                continue;
+            }
+            let tag_end = tag.data_start + known(tag)?;
+            while self.r.position() < tag_end {
+                let c = self.header()?;
+                if c.id != id::SIMPLE_TAG {
+                    self.r.skip(known(c)?)?;
+                    continue;
+                }
+                let simple_end = c.data_start + known(c)?;
+                let (mut name, mut value) = (None, None);
+                while self.r.position() < simple_end {
+                    let e = self.header()?;
+                    let size = known(e)?;
+                    match e.id {
+                        id::TAG_NAME if size <= 256 => name = Some(self.r.read_string(size)?),
+                        id::TAG_STRING if size as usize <= MAX_TEXT => value = Some(self.r.read_string(size)?),
+                        _ => self.r.skip(size)?, // nested SimpleTags, binary values
+                    }
+                }
+                if let (Some(name), Some(value)) = (name, value) {
+                    let field = match name.to_ascii_uppercase().as_str() {
+                        "TITLE" => Field::Title,
+                        "ARTIST" => Field::Artist,
+                        "ALBUM" => Field::Album,
+                        "ALBUM_ARTIST" | "ALBUMARTIST" => Field::AlbumArtist,
+                        "PART_NUMBER" | "TRACKNUMBER" | "TRACK" => Field::Track,
+                        "DATE" | "DATE_RELEASED" | "DATE_RECORDED" | "YEAR" => Field::Year,
+                        "GENRE" => Field::Genre,
+                        _ => continue,
+                    };
+                    meta.set(field, &value);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `Attachments`: images; one named `cover.*` is the front cover.
+    fn parse_attachments(&mut self, h: Header, covers: &mut CoverPick) -> Result<()> {
+        let end = h.data_start + known(h)?;
+        while self.r.position() < end {
+            let f = self.header()?;
+            if f.id != id::ATTACHED_FILE {
+                self.r.skip(known(f)?)?;
+                continue;
+            }
+            let file_end = f.data_start + known(f)?;
+            let (mut name, mut mime, mut data) = (String::new(), String::new(), None);
+            while self.r.position() < file_end {
+                let c = self.header()?;
+                let size = known(c)?;
+                match c.id {
+                    id::FILE_NAME if size <= 1024 => name = self.r.read_string(size)?,
+                    id::FILE_MIME_TYPE if size <= 256 => mime = self.r.read_string(size)?,
+                    id::FILE_DATA if size as usize <= MAX_PICTURE => data = Some(self.r.read_bytes(size)?),
+                    _ => self.r.skip(size)?,
+                }
+            }
+            let lower = name.to_ascii_lowercase();
+            if let Some(data) = data
+                && (mime.starts_with("image/") || lower.starts_with("cover"))
+            {
+                covers.offer(lower.starts_with("cover.") || lower.starts_with("cover_"), &mime, &data);
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_info(&mut self, h: Header, title: &mut Option<String>) -> Result<Option<f64>> {
         let mut duration = None;
         let end = h.data_start + known(h)?;
         while self.r.position() < end {
@@ -132,6 +260,7 @@ impl MatroskaDemuxer {
             match c.id {
                 id::TIMESTAMP_SCALE => self.scale_ns = self.r.read_uint(known(c)?)?.max(1),
                 id::DURATION => duration = Some(self.r.read_float(known(c)?)?),
+                id::TITLE if known(c)? as usize <= MAX_TEXT => *title = Some(self.r.read_string(known(c)?)?),
                 _ => self.r.skip(known(c)?)?,
             }
         }
@@ -332,6 +461,10 @@ impl MatroskaDemuxer {
 impl Demuxer for MatroskaDemuxer {
     fn streams(&self) -> &[StreamInfo] {
         &self.streams
+    }
+
+    fn metadata(&self) -> Option<&Metadata> {
+        self.metadata.as_ref()
     }
 
     fn next_packet(&mut self) -> Result<Option<Packet>> {
