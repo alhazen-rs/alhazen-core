@@ -354,3 +354,35 @@ fn mp3_resyncs_over_junk_between_frames() {
     // The frame cut by the junk is lost; everything else decodes.
     assert!(ours.samples.len() * 100 >= clean.samples.len() * 95, "{} of {}", ours.samples.len(), clean.samples.len());
 }
+
+// ---- ADTS ----
+
+#[cfg(feature = "native-aac")]
+#[test]
+fn adts_matches_ffmpeg() {
+    assert_matches_ffmpeg("aac.aac", Exact::Db(100.0));
+}
+
+#[cfg(feature = "native-aac")]
+#[test]
+fn adts_seeks_exactly_in_local_files() {
+    // ffmpeg's AAC encoder uses noise substitution: those bands are random-generated, so a fresh
+    // decoder after a seek cannot reproduce them exactly (≈ 85 dB; a wrong position is ≈ 0 dB).
+    assert_seek("aac.aac", ms(500), Exact::Db(80.0));
+}
+
+#[test]
+fn adts_id3_tags() {
+    let d = open("aac_tagged.aac");
+    let m = d.metadata().expect("ID3v2 before the frames");
+    assert_eq!((m.title.as_deref(), m.artist.as_deref(), m.album.as_deref()), (Some("Test Title"), Some("Test Artist"), Some("Test Album")));
+    let s = audio(&*d);
+    assert_eq!(s.extradata.as_ref().map(Vec::len), Some(2), "AudioSpecificConfig built from the ADTS header");
+    assert!(s.duration.is_some());
+}
+
+#[cfg(feature = "native-aac")]
+#[test]
+fn adts_plays_to_the_end() {
+    plays_to_the_end("aac.aac");
+}

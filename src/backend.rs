@@ -198,7 +198,8 @@ impl Backend for NativeBackend {
             ContainerFormat::Wav => Box::new(crate::demux::WavDemuxer::open(src)?),
             ContainerFormat::Flac => Box::new(crate::demux::FlacDemuxer::open(src)?),
             ContainerFormat::Mp3 => Box::new(crate::demux::Mp3Demuxer::open(src)?),
-            ContainerFormat::Adts | ContainerFormat::Ogg => {
+            ContainerFormat::Adts => Box::new(crate::demux::AdtsDemuxer::open(src)?),
+            ContainerFormat::Ogg => {
                 return Err(Error::UnsupportedContainer);
             }
         })

@@ -1,5 +1,7 @@
 //! Containers -> packets.
 
+#[cfg(feature = "native")]
+mod adts;
 mod ebml;
 #[cfg(feature = "native")]
 mod flac;
@@ -19,6 +21,8 @@ pub(crate) mod window;
 use std::io::SeekFrom;
 use std::time::Duration;
 
+#[cfg(feature = "native")]
+pub use adts::AdtsDemuxer;
 #[cfg(feature = "native")]
 pub use flac::FlacDemuxer;
 pub use matroska::MatroskaDemuxer;

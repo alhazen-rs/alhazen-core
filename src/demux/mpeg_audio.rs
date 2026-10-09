@@ -1,8 +1,5 @@
 //! MPEG audio (Layer III) and ADTS frame headers, shared by detection and the MP3/ADTS readers.
 
-// Several fields and helpers serve only the MP3/ADTS readers (Tasks 7–8).
-#![allow(dead_code)]
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MpegVersion {
     V1,
@@ -58,6 +55,7 @@ impl MpegHeader {
         Some(Self { version, bitrate_kbps, sample_rate, channels, frame_len, samples })
     }
 
+    #[cfg(feature = "native")]
     /// Bytes of side information after the 4-byte header; a Xing/Info header starts after them.
     pub fn side_info_len(&self) -> usize {
         match (self.version, self.channels) {
@@ -105,6 +103,7 @@ impl AdtsHeader {
         Some(Self { profile: b[2] >> 6, rate_index, sample_rate, channel_config, header_len, frame_len, blocks: (b[6] & 3) as u32 + 1 })
     }
 
+    #[cfg(feature = "native")]
     /// The 2-byte AudioSpecificConfig this header describes.
     pub fn audio_specific_config(&self) -> Vec<u8> {
         let aot = self.profile as u16 + 1;
@@ -118,8 +117,6 @@ pub(crate) trait FrameHeader: Copy {
     fn length(&self) -> usize;
     /// Whether `other` belongs to the same stream (same version/profile, rate and layout).
     fn same_stream(&self, other: &Self) -> bool;
-    fn frame_samples(&self) -> u32;
-    fn rate(&self) -> u32;
 }
 
 impl FrameHeader for MpegHeader {
@@ -132,12 +129,6 @@ impl FrameHeader for MpegHeader {
     fn same_stream(&self, other: &Self) -> bool {
         self.version == other.version && self.sample_rate == other.sample_rate
     }
-    fn frame_samples(&self) -> u32 {
-        self.samples
-    }
-    fn rate(&self) -> u32 {
-        self.sample_rate
-    }
 }
 
 impl FrameHeader for AdtsHeader {
@@ -149,12 +140,6 @@ impl FrameHeader for AdtsHeader {
     }
     fn same_stream(&self, other: &Self) -> bool {
         self.profile == other.profile && self.rate_index == other.rate_index && self.channel_config == other.channel_config
-    }
-    fn frame_samples(&self) -> u32 {
-        1024 * self.blocks
-    }
-    fn rate(&self) -> u32 {
-        self.sample_rate
     }
 }
 
@@ -351,6 +336,7 @@ pub(crate) fn read_id3v1(w: &mut ReadWindow, meta: &mut Metadata) -> Result<Opti
 mod tests {
     use super::*;
 
+    #[cfg(feature = "native")]
     #[test]
     fn parses_an_mpeg1_layer3_header() {
         // MPEG-1 Layer III, 128 kb/s, 44.1 kHz, no padding, joint stereo.
@@ -371,6 +357,7 @@ mod tests {
         assert!(MpegHeader::parse(&[0xFF, 0xF1, 0x50, 0x80]).is_none(), "ADTS is not MP3");
     }
 
+    #[cfg(feature = "native")]
     #[test]
     fn parses_an_adts_header_and_builds_its_config() {
         // AAC-LC, 44.1 kHz (index 4), stereo, 371-byte frame, no CRC.
