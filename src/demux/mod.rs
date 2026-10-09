@@ -6,6 +6,8 @@ mod flac;
 mod matroska;
 mod metadata;
 #[cfg(feature = "native")]
+mod mp3;
+#[cfg(feature = "native")]
 mod mp4;
 pub(crate) mod mpeg_audio;
 pub(crate) mod tags;
@@ -23,6 +25,8 @@ pub use matroska::MatroskaDemuxer;
 pub use metadata::{Metadata, Picture};
 #[cfg(feature = "native")]
 pub(crate) use matroska::split_xiph_lacing;
+#[cfg(feature = "native")]
+pub use mp3::Mp3Demuxer;
 #[cfg(feature = "native")]
 pub use mp4::Mp4Demuxer;
 #[cfg(feature = "native")]

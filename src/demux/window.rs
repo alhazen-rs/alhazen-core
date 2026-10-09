@@ -23,7 +23,6 @@ impl ReadWindow {
         self.src.byte_len()
     }
 
-    #[allow(dead_code)] // used from Task 7
     pub fn is_local(&self) -> bool {
         self.src.is_local()
     }

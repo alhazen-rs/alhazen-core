@@ -301,3 +301,56 @@ fn mp3_in_mp4_decodes_like_ffmpeg() {
     assert!(ours.samples.len() >= reference.len(), "{} vs {}", ours.samples.len(), reference.len());
     assert_close("mp3.mp4", "decode", &ours.samples[..reference.len()], &reference, Exact::Db(100.0));
 }
+
+// ---- MP3 files ----
+
+#[cfg(feature = "native-mp3")]
+#[test]
+fn mp3_files_match_ffmpeg_gapless() {
+    for name in ["mp3_cbr.mp3", "mp3_vbr.mp3", "mp3_mpeg2.mp3", "mp3_mpeg25.mp3", "mp3_no_xing.mp3"] {
+        assert_matches_ffmpeg(name, Exact::Db(100.0));
+    }
+}
+
+#[cfg(feature = "native-mp3")]
+#[test]
+fn mp3_seeks_exactly_in_local_files() {
+    for (name, t) in [("mp3_cbr.mp3", 1234), ("mp3_vbr.mp3", 777), ("mp3_mpeg25.mp3", 1500), ("mp3_no_xing.mp3", 999)] {
+        assert_seek(name, ms(t), Exact::Db(90.0));
+    }
+}
+
+#[test]
+fn mp3_tags_and_cover() {
+    let d = open("mp3_tagged.mp3");
+    let m = d.metadata().expect("ID3v2");
+    assert_eq!((m.title.as_deref(), m.artist.as_deref(), m.album.as_deref()), (Some("Test Title"), Some("Test Artist"), Some("Test Album")));
+    assert_eq!((m.track, m.year, m.genre.as_deref()), (Some(3), Some(2024), Some("Rock")));
+    assert_eq!(&m.cover.as_ref().expect("APIC").data[..], &std::fs::read(fixture("cover.png")).unwrap()[..]);
+}
+
+#[cfg(feature = "native-mp3")]
+#[test]
+fn mp3_plays_to_the_end_with_the_lame_length() {
+    let p = plays_to_the_end("mp3_cbr.mp3");
+    let d = p.duration().unwrap();
+    assert!(d.abs_diff(Duration::from_secs(2)) < ms(30), "duration {d:?}");
+}
+
+#[cfg(feature = "native-mp3")]
+#[test]
+fn mp3_resyncs_over_junk_between_frames() {
+    let original = std::fs::read(fixture("mp3_no_xing.mp3")).unwrap();
+    let mid = original.len() / 2;
+    let mut damaged = original[..mid].to_vec();
+    damaged.extend((0..700u32).map(|i| (i * 37 % 251) as u8 & 0x7F)); // junk without 0xFF syncs
+    damaged.extend(&original[mid..]);
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("junk.mp3");
+    std::fs::write(&path, damaged).unwrap();
+    let mut d = open_path(path.to_str().unwrap());
+    let s = audio(&*d);
+    let ours = decode(&mut *d, &s, |_| false);
+    let (_, clean) = decode_all("mp3_no_xing.mp3");
+    // The frame cut by the junk is lost; everything else decodes.
+    assert!(ours.samples.len() * 100 >= clean.samples.len() * 95, "{} of {}", ours.samples.len(), clean.samples.len());
+}

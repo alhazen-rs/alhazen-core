@@ -181,6 +181,172 @@ pub(crate) fn find_chain<H: FrameHeader>(buf: &[u8], count: usize, like: Option<
     (0..buf.len()).find_map(|i| chain(buf, i, count, like).map(|h| (i, h)))
 }
 
+#[cfg(feature = "native")]
+use crate::Result;
+#[cfg(feature = "native")]
+use crate::demux::Metadata;
+#[cfg(feature = "native")]
+use crate::demux::window::ReadWindow;
+
+/// Bytes searched per step when resynchronising, and the overlap between steps (an ADTS frame can
+/// be up to 8 KiB, so two chained frames fit in the overlap).
+#[cfg(feature = "native")]
+const RESYNC_WINDOW: usize = 64 * 1024;
+#[cfg(feature = "native")]
+const RESYNC_OVERLAP: usize = 16 * 1024;
+/// ID3v2 tags larger than this are skipped unread.
+#[cfg(feature = "native")]
+const MAX_TAG: u64 = 64 << 20;
+
+/// Chained MPEG audio / ADTS frames in `[first, end)`: reading, resync over junk, and an index of
+/// frame offsets for exact seeking (local files).
+#[cfg(feature = "native")]
+pub(crate) struct Frames<H: FrameHeader> {
+    pub w: ReadWindow,
+    pub first: u64,
+    pub end: u64,
+    pos: u64,
+    /// Number of the frame at `pos`.
+    index: u64,
+    /// Offsets of frames 0, 1, …, valid while `exact`.
+    offsets: Vec<u64>,
+    exact: bool,
+    like: H,
+}
+
+#[cfg(feature = "native")]
+impl<H: FrameHeader> Frames<H> {
+    pub fn new(w: ReadWindow, first: u64, end: u64, like: H) -> Self {
+        Self { w, first, end, pos: first, index: 0, offsets: Vec::new(), exact: true, like }
+    }
+
+    /// A header of this stream at `at` whose frame ends within the audio.
+    fn header_at(&mut self, at: u64) -> Result<Option<H>> {
+        let b = self.w.at(at, 16)?;
+        Ok(H::read(b).filter(|h| self.like.same_stream(h) && at + h.length() as u64 <= self.end))
+    }
+
+    /// The first position at or after `from` where two frames of this stream chain.
+    fn find_frame(&mut self, from: u64) -> Result<Option<u64>> {
+        let mut at = from;
+        while at < self.end {
+            let window = self.w.at(at, RESYNC_WINDOW)?.to_vec();
+            if let Some((i, _)) = find_chain(&window, 2, Some(&self.like)) {
+                return Ok(Some(at + i as u64));
+            }
+            if window.len() < RESYNC_WINDOW {
+                return Ok(None);
+            }
+            at += (RESYNC_WINDOW - RESYNC_OVERLAP) as u64;
+        }
+        Ok(None)
+    }
+
+    /// The next frame: (frame number, header, the whole frame). Junk between frames is skipped.
+    pub fn next(&mut self) -> Result<Option<(u64, H, Vec<u8>)>> {
+        loop {
+            if self.pos >= self.end {
+                return Ok(None);
+            }
+            let Some(h) = self.header_at(self.pos)? else {
+                match self.find_frame(self.pos + 1)? {
+                    Some(at) => self.pos = at,
+                    None => self.pos = self.end,
+                }
+                continue;
+            };
+            let bytes = self.w.at(self.pos, h.length())?.to_vec();
+            if bytes.len() < h.length() {
+                return Ok(None); // truncated last frame
+            }
+            if self.exact && self.index == self.offsets.len() as u64 {
+                self.offsets.push(self.pos);
+            }
+            let n = self.index;
+            self.index += 1;
+            self.pos += h.length() as u64;
+            return Ok(Some((n, h, bytes)));
+        }
+    }
+
+    /// Exact seek to frame `n` (or the last frame), extending the offset index by reading frame
+    /// headers only. Returns the frame number reached.
+    pub fn seek_exact(&mut self, n: u64) -> Result<u64> {
+        if !self.exact || self.offsets.is_empty() {
+            self.offsets = vec![self.first];
+            self.exact = true;
+        }
+        while (self.offsets.len() as u64) <= n {
+            let at = *self.offsets.last().expect("not empty");
+            let Some(h) = self.header_at(at)? else { break };
+            let next = at + h.length() as u64;
+            let next = if self.header_at(next)?.is_some() {
+                next
+            } else {
+                match self.find_frame(next)? {
+                    Some(p) => p,
+                    None => break,
+                }
+            };
+            self.offsets.push(next);
+        }
+        let k = n.min(self.offsets.len() as u64 - 1);
+        self.pos = self.offsets[k as usize];
+        self.index = k;
+        Ok(k)
+    }
+
+    /// Approximate seek without scanning: to the first frame at or after byte `offset`, taken to
+    /// be frame `n`.
+    pub fn seek_approx(&mut self, offset: u64, n: u64) -> Result<u64> {
+        let offset = offset.clamp(self.first, self.end);
+        self.pos = match self.header_at(offset)? {
+            Some(_) => offset,
+            None => self.find_frame(offset)?.unwrap_or(self.end),
+        };
+        self.index = n;
+        self.exact = false;
+        Ok(n)
+    }
+
+    /// The number of frames, by scanning every header (local files). The read position is kept.
+    pub fn count(&mut self) -> Result<u64> {
+        let (pos, index) = (self.pos, self.index);
+        self.seek_exact(u64::MAX)?;
+        let n = self.offsets.len() as u64;
+        (self.pos, self.index) = (pos, index);
+        Ok(n)
+    }
+}
+
+/// Reads the ID3v2 tags at the start of the file into `meta`; returns the offset after them.
+#[cfg(feature = "native")]
+pub(crate) fn read_id3v2_tags(w: &mut ReadWindow, meta: &mut Metadata) -> Result<u64> {
+    let mut start = 0u64;
+    for _ in 0..4 {
+        let head = w.at(start, 10)?.to_vec();
+        let Some(len) = crate::demux::tags::id3::id3v2_len(&head) else { break };
+        if len <= MAX_TAG {
+            let tag = w.at(start, len as usize)?.to_vec();
+            crate::demux::tags::id3::parse_id3v2(&tag, meta);
+        }
+        start += len;
+    }
+    Ok(start)
+}
+
+/// For local files: reads an ID3v1 trailer into `meta` and returns where the audio ends (before it).
+#[cfg(feature = "native")]
+pub(crate) fn read_id3v1(w: &mut ReadWindow, meta: &mut Metadata) -> Result<Option<u64>> {
+    let Some(len) = w.len().filter(|&l| l >= 128 && w.is_local()) else { return Ok(None) };
+    let trailer = w.at(len - 128, 128)?.to_vec();
+    if !trailer.starts_with(b"TAG") {
+        return Ok(None);
+    }
+    crate::demux::tags::id3::parse_id3v1(&trailer, meta);
+    Ok(Some(len - 128))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +394,39 @@ mod tests {
         let (at, h) = find_chain::<MpegHeader>(&buf, 3, None).unwrap();
         assert_eq!((at, h.frame_len), (100, 417));
         assert!(find_chain::<MpegHeader>(&buf, 4, None).is_none(), "only three frames");
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn frames_read_resync_and_seek_exactly() {
+        use crate::demux::window::ReadWindow;
+        use crate::source::FileSource;
+        let mut bytes = vec![0u8; 50];
+        let mut offsets = Vec::new();
+        for i in 0..20 {
+            if i == 10 {
+                bytes.extend([0x12u8; 300]); // junk in the middle
+            }
+            offsets.push(bytes.len() as u64);
+            let start = bytes.len();
+            bytes.extend([0xFF, 0xFB, 0x90, 0x64, i as u8]);
+            bytes.resize(start + 417, 0);
+        }
+        let path = std::env::temp_dir().join(format!("frames_{}.bin", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let w = ReadWindow::new(Box::new(FileSource::open(&path).unwrap()));
+        let like = MpegHeader::parse(&bytes[50..]).unwrap();
+        let mut f = Frames::new(w, 50, bytes.len() as u64, like);
+        let mut seen = Vec::new();
+        while let Some((n, _, data)) = f.next().unwrap() {
+            seen.push((n, data[4]));
+        }
+        assert_eq!(seen.len(), 20, "junk skipped, every frame read");
+        assert!(seen.iter().enumerate().all(|(i, &(n, tag))| n == i as u64 && tag == i as u8));
+        assert_eq!(f.seek_exact(15).unwrap(), 15);
+        assert_eq!(f.next().unwrap().unwrap().2[4], 15);
+        assert_eq!(f.count().unwrap(), 20);
+        f.seek_approx(offsets[12] - 100, 12).unwrap();
+        assert_eq!(f.next().unwrap().unwrap().2[4], 12, "approximate seek resyncs to the next frame");
     }
 }

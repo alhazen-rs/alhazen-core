@@ -209,7 +209,6 @@ fn unsync(b: &[u8]) -> Vec<u8> {
 
 /// An ID3v1/v1.1 trailer (the last 128 bytes of the file). Fills only fields still empty.
 #[cfg(feature = "native")]
-#[allow(dead_code)] // first used by the MP3 reader (Task 7)
 pub(crate) fn parse_id3v1(t: &[u8], meta: &mut Metadata) {
     if t.len() != 128 || &t[..3] != b"TAG" {
         return;
