@@ -33,7 +33,6 @@ mod delay;
 #[cfg(any(feature = "native-aac", feature = "native-mp3", feature = "ffmpeg-cli", all(windows, feature = "media-foundation")))]
 pub(crate) use delay::DelayTrim;
 #[cfg(feature = "native")]
-#[allow(unused_imports)] // used by the Opus and Vorbis decoders from Task 9
 pub(crate) use delay::clip_end;
 
 use std::time::Duration;

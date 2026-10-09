@@ -103,7 +103,6 @@ fn snr_db(ours: &[f32], reference: &[f32]) -> f64 {
 }
 
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(not(any(feature = "native-mp3", feature = "native-aac")), allow(dead_code))] // until the Ogg tests (Task 9)
 enum Exact {
     Bits,
     Db(f64),
@@ -386,3 +385,60 @@ fn adts_id3_tags() {
 fn adts_plays_to_the_end() {
     plays_to_the_end("aac.aac");
 }
+
+// ---- Ogg ----
+
+#[test]
+fn ogg_vorbis_matches_ffmpeg() {
+    assert_matches_ffmpeg("vorbis.ogg", Exact::Db(80.0));
+}
+
+#[test]
+fn ogg_opus_matches_ffmpeg() {
+    assert_matches_ffmpeg("opus.opus", Exact::Db(50.0));
+    // The multistream (surround) decoder matches ffmpeg's to ≈ 30 dB per channel (the same on
+    // opus_51.webm); length, start and channel order are still exact.
+    assert_matches_ffmpeg("opus_51.opus", Exact::Db(25.0));
+}
+
+#[test]
+fn ogg_flac_matches_ffmpeg_exactly() {
+    assert_matches_ffmpeg("flac.oga", Exact::Bits);
+}
+
+#[test]
+fn ogg_comments_are_read() {
+    for name in ["vorbis.ogg", "opus.opus"] {
+        let d = open(name);
+        let m = d.metadata().expect("comments");
+        assert_eq!((m.title.as_deref(), m.artist.as_deref(), m.album.as_deref()), (Some("Test Title"), Some("Test Artist"), Some("Test Album")), "{name}");
+        assert_eq!((m.track, m.year, m.genre.as_deref()), (Some(3), Some(2024), Some("Rock")), "{name}");
+    }
+}
+
+#[test]
+fn ogg_plays_to_the_end() {
+    for name in ["vorbis.ogg", "opus.opus", "opus_51.opus", "flac.oga"] {
+        plays_to_the_end(name);
+    }
+}
+
+#[test]
+fn ogg_comment_spanning_pages_is_assembled() {
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("big_comment.opus");
+    let comment = format!("comment={}", "x".repeat(90_000)); // > one 64 KB page
+    let made = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "aevalsrc=exprs='0.5*sin(2*PI*440*t)':s=48000:d=1"])
+        .args(["-c:a", "libopus", "-metadata", "title=Big", "-metadata", &comment])
+        .arg(&path)
+        .status();
+    if !made.is_ok_and(|s| s.success()) {
+        eprintln!("skipped: no ffmpeg");
+        return;
+    }
+    let mut d = open_path(path.to_str().unwrap());
+    assert_eq!(d.metadata().and_then(|m| m.title.clone()).as_deref(), Some("Big"));
+    let s = audio(&*d);
+    assert!(decode(&mut *d, &s, |_| false).samples.len() > 40_000);
+}
+

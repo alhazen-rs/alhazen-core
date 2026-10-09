@@ -199,9 +199,7 @@ impl Backend for NativeBackend {
             ContainerFormat::Flac => Box::new(crate::demux::FlacDemuxer::open(src)?),
             ContainerFormat::Mp3 => Box::new(crate::demux::Mp3Demuxer::open(src)?),
             ContainerFormat::Adts => Box::new(crate::demux::AdtsDemuxer::open(src)?),
-            ContainerFormat::Ogg => {
-                return Err(Error::UnsupportedContainer);
-            }
+            ContainerFormat::Ogg => Box::new(crate::demux::OggDemuxer::open(src)?),
         })
     }
     fn supports_video(&self, stream: &StreamInfo) -> bool {

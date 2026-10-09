@@ -9,6 +9,7 @@ use super::channels::to_wave_order;
 use super::opus_multistream::MultistreamDecoder;
 
 use super::audio::{AudioBuffer, AudioDecoder};
+use super::clip_end;
 use crate::demux::{Packet, StreamInfo};
 use crate::{Error, Result};
 
@@ -65,6 +66,8 @@ pub struct OpusAudioDecoder {
     /// Matroska block times are offset by the codec delay (= pre-skip); presentation time is
     /// block time minus this, as ffmpeg's decoder reports it.
     codec_delay: Duration,
+    /// The stream's exact presentation length (Ogg final granule): later samples are padding.
+    end: Option<Duration>,
     /// Reorder surround output from Vorbis order to WAVE order (mapping family 1).
     reorder: bool,
     out: VecDeque<AudioBuffer>,
@@ -100,6 +103,7 @@ impl OpusAudioDecoder {
             pre_skip,
             skip: pre_skip,
             codec_delay: stream.codec_delay,
+            end: stream.end_trim,
             reorder,
             out: VecDeque::new(),
             pcm: vec![0.0; MAX_FRAMES * channels as usize],
@@ -124,17 +128,15 @@ impl AudioDecoder for OpusAudioDecoder {
         self.skip -= drop;
         if frames > drop {
             let samples = self.pcm[drop * ch..frames * ch].to_vec();
-            self.out.push_back(AudioBuffer {
-                rate: RATE,
-                channels: self.channels,
-                samples: match self.inner {
-                    Inner::Multi(_) if self.reorder => to_wave_order(samples, self.channels),
-                    Inner::Multi(_) => samples,
-                    Inner::Single(_) => samples,
-                },
-                pts: (packet.pts + Duration::from_nanos(drop as u64 * 1_000_000_000 / RATE as u64))
-                    .saturating_sub(self.codec_delay),
-            });
+            let samples = match self.inner {
+                Inner::Multi(_) if self.reorder => to_wave_order(samples, self.channels),
+                _ => samples,
+            };
+            let pts = (packet.pts + Duration::from_nanos(drop as u64 * 1_000_000_000 / RATE as u64)).saturating_sub(self.codec_delay);
+            let samples = clip_end(samples, self.channels, RATE, pts, self.end);
+            if !samples.is_empty() {
+                self.out.push_back(AudioBuffer { rate: RATE, channels: self.channels, samples, pts });
+            }
         }
         Ok(())
     }

@@ -12,6 +12,8 @@ mod mp3;
 #[cfg(feature = "native")]
 mod mp4;
 pub(crate) mod mpeg_audio;
+#[cfg(feature = "native")]
+mod ogg;
 pub(crate) mod tags;
 #[cfg(feature = "native")]
 mod wav;
@@ -33,6 +35,8 @@ pub(crate) use matroska::split_xiph_lacing;
 pub use mp3::Mp3Demuxer;
 #[cfg(feature = "native")]
 pub use mp4::Mp4Demuxer;
+#[cfg(feature = "native")]
+pub use ogg::OggDemuxer;
 #[cfg(feature = "native")]
 pub use wav::WavDemuxer;
 
