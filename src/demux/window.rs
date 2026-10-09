@@ -8,6 +8,8 @@ use crate::Result;
 use crate::source::MediaSource;
 
 const READ_AHEAD: usize = 64 * 1024;
+/// Larger buffers are shrunk once a read no longer needs them.
+const MAX_KEEP: usize = 1 << 20;
 
 pub(crate) struct ReadWindow {
     src: Box<dyn MediaSource>,
@@ -66,6 +68,10 @@ impl ReadWindow {
                 filled += n;
             }
             self.buf.truncate(filled);
+            // A one-off large read (a big cover in a tag) must not stay resident.
+            if self.buf.capacity() > MAX_KEEP && self.buf.len() <= MAX_KEEP {
+                self.buf.shrink_to(READ_AHEAD.max(self.buf.len()));
+            }
             self.src_pos = Some(self.start + filled as u64);
         }
         let off = (pos - self.start) as usize;
@@ -78,6 +84,18 @@ impl ReadWindow {
 mod tests {
     use super::*;
     use crate::source::FileSource;
+
+    #[test]
+    fn a_huge_read_does_not_stay_resident() {
+        let path = std::env::temp_dir().join(format!("window_big_{}.bin", std::process::id()));
+        std::fs::write(&path, vec![7u8; 3 << 20]).unwrap();
+        let mut w = ReadWindow::new(Box::new(FileSource::open(&path).unwrap()));
+        assert_eq!(w.at(0, 2 << 20).unwrap().len(), 2 << 20); // e.g. a large cover in a tag
+        w.at(2 << 20, 16).unwrap(); // reading on from the end of it
+        assert!(w.buf.capacity() <= 1 << 20, "capacity {}", w.buf.capacity());
+        w.at(100, 16).unwrap(); // a fresh read elsewhere
+        assert!(w.buf.capacity() <= 1 << 20, "capacity {}", w.buf.capacity());
+    }
 
     #[test]
     fn reads_match_the_file_across_refills_and_at_the_end() {
