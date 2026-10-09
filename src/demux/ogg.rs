@@ -22,7 +22,6 @@ const CONTINUED: u8 = 1;
 const BOS: u8 = 2;
 
 struct Page {
-    #[allow(dead_code)] // read by seeking (Task 10)
     offset: u64,
     len: u64,
     flags: u8,
@@ -158,7 +157,6 @@ fn last_granule(w: &mut ReadWindow, serial: u32, end: u64) -> Result<Option<u64>
 
 enum OggCodec {
     Vorbis { ident: Box<IdentHeader>, setup: Box<SetupHeader> },
-    #[allow(dead_code)] // `pre_skip` is read by seeking (Task 10)
     Opus { pre_skip: u64 },
     Flac { info: FlacInfo },
 }
@@ -395,7 +393,82 @@ impl OggDemuxer {
         }
     }
 
-    /// Back to the first audio page with fresh packet state.
+    /// The granule a presentation time falls on (Opus granules include the pre-skip).
+    fn granule_at(&self, t: Duration) -> u64 {
+        let g = (t.as_secs_f64() * self.rate as f64) as u64;
+        match self.codec {
+            OggCodec::Opus { pre_skip } => g + pre_skip,
+            _ => g,
+        }
+    }
+
+    /// The first valid page at or after `from` and before `limit`.
+    fn page_at_or_after(&mut self, from: u64, limit: u64) -> Result<Option<Page>> {
+        let mut at = from;
+        while at < limit {
+            let chunk = self.w.at(at, SEARCH)?.to_vec();
+            let mut i = 0;
+            while i + 4 <= chunk.len() {
+                let Some(off) = chunk[i..].windows(4).position(|x| x == b"OggS") else { break };
+                let page_at = at + (i + off) as u64;
+                if page_at >= limit {
+                    return Ok(None);
+                }
+                if let Some(p) = read_page(&mut self.w, page_at)? {
+                    return Ok(Some(p));
+                }
+                i += off + 1;
+            }
+            if chunk.len() < SEARCH {
+                return Ok(None);
+            }
+            at += (SEARCH - 3) as u64;
+        }
+        Ok(None)
+    }
+
+    /// The first page of this stream with a granule at or after `from`: (offset, granule).
+    fn granule_page_after(&mut self, from: u64, limit: u64) -> Result<Option<(u64, u64)>> {
+        let mut at = from;
+        while let Some(p) = self.page_at_or_after(at, limit)? {
+            if p.serial == self.serial && p.granule >= 0 {
+                return Ok(Some((p.offset, p.granule as u64)));
+            }
+            at = p.offset + p.len;
+        }
+        Ok(None)
+    }
+
+    /// The last page of this stream whose granule is at most `goal`: every packet on it starts
+    /// before `goal`. (offset, granule); the first audio page when none qualifies.
+    fn bisect(&mut self, goal: u64) -> Result<(u64, u64)> {
+        let mut best = (self.first_audio_page, 0);
+        let (mut lo, mut hi) = (self.first_audio_page, self.end);
+        while hi - lo > SEARCH as u64 {
+            let mid = lo + (hi - lo) / 2;
+            match self.granule_page_after(mid, hi)? {
+                Some((at, g)) if g <= goal => {
+                    best = (at, g);
+                    lo = at + 1;
+                }
+                _ => hi = mid,
+            }
+        }
+        // The rest, page by page.
+        let mut at = best.0;
+        while let Some(p) = self.page_at_or_after(at, self.end)? {
+            if p.serial == self.serial && p.granule >= 0 {
+                if p.granule as u64 > goal {
+                    break;
+                }
+                best = (p.offset, p.granule as u64);
+            }
+            at = p.offset + p.len;
+        }
+        Ok(best)
+    }
+
+    /// Back to `page` with fresh packet state.
     fn restart_at(&mut self, page: u64) {
         self.pos = page;
         self.ready.clear();
@@ -434,10 +507,19 @@ impl Demuxer for OggDemuxer {
         }
     }
 
-    fn seek(&mut self, _target: Duration) -> Result<Duration> {
-        // Task 10 replaces this with bisection.
-        self.restart_at(self.first_audio_page);
-        Ok(Duration::ZERO)
+    fn seek(&mut self, target: Duration) -> Result<Duration> {
+        let goal = self.granule_at(target);
+        let (page, granule) = if self.w.is_seekable() && self.end != u64::MAX {
+            self.bisect(goal)?
+        } else {
+            (self.first_audio_page, 0)
+        };
+        self.restart_at(page);
+        let landed = match self.codec {
+            OggCodec::Opus { pre_skip } => granule.saturating_sub(pre_skip),
+            _ => granule,
+        };
+        Ok(self.time(landed).min(target))
     }
 }
 

@@ -11,8 +11,9 @@ use alhazen_core::decode::AudioBuffer;
 use alhazen_core::demux::{Demuxer, StreamInfo, StreamKind};
 use alhazen_core::{FfmpegConfig, Player, PlayerConfig, PlayerState, Source};
 
+/// A fixture by name, or a file generated at test time by absolute path.
 fn fixture(name: &str) -> String {
-    format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
+    if name.starts_with('/') { name.to_owned() } else { format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR")) }
 }
 
 fn open_path(path: &str) -> Box<dyn Demuxer> {
@@ -442,3 +443,41 @@ fn ogg_comment_spanning_pages_is_assembled() {
     assert!(decode(&mut *d, &s, |_| false).samples.len() > 40_000);
 }
 
+
+#[test]
+fn ogg_seeks_land_before_the_target_with_the_right_samples() {
+    assert_seek("vorbis.ogg", ms(1234), Exact::Db(60.0));
+    assert_seek("opus.opus", ms(1234), Exact::Db(20.0)); // a different decoder re-converging after 80 ms
+    assert_seek("flac.oga", ms(555), Exact::Bits);
+}
+
+/// A 20 s two-tone chirp encoded with `codec` into the test temp dir; `None` without ffmpeg.
+fn generated(name: &str, codec: &[&str]) -> Option<String> {
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let ok = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+        .arg("aevalsrc=exprs='0.5*sin(2*PI*(220+30*t)*t)|0.4*sin(2*PI*(330+20*t)*t)':s=48000:d=20")
+        .args(codec)
+        .arg(&path)
+        .status()
+        .ok()?
+        .success();
+    ok.then(|| path.to_string_lossy().into_owned())
+}
+
+#[test]
+fn ogg_seeks_land_near_the_target_in_long_files() {
+    for (name, codec, min_db) in [
+        ("long_seek.ogg", &["-c:a", "libvorbis", "-q:a", "3"][..], 60.0),
+        ("long_seek.opus", &["-c:a", "libopus", "-b:a", "64k"][..], 20.0),
+    ] {
+        let Some(path) = generated(name, codec) else { return };
+        let t = Duration::from_millis(15_500);
+        let mut d = open(&path);
+        let s = audio(&*d);
+        d.seek(t.saturating_sub(s.seek_preroll)).unwrap();
+        let first = d.next_packet().unwrap().expect("audio after the seek").pts;
+        assert!(first <= t && t - first < Duration::from_secs(2), "{name}: landed at {first:?} for {t:?}");
+        assert_seek(&path, t, Exact::Db(min_db));
+    }
+}
