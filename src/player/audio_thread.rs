@@ -221,6 +221,7 @@ impl AudioLoop {
                 && shared.generation.load(Ordering::SeqCst) == generation
         });
         self.pushed += written as u64;
+        crate::player::Diag::set(&shared.diag.audio, 2, self.expected);
         if shared.shutdown.load(Ordering::SeqCst) {
             return false;
         }
@@ -253,6 +254,7 @@ impl AudioLoop {
                 return false;
             }
         }
+        crate::player::Diag::set(&shared.diag.audio, 4, self.expected);
         let capacity = self.producer.buffer().capacity();
         loop {
             if shared.shutdown.load(Ordering::SeqCst) {

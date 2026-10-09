@@ -168,10 +168,12 @@ fn decoder_that_fell_behind_the_sound_is_replaced() {
     let events = player.events();
     player.play();
     let start = Instant::now();
+    let mut loops = 0u64;
     while player.state() != PlayerState::Ended {
+        loops += 1;
         assert!(
             start.elapsed() < Duration::from_secs(20),
-            "never ended: {:?} at {:?}, slow {} fast {}, {:?}\n{}",
+            "never ended after {loops} loops: {:?} at {:?}, slow {} fast {}, {:?}\n{}",
             player.state(),
             player.position(),
             slow.load(Ordering::SeqCst),

@@ -578,8 +578,10 @@ impl Player {
         let s = &self.shared;
         let audio = s.audio_out.as_ref().map(|o| {
             format!(
-                "played {} paused {} discard_until {} exhausted {} failed {}",
+                "played {} renders {} ring {} paused {} discard_until {} exhausted {} failed {}",
                 o.frames_played.load(Ordering::SeqCst),
+                o.renders.load(Ordering::Relaxed),
+                o.ring_frames.load(Ordering::Relaxed),
                 o.paused.load(Ordering::SeqCst),
                 o.discard_until.load(Ordering::SeqCst),
                 o.exhausted.load(Ordering::SeqCst),
