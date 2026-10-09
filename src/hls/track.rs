@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -86,6 +86,8 @@ pub(crate) struct Track {
     duration: Option<Duration>,
     target_duration: Duration,
     cancel: Arc<AtomicBool>,
+    /// Where the newest segment handed over (queued included) ends, in nanoseconds.
+    fetched_end: Arc<AtomicU64>,
 }
 
 impl Track {
@@ -107,7 +109,9 @@ impl Track {
         playlists[variant] = Some(Arc::new(first.1));
         let (event_tx, events) = crossbeam_channel::bounded(AHEAD);
         let (commands, command_rx) = crossbeam_channel::unbounded();
+        let fetched_end = Arc::new(AtomicU64::new(0));
         let worker = Worker {
+            fetched_end: fetched_end.clone(),
             fetch,
             urls,
             playlists,
@@ -127,7 +131,7 @@ impl Track {
             jump_pending: false,
         };
         thread::Builder::new().name("hls-fetch".into()).spawn(move || worker.run())?;
-        Ok(Track { events, commands, live, duration, target_duration, cancel: cfg.cancel })
+        Ok(Track { events, commands, live, duration, target_duration, cancel: cfg.cancel, fetched_end })
     }
 
     /// The next event, or `None` after `timeout` (or once the thread has stopped).
@@ -163,6 +167,12 @@ impl Track {
     /// VOD: the playlist's length.
     pub fn duration(&self) -> Option<Duration> {
         self.duration
+    }
+
+    /// Where the newest downloaded segment ends on the timeline (segments waiting to be read
+    /// included): the media buffered is this minus the position read.
+    pub fn fetched_end(&self) -> Duration {
+        Duration::from_nanos(self.fetched_end.load(Ordering::Relaxed))
     }
 
     pub fn target_duration(&self) -> Duration {
@@ -208,6 +218,7 @@ fn live_edge(p: &MediaPlaylist) -> Option<u64> {
 }
 
 struct Worker {
+    fetched_end: Arc<AtomicU64>,
     fetch: Fetcher,
     urls: Vec<Url>,
     playlists: Vec<Option<Arc<MediaPlaylist>>>,
@@ -271,6 +282,7 @@ impl Worker {
         match c {
             Command::Seek(t) => {
                 self.epoch += 1;
+                self.fetched_end.store(0, Ordering::Relaxed);
                 if self.live {
                     return;
                 }
@@ -476,6 +488,8 @@ impl Worker {
                 });
                 if self.send(event) {
                     self.jump_pending = false;
+                    let end = start + seg.duration;
+                    self.fetched_end.store(end.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
                     self.next = Some(seg.sequence + 1);
                     self.next_start = start + seg.duration;
                 }

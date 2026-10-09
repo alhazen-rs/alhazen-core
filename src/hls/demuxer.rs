@@ -160,19 +160,19 @@ struct Selection {
     fetching: usize,
     /// Chosen by the application (`Variant::Index`); `None`: ABR decides.
     manual: Option<usize>,
-    /// End of the newest main segment received, and pts of the last main packet returned: the
-    /// difference is the media buffered ahead.
-    received_end: Duration,
+    /// Pts of the last main packet returned: the media buffered is from here to the end of the
+    /// newest segment downloaded.
     returned: Duration,
 }
 
 impl Selection {
-    /// After a main segment arrived: measure, then pick the variant to fetch next.
-    fn on_segment(&mut self, s: &SegmentData, control: &HlsControl, track: &Track) {
+    /// After a main segment arrived: measure, then pick the variant to fetch next (`Some` when
+    /// it differs from the one being fetched). `fetched_end`: where the newest downloaded segment
+    /// ends.
+    fn on_segment(&mut self, s: &SegmentData, control: &HlsControl, fetched_end: Duration) -> Option<usize> {
         if s.bytes > 0 {
             self.abr.sample(s.bytes, s.elapsed);
         }
-        self.received_end = s.start + s.duration;
         control.variant_changed(s.variant);
         let n = self.blacklist.len();
         match control.requested.lock().unwrap().take() {
@@ -181,16 +181,17 @@ impl Selection {
             Some(Variant::Auto) => self.manual = None,
             None => {}
         }
-        let buffer = self.received_end.saturating_sub(self.returned);
+        let buffer = fetched_end.saturating_sub(self.returned);
         let next = match self.manual {
             Some(i) => i,
             None => self.abr.choose(self.fetching, buffer, s.duration, &self.blacklist),
         };
-        if next != self.fetching {
-            log::info!("HLS: switching to variant {next} (buffer {buffer:?}, estimate {:?} b/s)", self.abr.estimate());
-            track.switch(next);
-            self.fetching = next;
+        if next == self.fetching {
+            return None;
         }
+        log::info!("HLS: switching to variant {next} (buffer {buffer:?}, estimate {:?} b/s)", self.abr.estimate());
+        self.fetching = next;
+        Some(next)
     }
 }
 
@@ -303,7 +304,6 @@ impl HlsDemuxer {
                 blacklist,
                 fetching: chosen,
                 manual: None,
-                received_end: Duration::ZERO,
                 returned: Duration::ZERO,
             },
             rendition_uris,
@@ -437,8 +437,10 @@ impl HlsDemuxer {
                 None => {}
                 Some(TrackEvent::Segment(s)) if s.epoch < lane.epoch => {}
                 Some(TrackEvent::Segment(s)) => {
-                    if let Some(sel) = selection.as_deref_mut() {
-                        sel.on_segment(&s, control, &lane.track);
+                    if let Some(sel) = selection.as_deref_mut()
+                        && let Some(v) = sel.on_segment(&s, control, lane.track.fetched_end())
+                    {
+                        lane.track.switch(v);
                     }
                     Self::open_segment(lane, timeline, s)?
                 }
@@ -558,4 +560,71 @@ fn decodable(registry: &Registry, codecs: &[String]) -> bool {
         };
         registry.can_decode(&StreamInfo::new(0, kind, codec))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn control(current: usize) -> HlsControl {
+        HlsControl {
+            variants: Vec::new(),
+            renditions: Vec::new(),
+            current: AtomicUsize::new(current),
+            requested: Mutex::new(None),
+            requested_audio: Mutex::new(None),
+            events: Mutex::new(None),
+            shutdown: AtomicBool::new(false),
+        }
+    }
+
+    fn segment(seq: u64, variant: usize) -> SegmentData {
+        SegmentData {
+            seq,
+            discontinuity_seq: 0,
+            start: Duration::from_secs(seq),
+            duration: Duration::from_secs(1),
+            data: Vec::new(),
+            init: None,
+            variant,
+            bytes: 125_000, // 10 Mb/s over 100 ms
+            elapsed: Duration::from_millis(100),
+            epoch: 0,
+            jumped: false,
+        }
+    }
+
+    #[test]
+    fn switches_up_when_downloads_are_well_ahead_of_playback() {
+        let mut sel = Selection {
+            abr: Abr::new(vec![433_000, 143_000]),
+            blacklist: vec![false; 2],
+            fetching: 1,
+            manual: None,
+            returned: Duration::ZERO,
+        };
+        let c = control(1);
+        assert_eq!(sel.on_segment(&segment(0, 1), &c, Duration::from_secs(4)), None, "one sample is not enough");
+        assert_eq!(sel.on_segment(&segment(1, 1), &c, Duration::from_secs(4)), None);
+        // A segment is opened when reading reaches it: the position read is its start (2 s), and
+        // the downloads are three segments further (5 s). Three fast downloads: up.
+        sel.returned = Duration::from_secs(2);
+        assert_eq!(sel.on_segment(&segment(2, 1), &c, Duration::from_secs(5)), Some(0));
+    }
+
+    #[test]
+    fn a_manual_choice_holds_until_auto() {
+        let mut sel =
+            Selection { abr: Abr::new(vec![433_000, 143_000]), blacklist: vec![false; 2], fetching: 0, manual: None, returned: Duration::ZERO };
+        let c = control(0);
+        c.set_variant(Variant::Index(1));
+        assert_eq!(sel.on_segment(&segment(0, 0), &c, Duration::from_secs(4)), Some(1));
+        for seq in 1..5 {
+            sel.returned = Duration::from_secs(seq);
+            assert_eq!(sel.on_segment(&segment(seq, 1), &c, Duration::from_secs(seq + 3)), None, "manual: no ABR");
+        }
+        c.set_variant(Variant::Auto);
+        sel.returned = Duration::from_secs(5);
+        assert_eq!(sel.on_segment(&segment(5, 1), &c, Duration::from_secs(8)), Some(0));
+    }
 }

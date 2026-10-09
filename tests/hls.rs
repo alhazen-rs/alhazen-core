@@ -360,3 +360,4 @@ fn a_jump_to_the_live_edge_leaves_no_gap_in_playback_time() {
     assert!(video.len() >= 3, "{video:?}");
     assert!(gaps.iter().all(|g| *g < Duration::from_millis(1100)), "keyframes 1 s apart, a skipped segment leaves no hole: {video:?}");
 }
+
