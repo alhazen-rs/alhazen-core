@@ -257,3 +257,33 @@ fn wav_with_odd_chunks_and_list_first_opens() {
     assert_eq!(ours.samples, decode_all("wav_s16.wav").1.samples);
 }
 
+
+// ---- FLAC ----
+
+#[test]
+fn flac_matches_ffmpeg_exactly() {
+    assert_matches_ffmpeg("flac.flac", Exact::Bits);
+}
+
+#[test]
+fn flac_seeks_exactly() {
+    for t in [0, 777, 1500, 1990] {
+        assert_seek("flac.flac", ms(t), Exact::Bits);
+    }
+}
+
+#[test]
+fn flac_tags_and_cover() {
+    let d = open("flac_tagged.flac");
+    let m = d.metadata().expect("tags");
+    assert_eq!((m.title.as_deref(), m.artist.as_deref(), m.album.as_deref()), (Some("Test Title"), Some("Test Artist"), Some("Test Album")));
+    assert_eq!((m.album_artist.as_deref(), m.track, m.year, m.genre.as_deref()), (Some("Test Album Artist"), Some(3), Some(2024), Some("Rock")));
+    let cover = m.cover.as_ref().expect("PICTURE block");
+    assert_eq!(cover.mime, "image/png");
+    assert_eq!(&cover.data[..], &std::fs::read(fixture("cover.png")).unwrap()[..]);
+}
+
+#[test]
+fn flac_plays_to_the_end() {
+    plays_to_the_end("flac.flac");
+}

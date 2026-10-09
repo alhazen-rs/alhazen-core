@@ -1,6 +1,8 @@
 //! Containers -> packets.
 
 mod ebml;
+#[cfg(feature = "native")]
+mod flac;
 mod matroska;
 mod metadata;
 #[cfg(feature = "native")]
@@ -15,6 +17,8 @@ pub(crate) mod window;
 use std::io::SeekFrom;
 use std::time::Duration;
 
+#[cfg(feature = "native")]
+pub use flac::FlacDemuxer;
 pub use matroska::MatroskaDemuxer;
 pub use metadata::{Metadata, Picture};
 #[cfg(feature = "native")]

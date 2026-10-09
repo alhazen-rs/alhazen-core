@@ -5,7 +5,6 @@ use super::Bytes;
 use crate::demux::metadata::{CoverPick, Field, MAX_PICTURE, Metadata};
 
 /// A Vorbis comment block starting at its vendor length (callers strip `\x03vorbis` / `OpusTags`).
-#[allow(dead_code)] // first used by a reader (Task 4/5)
 pub(crate) fn parse_vorbis_comment(body: &[u8], meta: &mut Metadata, covers: &mut CoverPick) {
     let mut r = Bytes::le(body);
     let Some(vendor) = r.u32() else { return };
@@ -42,7 +41,6 @@ pub(crate) fn parse_vorbis_comment(body: &[u8], meta: &mut Metadata, covers: &mu
 }
 
 /// A FLAC `PICTURE` block body: (front cover, MIME type, image data).
-#[allow(dead_code)] // first used by a reader (Task 4/5)
 pub(crate) fn parse_flac_picture(b: &[u8]) -> Option<(bool, String, &[u8])> {
     let mut r = Bytes::be(b);
     let kind = r.u32()?;
