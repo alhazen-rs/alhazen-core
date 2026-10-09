@@ -430,3 +430,24 @@ fn a_ts_clock_that_wraps_plays_and_seeks() {
     let p = std::iter::from_fn(|| d.next_packet().unwrap()).find(|p| p.stream == 1).unwrap();
     assert_eq!(p.pts, at);
 }
+
+#[test]
+fn a_muxed_default_rendition_plays_the_variants_own_audio() {
+    let (video, audio) = (Server::dir(root()), Server::dir(root()));
+    video.set_body(
+        "muxed.m3u8",
+        format!(
+            "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Main\",DEFAULT=YES\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Commentary\",URI=\"{}\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=300000,AUDIO=\"aud\"\nts/index.m3u8\n",
+            audio.url("multi/audio/index.m3u8")
+        ),
+    );
+    let mut d = demux(&video.url("muxed.m3u8"));
+    let names: Vec<String> = d.control().audio_renditions().into_iter().map(|r| r.name).collect();
+    assert_eq!(names, ["Main", "Commentary"]);
+    let streams = d.streams().to_vec();
+    let (_, a1, an) = span(&streams, &all(&mut d), StreamKind::Audio);
+    assert!(an > 250 && a1 > Duration::from_millis(5800), "the muxed audio plays: {an} frames to {a1:?}");
+    assert_eq!(audio.hits("multi/audio/index.m3u8"), 0, "the commentary is not fetched");
+}

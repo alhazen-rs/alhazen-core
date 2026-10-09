@@ -208,7 +208,8 @@ pub struct HlsDemuxer {
     duration: Option<Duration>,
     selection: Selection,
     /// Playlists of the current variant's audio renditions, and which one plays.
-    rendition_uris: Vec<Url>,
+    /// `None`: that rendition is the audio muxed into the variant's own segments.
+    rendition_uris: Vec<Option<Url>>,
     rendition: Option<usize>,
 }
 
@@ -262,7 +263,7 @@ impl HlsDemuxer {
             }
         };
         let group: Vec<&Rendition> = match variants[chosen].audio_group.as_deref() {
-            Some(g) => renditions.iter().filter(|r| r.group == g && r.uri.is_some()).collect(),
+            Some(g) => renditions.iter().filter(|r| r.group == g).collect(),
             None => Vec::new(),
         };
         let rendition = group.iter().position(|r| r.default).or((!group.is_empty()).then_some(0));
@@ -288,7 +289,7 @@ impl HlsDemuxer {
             events: Mutex::new(None),
             shutdown: AtomicBool::new(false),
         });
-        let rendition_uris = group.iter().filter_map(|r| r.uri.clone()).collect();
+        let rendition_uris = group.iter().map(|r| r.uri.clone()).collect();
         let mut d = HlsDemuxer {
             control,
             main: Lane::new(Role::Main, main, audio.is_none()),
@@ -375,16 +376,23 @@ impl HlsDemuxer {
         if Some(i) == self.rendition || i >= self.rendition_uris.len() {
             return Ok(());
         }
+        self.rendition = Some(i);
+        let Some(uri) = self.rendition_uris[i].clone() else {
+            // The variant's own audio: no separate playlist.
+            self.audio = None;
+            self.main.use_audio = true;
+            return Ok(());
+        };
         let now = self.audio.as_ref().and_then(|a| a.pending.as_ref()).map_or(self.selection.returned, |p| p.pts);
         let start = if self.live { Start::LiveEdge } else { Start::At(now) };
-        let cfg = TrackConfig { playlists: vec![self.rendition_uris[i].clone()], variant: 0, start, cancel: Arc::new(AtomicBool::new(false)) };
+        let cfg = TrackConfig { playlists: vec![uri], variant: 0, start, cancel: Arc::new(AtomicBool::new(false)) };
         let track = Track::start(cfg)?;
         self.timeline.forget(Role::Audio);
         let mut lane = Lane::new(Role::Audio, track, true);
         // Nothing before where the old rendition was.
         lane.skip_before = Some(now);
         self.audio = Some(lane);
-        self.rendition = Some(i);
+        self.main.use_audio = false;
         Ok(())
     }
 
