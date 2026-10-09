@@ -123,6 +123,18 @@ fn format(f: &[u8]) -> Option<(Codec, u16, u32, u16)> {
             Codec::Other(format!("WAV format {code:#06x}{name}"))
         }
     };
+    // For PCM the frame size follows from the layout; a wrong stated block_align would misplace
+    // every packet.
+    let block_align = match &codec {
+        Codec::Pcm(p) => {
+            let frame = channels as u32 * (p.bits as u32).div_ceil(8);
+            if frame != block_align as u32 {
+                log::warn!("wav: block_align {block_align} does not match the format; using {frame}");
+            }
+            u16::try_from(frame).ok()?
+        }
+        _ => block_align,
+    };
     Some((codec, channels, rate, block_align))
 }
 

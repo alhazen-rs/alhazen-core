@@ -650,3 +650,16 @@ fn matroska_attachments_that_are_not_images_are_not_read() {
     assert!(d.metadata().is_none_or(|m| m.cover.is_none()));
     assert!(read.load(Ordering::Relaxed) < 1 << 20, "opening read {} bytes", read.load(Ordering::Relaxed));
 }
+
+#[test]
+fn wav_with_a_wrong_block_align_still_decodes() {
+    let mut bytes = std::fs::read(fixture("wav_s16.wav")).unwrap();
+    let fmt = bytes.windows(4).position(|w| w == b"fmt ").unwrap() + 8;
+    bytes[fmt + 12..fmt + 14].copy_from_slice(&1u16.to_le_bytes()); // should be 4 (stereo s16)
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("bad_block_align.wav");
+    std::fs::write(&path, bytes).unwrap();
+    let mut d = open_path(path.to_str().unwrap());
+    let s = audio(&*d);
+    assert_eq!(s.duration, audio(&*open("wav_s16.wav")).duration);
+    assert_eq!(decode(&mut *d, &s, |_| false).samples, decode_all("wav_s16.wav").1.samples);
+}
