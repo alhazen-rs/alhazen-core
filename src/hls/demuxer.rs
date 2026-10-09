@@ -140,11 +140,15 @@ struct Lane {
     wait_key: bool,
     /// A new audio rendition: drop what comes before where the old one was.
     skip_before: Option<Duration>,
+    /// Live: this lane jumped to the live edge because the other one did.
+    jump_by_peer: bool,
+    /// Live: this lane just jumped on its own; the other lane must follow.
+    jumped: bool,
 }
 
 impl Lane {
     fn new(role: Role, track: Track, use_audio: bool) -> Self {
-        Self { role, track, seg: None, pending: None, formats: HashMap::new(), ts_ref: None, ended: false, epoch: 0, use_audio, wait_key: false, skip_before: None }
+        Self { role, track, seg: None, pending: None, formats: HashMap::new(), ts_ref: None, ended: false, epoch: 0, use_audio, wait_key: false, skip_before: None, jump_by_peer: false, jumped: false }
     }
 }
 
@@ -338,10 +342,30 @@ impl HlsDemuxer {
 
     fn fill_all(&mut self) -> Result<()> {
         Self::fill(&mut self.main, &mut self.timeline, &self.control, Some(&mut self.selection))?;
+        if std::mem::take(&mut self.main.jumped)
+            && let Some(a) = self.audio.as_mut()
+        {
+            Self::follow_jump(a);
+        }
         if let Some(a) = self.audio.as_mut() {
             Self::fill(a, &mut self.timeline, &self.control, None)?;
+            if std::mem::take(&mut a.jumped) {
+                Self::follow_jump(&mut self.main);
+                Self::fill(&mut self.main, &mut self.timeline, &self.control, Some(&mut self.selection))?;
+            }
         }
         Ok(())
+    }
+
+    /// The other playlist jumped to the live edge: this one goes there too, so both stay in sync.
+    fn follow_jump(lane: &mut Lane) {
+        lane.track.jump_to_live_edge();
+        lane.epoch += 1;
+        lane.seg = None;
+        lane.pending = None;
+        lane.ended = false;
+        lane.ts_ref = None;
+        lane.jump_by_peer = true;
     }
 
     /// Applies an audio rendition change the application asked for: a new audio lane from where
@@ -428,6 +452,9 @@ impl HlsDemuxer {
     }
 
     fn open_segment(lane: &mut Lane, timeline: &mut Timeline, s: SegmentData) -> Result<()> {
+        if s.jumped {
+            lane.ts_ref = None;
+        }
         let reference = lane.ts_ref.filter(|&(_, disc)| disc == s.discontinuity_seq).map(|(r, _)| r);
         let mut demux = match SegmentDemuxer::open(s.data, s.init.as_deref().map(Vec::as_slice), reference) {
             Ok(d) => d,
@@ -441,7 +468,16 @@ impl HlsDemuxer {
             lane.formats.insert(info.kind, Arc::new(info.clone()));
         }
         let first = demux.first_raw()?.unwrap_or_default();
-        let offset = timeline.anchor(lane.role, s.discontinuity_seq, s.start, first);
+        let offset = if !s.jumped {
+            timeline.anchor(lane.role, s.discontinuity_seq, s.start, first)
+        } else if std::mem::take(&mut lane.jump_by_peer) {
+            // Following the other playlist: line up with its new offset.
+            timeline.forget(lane.role);
+            timeline.anchor(lane.role, s.discontinuity_seq, s.start, first)
+        } else {
+            lane.jumped = true;
+            timeline.reanchor(lane.role, s.discontinuity_seq, s.start, first)
+        };
         lane.seg = Some(Open { demux, offset, disc: s.discontinuity_seq });
         Ok(())
     }

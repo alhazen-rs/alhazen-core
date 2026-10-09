@@ -347,3 +347,16 @@ fn seeking_back_after_everything_was_downloaded_plays_again() {
     let (_, _, vn) = span(&streams, &all(&mut d), StreamKind::Video);
     assert_eq!(vn, 100, "a stale end-of-playlist from before the seek does not end playback");
 }
+
+#[test]
+fn a_jump_to_the_live_edge_leaves_no_gap_in_playback_time() {
+    let server = Server::dir(root());
+    server.live("ts/live.m3u8", "ts/index.m3u8", root(), 2, Duration::from_millis(300), 4);
+    let mut d = demux(&server.url("ts/live.m3u8"));
+    std::thread::sleep(Duration::from_millis(2000)); // nobody reads: the window moves on
+    let packets = all(&mut d);
+    let video: Vec<Duration> = packets.iter().filter(|(p, _)| p.stream == 1 && p.keyframe).map(|(p, _)| p.pts).collect();
+    let gaps: Vec<Duration> = video.windows(2).map(|w| w[1].saturating_sub(w[0])).collect();
+    assert!(video.len() >= 3, "{video:?}");
+    assert!(gaps.iter().all(|g| *g < Duration::from_millis(1100)), "keyframes 1 s apart, a skipped segment leaves no hole: {video:?}");
+}

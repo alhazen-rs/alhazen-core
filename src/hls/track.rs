@@ -62,6 +62,9 @@ pub(crate) struct SegmentData {
     pub elapsed: Duration,
     /// Number of seeks before this segment was fetched.
     pub epoch: u64,
+    /// Live: the first segment after a jump to the live edge (fell behind the window, or the
+    /// server restarted): its timestamps do not follow the previous segment's.
+    pub jumped: bool,
 }
 
 impl std::fmt::Debug for SegmentData {
@@ -73,6 +76,7 @@ impl std::fmt::Debug for SegmentData {
 enum Command {
     Seek(Duration),
     Switch(usize),
+    LiveEdge,
 }
 
 pub(crate) struct Track {
@@ -98,8 +102,7 @@ impl Track {
             Start::LiveEdge if live => live_edge(&first.1),
             _ => first.1.index_at(start_time(&cfg.start)).map(|i| first.1.segments[i].sequence),
         };
-        let mut urls = cfg.playlists.clone();
-        urls[variant] = first.0;
+        let urls = cfg.playlists.clone();
         let mut playlists = vec![None; urls.len()];
         playlists[variant] = Some(Arc::new(first.1));
         let (event_tx, events) = crossbeam_channel::bounded(AHEAD);
@@ -121,6 +124,7 @@ impl Track {
             last_reload: Instant::now(),
             last_change: Instant::now(),
             unchanged: false,
+            jump_pending: false,
         };
         thread::Builder::new().name("hls-fetch".into()).spawn(move || worker.run())?;
         Ok(Track { events, commands, live, duration, target_duration, cancel: cfg.cancel })
@@ -139,6 +143,12 @@ impl Track {
     /// Restarts fetching at the segment holding `t` (VOD); events after it carry a new epoch.
     pub fn seek(&self, t: Duration) {
         let _ = self.commands.send(Command::Seek(t));
+    }
+
+    /// Live: jumps to the live edge (the other playlist of the presentation jumped there), keeping
+    /// live time continuous; events after it carry a new epoch.
+    pub fn jump_to_live_edge(&self) {
+        let _ = self.commands.send(Command::LiveEdge);
     }
 
     /// Continues with `variant`'s segments from the next segment on.
@@ -218,6 +228,8 @@ struct Worker {
     last_change: Instant,
     /// The last reload brought nothing new (reload sooner).
     unchanged: bool,
+    /// The next segment delivered is the first after a jump to the live edge.
+    jump_pending: bool,
 }
 
 /// What the loop does after handling one step.
@@ -249,8 +261,7 @@ impl Worker {
         if let Some(p) = &self.playlists[variant] {
             return Ok(p.clone());
         }
-        let (url, p) = load(&self.fetch, &self.urls[variant])?;
-        self.urls[variant] = url;
+        let (_, p) = load(&self.fetch, &self.urls[variant])?;
         let p = Arc::new(p);
         self.playlists[variant] = Some(p.clone());
         Ok(p)
@@ -283,6 +294,15 @@ impl Worker {
                 self.variant = v;
             }
             Command::Switch(_) => {}
+            Command::LiveEdge => {
+                self.epoch += 1;
+                if self.live
+                    && let Ok(p) = self.playlist(self.variant)
+                {
+                    self.next = live_edge(&p);
+                    self.jump_pending = true;
+                }
+            }
         }
     }
 
@@ -352,6 +372,16 @@ impl Worker {
         {
             log::warn!("HLS: live playback fell behind the playlist window; jumping to the live edge");
             self.next = live_edge(&p);
+            self.jump_pending = true;
+            return Flow::Continue;
+        }
+        if self.live
+            && let (Some(next), Some(last)) = (self.next, p.segments.last().map(|s| s.sequence))
+            && next > last + 1
+        {
+            log::warn!("HLS: the live playlist's sequence numbers went back; jumping to its live edge");
+            self.next = live_edge(&p);
+            self.jump_pending = true;
             return Flow::Continue;
         }
         if self.live && self.next.is_none() {
@@ -388,13 +418,19 @@ impl Worker {
         self.last_reload = Instant::now();
         let last = p.segments.last().map(|s| s.sequence);
         match load(&self.fetch, &self.urls[self.variant]) {
-            Ok((url, new)) => {
-                let grew = new.segments.last().map(|s| s.sequence) > last || new.ended;
+            Ok((_, new)) => {
+                let new_last = new.segments.last().map(|s| s.sequence);
+                if new_last < last {
+                    // The server restarted: its sequence numbers start over.
+                    log::warn!("HLS: the live playlist's sequence numbers went back; jumping to its live edge");
+                    self.next = live_edge(&new);
+                    self.jump_pending = true;
+                }
+                let grew = new_last != last || new.ended;
                 self.unchanged = !grew;
                 if grew {
                     self.last_change = Instant::now();
                 }
-                self.urls[self.variant] = url;
                 // Other variants' playlists are stale now; reloaded when switched to.
                 for (i, slot) in self.playlists.iter_mut().enumerate() {
                     if i != self.variant {
@@ -436,8 +472,10 @@ impl Worker {
                     bytes,
                     elapsed,
                     epoch: self.epoch,
+                    jumped: self.jump_pending,
                 });
                 if self.send(event) {
+                    self.jump_pending = false;
                     self.next = Some(seg.sequence + 1);
                     self.next_start = start + seg.duration;
                 }
@@ -677,5 +715,60 @@ mod tests {
         track.cancel.store(true, std::sync::atomic::Ordering::Relaxed); // the thread exits
         let events = collect(&track, Duration::from_secs(5));
         assert!(matches!(events.last(), Some(TrackEvent::Failed(..) | TrackEvent::End(_))), "{events:?}");
+    }
+
+    fn media(seq: u64, segments: &[usize], end: bool) -> String {
+        let mut p = format!("#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:{seq}\n");
+        for i in segments {
+            p.push_str(&format!("#EXTINF:1.0,\nseg{i}.ts\n"));
+        }
+        if end {
+            p.push_str("#EXT-X-ENDLIST\n");
+        }
+        p
+    }
+
+    #[test]
+    fn a_live_server_restart_jumps_to_the_new_live_edge() {
+        let server = Server::dir(root());
+        server.set_body("ts/restart.m3u8", media(1000, &[0, 1, 2], false));
+        let track = start(&server, "ts/restart.m3u8", Start::LiveEdge).unwrap();
+        let first: Vec<u64> = (0..3)
+            .filter_map(|_| match track.recv(Duration::from_secs(5)) {
+                Some(TrackEvent::Segment(s)) => Some(s.seq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(first, [1000, 1001, 1002]);
+        // The server restarts: sequence numbers start over.
+        server.set_body("ts/restart.m3u8", media(0, &[3, 4, 5], true));
+        let events = collect(&track, Duration::from_secs(15));
+        let segs = segments(&events);
+        assert_eq!(segs.first().map(|s| (s.seq, s.jumped)), Some((0, true)), "{events:?}");
+        assert_eq!(segs.first().unwrap().start, Duration::from_secs(3), "live time goes on");
+    }
+
+    #[test]
+    fn falling_behind_the_window_flags_the_jump() {
+        let server = Server::dir(root());
+        server.live("ts/live.m3u8", "ts/index.m3u8", root(), 2, Duration::from_millis(300), 4);
+        let track = start(&server, "ts/live.m3u8", Start::LiveEdge).unwrap();
+        std::thread::sleep(Duration::from_millis(2000)); // nobody reads: the window moves on
+        let events = collect(&track, Duration::from_secs(15));
+        let segs = segments(&events);
+        let jump = segs.iter().position(|s| s.jumped).expect("a jump to the live edge");
+        assert!(segs[jump].seq > segs[jump - 1].seq + 1, "{events:?}");
+        assert_eq!(segs[jump].start, segs[jump - 1].start + segs[jump - 1].duration, "no gap in live time");
+    }
+
+    #[test]
+    fn live_reloads_go_to_the_original_url_not_the_redirect() {
+        let server = Server::dir(root());
+        server.live("ts/live.m3u8", "ts/index.m3u8", root(), 3, Duration::from_secs(1), 3);
+        server.redirect("ts/stable.m3u8", "ts/live.m3u8");
+        let track = start(&server, "ts/stable.m3u8", Start::LiveEdge).unwrap();
+        let events = collect(&track, Duration::from_secs(20));
+        assert_eq!(segments(&events).len(), 6);
+        assert!(server.hits("ts/stable.m3u8") >= 3, "reloads: {}", server.hits("ts/stable.m3u8"));
     }
 }

@@ -20,6 +20,8 @@ struct State {
     hits: HashMap<String, usize>,
     /// path → replacement body (playlists rewritten by a test).
     bodies: HashMap<String, Vec<u8>>,
+    /// path → path it redirects to (302).
+    redirects: HashMap<String, String>,
     live: Option<Live>,
 }
 
@@ -82,6 +84,11 @@ impl Server {
         self.state.lock().unwrap().bodies.insert(path.into(), body.into());
     }
 
+    /// Requests for `from` are redirected (302) to `to`.
+    pub fn redirect(&self, from: &str, to: &str) {
+        self.state.lock().unwrap().redirects.insert(from.into(), to.into());
+    }
+
     pub fn hits(&self, path: &str) -> usize {
         self.state.lock().unwrap().hits.get(path).copied().unwrap_or(0)
     }
@@ -129,6 +136,12 @@ fn respond(req: tiny_http::Request, root: &std::path::Path, state: &Mutex<State>
     let (body, failure, stall, throttle) = {
         let mut s = state.lock().unwrap();
         *s.hits.entry(path.clone()).or_default() += 1;
+        if let Some(to) = s.redirects.get(&path) {
+            let location = tiny_http::Header::from_bytes("Location", format!("/{to}")).unwrap();
+            drop(s);
+            let _ = req.respond(tiny_http::Response::empty(302).with_header(location));
+            return;
+        }
         let failure = match s.failures.get_mut(&path) {
             Some((status, left)) if *left > 0 => {
                 if *left != usize::MAX {

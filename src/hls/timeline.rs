@@ -52,6 +52,15 @@ impl Timeline {
         offset
     }
 
+    /// Like `anchor`, but always from this segment's own timing (never the other playlist's):
+    /// after a jump to the live edge, the old offsets would put a hole in playback time.
+    pub fn reanchor(&mut self, role: Role, disc: u64, start: Duration, first_raw: Duration) -> i128 {
+        self.forget(role);
+        let own = start.as_nanos() as i128 - first_raw.as_nanos() as i128;
+        self.offsets.insert((role, disc), own);
+        own
+    }
+
     /// Drops `role`'s offsets (another rendition takes its place).
     pub fn forget(&mut self, role: Role) {
         self.offsets.retain(|(r, _), _| *r != role);
