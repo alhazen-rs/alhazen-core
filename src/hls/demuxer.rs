@@ -457,7 +457,13 @@ impl HlsDemuxer {
         if s.jumped {
             lane.ts_ref = None;
         }
-        let reference = lane.ts_ref.filter(|&(_, disc)| disc == s.discontinuity_seq).map(|(r, _)| r);
+        // TS timestamps wrap every 26.5 hours: unwrap near the previous segment's, or (after a
+        // seek) near where the timeline expects this segment to start.
+        let reference = lane.ts_ref.filter(|&(_, disc)| disc == s.discontinuity_seq).map(|(r, _)| r).or_else(|| {
+            let offset = timeline.offset(lane.role, s.discontinuity_seq)?;
+            let raw = s.start.as_nanos() as i128 - offset;
+            (raw >= 0).then(|| (raw * 90_000 / 1_000_000_000) as u64)
+        });
         let mut demux = match SegmentDemuxer::open(s.data, s.init.as_deref().map(Vec::as_slice), reference) {
             Ok(d) => d,
             Err(e) if lane.track.is_live() => {

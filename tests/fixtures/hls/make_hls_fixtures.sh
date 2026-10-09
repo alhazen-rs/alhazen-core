@@ -88,3 +88,9 @@ ffmpeg -v error -y -f lavfi -t 3 -i "$(v 160x90)" -f lavfi -t 3 -i "sine=frequen
   printf '#EXT-X-ENDLIST\n'
 } > disc/index.m3u8
 rm disc/b.m3u8
+
+# MPEG-TS whose 33-bit clock wraps mid-stream (2^33 / 90 kHz = 95443.7 s): starts at 95441 s.
+rm -rf wrap && mkdir wrap
+ffmpeg -v error -y -f lavfi -t 6 -i "$(v 320x180)" -f lavfi -t 6 -i "$(a)" \
+  -c:v libx264 -g 25 -pix_fmt yuv420p -x264-params log-level=error:scenecut=0 -c:a aac -b:a 64k -ac 1 \
+  -output_ts_offset 95441 -f hls -hls_time 1 -hls_playlist_type vod -hls_segment_filename 'wrap/seg%d.ts' wrap/index.m3u8

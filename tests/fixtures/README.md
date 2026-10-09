@@ -213,3 +213,4 @@ packed audio is assembled by the script itself, as ffmpeg's HLS muxer writes TS 
 - `hls/aes/`: AES-128 (`aes/key.bin`, fixed IV), 3 s.
 - `hls/disc/`: three segments of `ts/`, `#EXT-X-DISCONTINUITY`, then a 160×90 encode whose clock
   starts over.
+- `hls/wrap/`: TS VOD whose 33-bit clock starts at 95441 s and wraps 2.7 s in.

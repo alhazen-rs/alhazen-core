@@ -413,3 +413,20 @@ fn the_player_seeks_in_a_vod_stream_and_plays_on() {
     assert_eq!(player.state(), PlayerState::Ended, "{:?}", player.debug_snapshot());
     assert!(after.iter().any(|p| *p >= Duration::from_secs(5)), "played on after the seek: {after:?}");
 }
+
+#[test]
+fn a_ts_clock_that_wraps_plays_and_seeks() {
+    let server = Server::dir(root());
+    let mut d = demux(&server.url("wrap/index.m3u8"));
+    let streams = d.streams().to_vec();
+    let (v0, v1, vn) = span(&streams, &all(&mut d), StreamKind::Video);
+    assert!(v0 < Duration::from_millis(100) && v1 > Duration::from_millis(5800), "{v0:?}..{v1:?}");
+    assert_eq!(vn, 150);
+    // Seek past the wrap (at 2.7 s) from the start: the TS demuxer starts over without the
+    // previous segment's clock.
+    let mut d = demux(&server.url("wrap/index.m3u8"));
+    let at = d.seek(Duration::from_millis(4500)).unwrap();
+    assert!(at.abs_diff(Duration::from_secs(4)) < Duration::from_millis(50), "{at:?}");
+    let p = std::iter::from_fn(|| d.next_packet().unwrap()).find(|p| p.stream == 1).unwrap();
+    assert_eq!(p.pts, at);
+}

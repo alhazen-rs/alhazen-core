@@ -61,6 +61,11 @@ impl Timeline {
         own
     }
 
+    /// The offset already fixed for `role` in discontinuity sequence `disc`, if any.
+    pub fn offset(&self, role: Role, disc: u64) -> Option<i128> {
+        self.offsets.get(&(role, disc)).copied()
+    }
+
     /// Drops `role`'s offsets (another rendition takes its place).
     pub fn forget(&mut self, role: Role) {
         self.offsets.retain(|(r, _), _| *r != role);
