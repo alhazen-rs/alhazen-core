@@ -188,9 +188,15 @@ fn demux_loop(
         if eof {
             continue;
         }
+        crate::player::Diag::set(&shared.diag.demux, 1, Duration::ZERO);
         match demuxer.next_packet() {
             Ok(Some(mut p)) => {
                 p.generation = generation;
+                let audio = shared.audio_out.is_some() && routes.last().is_some_and(|r| r.stream == p.stream) && routes.len() > 1;
+                crate::player::Diag::set(&shared.diag.demux, if audio { 2 } else { 3 }, p.pts);
+                for (r, slot) in routes.iter().zip([&shared.diag.video_queued, &shared.diag.audio_queued]) {
+                    slot.store(r.tx.as_ref().map_or(0, |t| t.len() as u64), Ordering::Relaxed);
+                }
                 if let Some(route) = routes.iter_mut().find(|r| r.stream == p.stream)
                     && !send_to(shared, route, &commands, Msg::Packet(p))
                 {
@@ -198,6 +204,7 @@ fn demux_loop(
                 }
             }
             Ok(None) => {
+                crate::player::Diag::set(&shared.diag.demux, 4, Duration::ZERO);
                 eof = true;
                 if !broadcast(shared, &mut routes, &commands, |_| Msg::Eof { generation }) {
                     return;
@@ -305,6 +312,7 @@ impl DecodeLoop {
             if shared.shutdown.load(Ordering::SeqCst) {
                 return;
             }
+            crate::player::Diag::set(&shared.diag.video, 1, self.last_shown.unwrap_or_default());
             let msg = match rx.recv_timeout(POLL) {
                 Ok(m) => m,
                 Err(RecvTimeoutError::Timeout) => continue,
@@ -338,6 +346,7 @@ impl DecodeLoop {
     }
 
     fn on_packet(&mut self, shared: &Shared, p: Packet) -> bool {
+        crate::player::Diag::set(&shared.diag.video, 2, p.pts);
         if self.is_stale(shared, p.generation) || (self.waiting_for_keyframe && !p.keyframe) {
             return true;
         }
@@ -463,6 +472,7 @@ impl DecodeLoop {
     }
 
     fn on_eof(&mut self, shared: &Shared) -> bool {
+        crate::player::Diag::set(&shared.diag.video, 4, self.last_shown.unwrap_or_default());
         self.decoder.send_eof();
         if !self.drain(shared) {
             return false;
@@ -533,6 +543,7 @@ impl DecodeLoop {
             }
         }
         let pts = frame.pts();
+        crate::player::Diag::set(&shared.diag.video, 3, pts);
         if !shared.queue.push(self.generation, frame) {
             return !shared.shutdown.load(Ordering::SeqCst);
         }
