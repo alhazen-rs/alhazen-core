@@ -3,6 +3,8 @@
 #[cfg(feature = "native-aac")]
 mod aac;
 mod audio;
+#[cfg(feature = "native-mp3")]
+mod mp3;
 #[cfg(feature = "native")]
 mod channels;
 #[cfg(feature = "native")]
@@ -26,15 +28,20 @@ mod vp8;
 #[cfg(feature = "native")]
 mod vp9;
 
-#[cfg(any(feature = "native-aac", feature = "ffmpeg-cli", all(windows, feature = "media-foundation")))]
+#[cfg(any(feature = "native", feature = "native-aac", feature = "native-mp3", feature = "ffmpeg-cli", all(windows, feature = "media-foundation")))]
 mod delay;
-#[cfg(any(feature = "native-aac", feature = "ffmpeg-cli", all(windows, feature = "media-foundation")))]
+#[cfg(any(feature = "native-aac", feature = "native-mp3", feature = "ffmpeg-cli", all(windows, feature = "media-foundation")))]
 pub(crate) use delay::DelayTrim;
+#[cfg(feature = "native")]
+#[allow(unused_imports)] // used by the Opus and Vorbis decoders from Task 9
+pub(crate) use delay::clip_end;
 
 use std::time::Duration;
 
 #[cfg(feature = "native-aac")]
 pub use aac::AacAudioDecoder;
+#[cfg(feature = "native-mp3")]
+pub use mp3::Mp3AudioDecoder;
 pub use audio::{AudioBuffer, AudioDecoder};
 #[cfg(feature = "native")]
 pub use av1::Av1Decoder;

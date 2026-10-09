@@ -122,6 +122,7 @@ impl Default for PlayerConfig {
 fn codec_hint(codec: &demux::Codec) -> &'static str {
     match codec {
         demux::Codec::Aac => " (install ffmpeg, or enable alhazen-core's default `native-aac` feature)",
+        demux::Codec::Mp3 => " (install ffmpeg, or enable alhazen-core's default `native-mp3` feature)",
         demux::Codec::H264 | demux::Codec::Hevc => " (install ffmpeg)",
         _ => "",
     }

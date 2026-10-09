@@ -103,7 +103,7 @@ fn snr_db(ours: &[f32], reference: &[f32]) -> f64 {
 }
 
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // `Db` is used from Task 6
+#[cfg_attr(not(any(feature = "native-mp3", feature = "native-aac")), allow(dead_code))] // until the Ogg tests (Task 9)
 enum Exact {
     Bits,
     Db(f64),
@@ -286,4 +286,18 @@ fn flac_tags_and_cover() {
 #[test]
 fn flac_plays_to_the_end() {
     plays_to_the_end("flac.flac");
+}
+
+// ---- MP3 decoder ----
+
+/// MP3 inside MP4 (edit list = encoder delay): offset 0 against ffmpeg. MP4 end trimming is not
+/// read, so only the overlap is compared.
+#[cfg(feature = "native-mp3")]
+#[test]
+fn mp3_in_mp4_decodes_like_ffmpeg() {
+    let (_, ours) = decode_all("mp3.mp4");
+    assert_eq!(ours.first_pts, Duration::ZERO);
+    let Some(reference) = ffmpeg("mp3.mp4") else { return };
+    assert!(ours.samples.len() >= reference.len(), "{} vs {}", ours.samples.len(), reference.len());
+    assert_close("mp3.mp4", "decode", &ours.samples[..reference.len()], &reference, Exact::Db(100.0));
 }

@@ -21,7 +21,7 @@ impl AacAudioDecoder {
     pub fn new(stream: &StreamInfo) -> Result<Self> {
         let asc = stream.extradata.clone().ok_or_else(|| Error::Decode("aac: missing AudioSpecificConfig".into()))?;
         let inner = decoder(&asc)?;
-        Ok(Self { asc, inner, trim: DelayTrim::new(stream.codec_delay), out: VecDeque::new() })
+        Ok(Self { asc, inner, trim: DelayTrim::new(stream.codec_delay).with_end(stream.end_trim), out: VecDeque::new() })
     }
 }
 

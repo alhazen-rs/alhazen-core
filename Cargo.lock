@@ -30,6 +30,7 @@ dependencies = [
  "rtrb",
  "rubato",
  "rusty_aac",
+ "rusty_mp3",
  "thiserror 2.0.21",
  "tiny_http",
  "ureq",
@@ -1978,6 +1979,12 @@ name = "rusty_aac"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be358888c3ae0cc16d17f50c76b76d8ce903845a97413559cecf38db1ca9c62d"
+
+[[package]]
+name = "rusty_mp3"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bc136ac5835a05cd84a7cb8ec91d2ad8e87f7c9120c5c322fb1a7089ccd54d4"
 
 [[package]]
 name = "same-file"
