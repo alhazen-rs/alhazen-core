@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use alhazen_core::audio::AudioOutputConfig;
+use alhazen_core::audio::{AudioOutputConfig, NullOutput};
 use alhazen_core::backend::{Backend, NativeBackend, Registry};
 use alhazen_core::clock::MockClock;
 use alhazen_core::decode::{Av1Decoder, DecodedFrame, VideoDecoder};
@@ -13,8 +13,8 @@ use alhazen_core::demux::{Codec, ContainerFormat, Demuxer, Packet, StreamInfo};
 use alhazen_core::source::MediaSource;
 use alhazen_core::{Player, PlayerConfig, PlayerEvent, PlayerState, Result, Source};
 
-/// AV1 through rav1d, made `delay` slower per frame, plus a one-off `stall` before the second
-/// frame (playback has started by then).
+/// AV1 through rav1d, made `delay` slower per frame, plus a one-off `stall` at frame
+/// `STALL_FRAME`, 1.5 s in: well into playback, past anything decoded ahead before it starts.
 struct Slowed {
     inner: Av1Decoder,
     delay: Duration,
@@ -30,7 +30,7 @@ impl VideoDecoder for Slowed {
         let f = self.inner.receive_frame()?;
         if f.is_some() {
             self.frames += 1;
-            let stall = if self.frames == 2 { self.stall.take().unwrap_or_default() } else { Duration::ZERO };
+            let stall = if self.frames == STALL_FRAME { self.stall.take().unwrap_or_default() } else { Duration::ZERO };
             std::thread::sleep(self.delay + stall);
         }
         Ok(f)
@@ -39,6 +39,8 @@ impl VideoDecoder for Slowed {
         self.inner.flush()
     }
 }
+
+const STALL_FRAME: u32 = 45;
 
 /// A video-only AV1 backend; counts how many decoders it opened.
 struct Av1Backend {
@@ -146,13 +148,40 @@ fn auto_fallback_off_keeps_the_slow_decoder() {
 }
 
 /// A decoder fast enough on average (25 ms per 33 ms frame) that fell behind once (an 800 ms
-/// stall after playback started) is replaced. (Which rule fires here depends on timing; the
-/// lateness rule alone is pinned by `pipeline::tests::frames_staying_behind_the_clock_…`.)
+/// stall 1.5 s into playback) while the sound plays on: catching up only 8 ms per frame, the
+/// picture stays more than 100 ms behind the audio clock for over 1.5 s, so the decoder is
+/// replaced. (With an audio clock the video can't make the clock wait, as it does in video-only
+/// playback, where such a stall costs a few dropped frames and needs no switch.)
 #[test]
-fn decoder_that_fell_behind_is_replaced() {
-    let (player, clock, slow, fast) = open_with(true, Some(Duration::from_millis(800)));
+fn decoder_that_fell_behind_the_sound_is_replaced() {
+    let (slow, fast) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let null = NullOutput::new(48_000, 2);
+    let config = PlayerConfig {
+        decoder_threads: 1,
+        registry: Some(registry(&slow, &fast, Some(Duration::from_millis(800)))),
+        audio_output: AudioOutputConfig::Null(null.clone()),
+        auto_fallback: true,
+        ..Default::default()
+    };
+    let src = Source::parse(&format!("{}/tests/fixtures/av1_8s_with_audio.webm", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let player = Player::open(src, config).unwrap();
     let events = player.events();
-    play_until_end(&player, &clock, |_| {});
+    player.play();
+    let start = Instant::now();
+    while player.state() != PlayerState::Ended {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "never ended: {:?} at {:?}, slow {} fast {}, {:?}",
+            player.state(),
+            player.position(),
+            slow.load(Ordering::SeqCst),
+            fast.load(Ordering::SeqCst),
+            player.stats()
+        );
+        player.current_frame(); // a UI drawing at 100 Hz
+        null.pull(48_000 / 100); // the sound plays in real time: 10 ms every 10 ms
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!((slow.load(Ordering::SeqCst), fast.load(Ordering::SeqCst)), (1, 1));
     assert!(events.try_iter().any(|e| matches!(e, PlayerEvent::Warning(w) if w.contains("switching to fast"))));
 }

@@ -189,3 +189,12 @@ ffmpeg -v error -y -i sync.mp4 -map 0:a -map 0:v -c copy audio_first.mp4
 - `vorbis.ogg`, `opus.opus` (both tagged), `opus_51.opus`, `flac.oga` (FLAC in Ogg).
 - `m4a_tagged.m4a` (iTunes `ilst` tags and `covr`), `mka_tagged.mka` (Matroska tags and a `cover.png` attachment).
 - `cover.png`: 16×16 red; the cover in every tagged fixture.
+
+## Decoder fallback
+
+```bash
+ffmpeg -v error -y -f lavfi -i "testsrc2=s=128x72:r=30:d=8" -f lavfi -i "sine=f=440:r=48000:d=8" -c:v libaom-av1 -cpu-used 8 -crf 50 -g 30 -c:a libopus -b:a 24k -shortest av1_8s_with_audio.webm
+```
+
+- `av1_8s_with_audio.webm`: long enough for a decoder that stalls once to stay behind the sound
+  for longer than the fallback rule's 1.5 s (`tests/fallback.rs`).
