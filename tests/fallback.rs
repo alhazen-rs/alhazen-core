@@ -169,6 +169,7 @@ fn decoder_that_fell_behind_the_sound_is_replaced() {
     player.play();
     let start = Instant::now();
     let mut loops = 0u64;
+    let mut pulled = 0usize;
     while player.state() != PlayerState::Ended {
         loops += 1;
         assert!(
@@ -181,8 +182,12 @@ fn decoder_that_fell_behind_the_sound_is_replaced() {
             player.stats(),
             player.debug_snapshot()
         );
-        player.current_frame(); // a UI drawing at 100 Hz
-        null.pull(48_000 / 100); // the sound plays in real time: 10 ms every 10 ms
+        player.current_frame(); // a UI drawing at up to 100 Hz
+        // A sound card consumes audio in real time however late this loop runs (slow CI
+        // machines take far longer than 10 ms per iteration).
+        let due = (start.elapsed().as_secs_f64() * 48_000.0) as usize;
+        null.pull(due - pulled);
+        pulled = due;
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!((slow.load(Ordering::SeqCst), fast.load(Ordering::SeqCst)), (1, 1));
