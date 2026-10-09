@@ -195,7 +195,8 @@ impl Backend for NativeBackend {
         Ok(match format {
             ContainerFormat::Matroska => Box::new(crate::demux::MatroskaDemuxer::open(src)?),
             ContainerFormat::Mp4 => Box::new(crate::demux::Mp4Demuxer::open(src)?),
-            ContainerFormat::Mp3 | ContainerFormat::Adts | ContainerFormat::Flac | ContainerFormat::Wav | ContainerFormat::Ogg => {
+            ContainerFormat::Wav => Box::new(crate::demux::WavDemuxer::open(src)?),
+            ContainerFormat::Mp3 | ContainerFormat::Adts | ContainerFormat::Flac | ContainerFormat::Ogg => {
                 return Err(Error::UnsupportedContainer);
             }
         })

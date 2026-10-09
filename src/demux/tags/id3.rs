@@ -29,7 +29,6 @@ use crate::demux::metadata::{CoverPick, Field, Metadata};
 /// tag (`tag` starts with its 10-byte header). Malformed frames end the walk; fields read so far
 /// stay.
 #[cfg(feature = "native")]
-#[allow(dead_code)] // first used by the WAV reader (Task 4)
 pub(crate) fn parse_id3v2(tag: &[u8], meta: &mut Metadata) {
     let Some(len) = id3v2_len(tag) else { return };
     let (version, flags) = (tag[3], tag[5]);

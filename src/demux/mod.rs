@@ -8,6 +8,8 @@ mod mp4;
 pub(crate) mod mpeg_audio;
 pub(crate) mod tags;
 #[cfg(feature = "native")]
+mod wav;
+#[cfg(feature = "native")]
 pub(crate) mod window;
 
 use std::io::SeekFrom;
@@ -19,6 +21,8 @@ pub use metadata::{Metadata, Picture};
 pub(crate) use matroska::split_xiph_lacing;
 #[cfg(feature = "native")]
 pub use mp4::Mp4Demuxer;
+#[cfg(feature = "native")]
+pub use wav::WavDemuxer;
 
 use crate::Result;
 use crate::source::MediaSource;

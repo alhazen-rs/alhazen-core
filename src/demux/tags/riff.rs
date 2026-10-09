@@ -3,7 +3,6 @@
 use crate::demux::metadata::{Field, Metadata};
 
 /// The sub-chunks of a RIFF `LIST` chunk of type `INFO` (`body` follows the `INFO` fourcc).
-#[allow(dead_code)] // first used by a reader (Task 4/5)
 pub(crate) fn parse_riff_info(body: &[u8], meta: &mut Metadata) {
     let mut pos = 0usize;
     while let Some(head) = body.get(pos..pos + 8) {

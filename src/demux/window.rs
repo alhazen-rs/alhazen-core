@@ -7,7 +7,6 @@ use crate::source::MediaSource;
 
 const READ_AHEAD: usize = 64 * 1024;
 
-#[allow(dead_code)] // used from Task 4
 pub(crate) struct ReadWindow {
     src: Box<dyn MediaSource>,
     buf: Vec<u8>,
@@ -15,7 +14,6 @@ pub(crate) struct ReadWindow {
     start: u64,
 }
 
-#[allow(dead_code)] // used from Task 4
 impl ReadWindow {
     pub fn new(src: Box<dyn MediaSource>) -> Self {
         Self { src, buf: Vec::new(), start: 0 }
@@ -25,6 +23,7 @@ impl ReadWindow {
         self.src.byte_len()
     }
 
+    #[allow(dead_code)] // used from Task 7
     pub fn is_local(&self) -> bool {
         self.src.is_local()
     }

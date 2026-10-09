@@ -207,6 +207,12 @@ impl AudioLoop {
         let generation = self.generation;
         let out = self.out.clone();
         let written = push_frames(&mut self.producer, &self.out, samples, || {
+            // The ring is full: for audio-only media that is ready to play. Without this, a buffer
+            // larger than the ring (8 kHz audio resampled to 48 kHz) waits for a playback start
+            // that waits for it.
+            if !shared.has_video {
+                shared.frame_ready(generation);
+            }
             !shared.shutdown.load(Ordering::SeqCst)
                 && !out.failed.load(Ordering::Relaxed)
                 && shared.generation.load(Ordering::SeqCst) == generation
