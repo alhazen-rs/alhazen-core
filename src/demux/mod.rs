@@ -267,16 +267,8 @@ fn probe_content(src: &mut dyn MediaSource) -> Result<Option<ContainerFormat>> {
     if head.len() >= 8 && matches!(&head[4..8], b"ftyp" | b"moov" | b"styp" | b"wide" | b"mdat" | b"free") {
         return Ok(Some(ContainerFormat::Mp4));
     }
-    if head.starts_with(b"fLaC") {
-        return Ok(Some(ContainerFormat::Flac));
-    }
-    if head.len() >= 12 && head.starts_with(b"RIFF") && &head[8..12] == b"WAVE" {
-        return Ok(Some(ContainerFormat::Wav));
-    }
-    if head.starts_with(b"OggS") {
-        return Ok(Some(ContainerFormat::Ogg));
-    }
-    // MPEG audio or ADTS, after any ID3v2 tags (skipped by their declared size).
+    // Audio files, possibly after ID3v2 tags (skipped by their declared size; some tools prefix
+    // even FLAC and WAV files with one).
     let mut start = 0u64;
     for _ in 0..4 {
         match tags::id3::id3v2_len(&read_at(src, start, 10)?) {
@@ -284,6 +276,17 @@ fn probe_content(src: &mut dyn MediaSource) -> Result<Option<ContainerFormat>> {
             None => break,
         }
     }
+    let head = if start == 0 { head } else { read_at(src, start, 12)? };
+    if head.starts_with(b"fLaC") {
+        return Ok(Some(ContainerFormat::Flac));
+    }
+    if head.len() >= 12 && head.starts_with(b"RIFF") && &head[8..12] == b"WAVE" {
+        return Ok(Some(ContainerFormat::Wav));
+    }
+    if head.starts_with(b"OggS") && start == 0 {
+        return Ok(Some(ContainerFormat::Ogg));
+    }
+    // MPEG audio or ADTS.
     let window = read_at(src, start, PROBE_WINDOW)?;
     let mp3 = mpeg_audio::find_chain::<mpeg_audio::MpegHeader>(&window, 3, None).map(|(i, _)| i);
     let adts = mpeg_audio::find_chain::<mpeg_audio::AdtsHeader>(&window, 3, None).map(|(i, _)| i);

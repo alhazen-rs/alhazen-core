@@ -187,6 +187,32 @@ pub(crate) struct Shared {
     pub video_backend: Mutex<Option<&'static str>>,
     /// `max_output_size` packed as `w << 32 | h`; 0 = no limit.
     pub max_output_size: AtomicU64,
+    /// What each pipeline thread is doing, for `Player::debug_snapshot`.
+    pub diag: Diag,
+}
+
+/// What each pipeline thread is doing and at which timestamp (diagnosing stalls). Each slot
+/// packs `step << 48 | milliseconds`.
+#[derive(Default)]
+pub(crate) struct Diag {
+    pub demux: AtomicU64,
+    pub audio: AtomicU64,
+    pub video: AtomicU64,
+    /// Packets waiting in the audio and video channels, as last seen by the demux thread.
+    pub audio_queued: AtomicU64,
+    pub video_queued: AtomicU64,
+}
+
+impl Diag {
+    pub fn set(slot: &AtomicU64, step: u64, at: Duration) {
+        slot.store(step << 48 | (at.as_millis() as u64 & 0xFFFF_FFFF_FFFF), Ordering::Relaxed);
+    }
+
+    fn show(slot: &AtomicU64, steps: &[&str]) -> String {
+        let v = slot.load(Ordering::Relaxed);
+        let step = steps.get((v >> 48) as usize).copied().unwrap_or("?");
+        format!("{step} @{} ms", v & 0xFFFF_FFFF_FFFF)
+    }
 }
 
 /// `PlayerConfig::max_output_size` in its atomic form.
@@ -439,6 +465,7 @@ impl Player {
             seekable,
             video_backend: Mutex::new(video_decoder.as_ref().map(|(name, _)| *name)),
             max_output_size: AtomicU64::new(pack_size(config.max_output_size)),
+            diag: Diag::default(),
         });
         let pool = config.thread_pool.clone().unwrap_or_else(shared_thread_pool);
         let mut audio_guard = None;
@@ -543,6 +570,47 @@ impl Player {
     /// `seek` is then ignored with a `Warning` event.
     pub fn is_seekable(&self) -> bool {
         self.seekable
+    }
+
+    /// Internal state for diagnosing stalls (tests, `ALHAZEN_DEBUG`); the format may change.
+    #[doc(hidden)]
+    pub fn debug_snapshot(&self) -> String {
+        let s = &self.shared;
+        let audio = s.audio_out.as_ref().map(|o| {
+            format!(
+                "played {} renders {} ring {} paused {} discard_until {} exhausted {} failed {}",
+                o.frames_played.load(Ordering::SeqCst),
+                o.renders.load(Ordering::Relaxed),
+                o.ring_frames.load(Ordering::Relaxed),
+                o.paused.load(Ordering::SeqCst),
+                o.discard_until.load(Ordering::SeqCst),
+                o.exhausted.load(Ordering::SeqCst),
+                o.failed.load(Ordering::SeqCst)
+            )
+        });
+        let d = &s.diag;
+        let threads = format!(
+            "demux [{}; queued audio {} video {}] audio thread [{}] video thread [{}]",
+            Diag::show(&d.demux, &["start", "reading", "sending audio", "sending video", "at end"]),
+            d.audio_queued.load(Ordering::Relaxed),
+            d.video_queued.load(Ordering::Relaxed),
+            Diag::show(&d.audio, &["start", "waiting for packets", "decoding", "pushing", "draining at end"]),
+            Diag::show(&d.video, &["start", "waiting for packets", "decoding", "queueing", "draining at end"]),
+        );
+        format!(
+            "state {:?} clock {:?} generation {} ready {} wants_play {} queue {} (next pts {:?}) video_done {} audio_done {} audio_active {} audio [{}] {threads}",
+            s.state(),
+            s.clock.now(),
+            s.generation.load(Ordering::SeqCst),
+            s.ready_generation.load(Ordering::SeqCst),
+            s.wants_play.load(Ordering::SeqCst),
+            s.queue.len(),
+            s.queue.peek_pts(),
+            s.video_done.load(Ordering::SeqCst),
+            s.audio_done.load(Ordering::SeqCst),
+            s.audio_active.load(Ordering::SeqCst),
+            audio.unwrap_or_default()
+        )
     }
 
     /// Tags and cover art (title, artist, album, …), when the file has any.

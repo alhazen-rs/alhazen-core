@@ -16,6 +16,8 @@ use crate::{Error, Result};
 
 /// Bytes searched per step for a capture pattern (`OggS`).
 const SEARCH: usize = 64 * 1024;
+/// How far back from the end the last page of the stream is searched for.
+const MAX_TAIL_SCAN: u64 = 1 << 20;
 /// Header packets (comments with cover art) larger than this are refused.
 const MAX_HEADER_PACKET: usize = MAX_PICTURE * 2;
 const CONTINUED: u8 = 1;
@@ -138,7 +140,10 @@ fn last_granule(w: &mut ReadWindow, serial: u32, end: u64) -> Result<Option<u64>
         let mut i = 0;
         while i + 4 <= chunk.len() {
             let Some(off) = chunk[i..].windows(4).position(|x| x == b"OggS") else { break };
-            if let Some(p) = read_page(w, from + (i + off) as u64)?
+            // Pages of other streams are told apart from the bytes in hand, without reading them.
+            let other = chunk.get(i + off + 14..i + off + 18).is_some_and(|s| s != serial.to_le_bytes());
+            if !other
+                && let Some(p) = read_page(w, from + (i + off) as u64)?
                 && p.serial == serial
                 && p.granule >= 0
             {
@@ -146,7 +151,9 @@ fn last_granule(w: &mut ReadWindow, serial: u32, end: u64) -> Result<Option<u64>
             }
             i += off + 1;
         }
-        if found.is_some() || from == 0 {
+        // Over a network, give up after 1 MiB: a tail of another stream (chained Ogg) would
+        // otherwise be read all the way back, a request per step. The duration is then unknown.
+        if found.is_some() || from == 0 || (!w.is_local() && end - from >= MAX_TAIL_SCAN) {
             return Ok(found);
         }
         from = from.saturating_sub(SEARCH as u64 - 64);

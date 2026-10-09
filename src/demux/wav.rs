@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use super::mpeg_audio::read_id3v2_tags;
 use super::window::ReadWindow;
 use super::{Codec, Demuxer, Metadata, Packet, PcmFormat, StreamInfo, StreamKind, tags};
 use crate::source::MediaSource;
@@ -28,14 +29,18 @@ pub struct WavDemuxer {
 impl WavDemuxer {
     pub fn open(src: Box<dyn MediaSource>) -> Result<Self> {
         let mut w = ReadWindow::new(src);
-        let head = w.at(0, 12)?;
+        let mut meta = Metadata::default();
+        // Some tools put an ID3v2 tag in front of WAV files: it only fills what the file's own
+        // tags leave empty.
+        let mut id3 = Metadata::default();
+        let start = read_id3v2_tags(&mut w, &mut id3)?;
+        let head = w.at(start, 12)?;
         if head.len() < 12 || &head[..4] != b"RIFF" || &head[8..12] != b"WAVE" {
             return Err(Error::UnsupportedContainer);
         }
         let file_end = w.len().unwrap_or(u64::MAX);
-        let mut meta = Metadata::default();
         let (mut fmt, mut data) = (None::<Vec<u8>>, None::<(u64, u64)>);
-        let mut pos = 12u64;
+        let mut pos = start + 12;
         while pos.saturating_add(8) <= file_end {
             let chunk = w.at(pos, 8)?.to_vec();
             if chunk.len() < 8 {
@@ -67,6 +72,7 @@ impl WavDemuxer {
             }
             pos = body.saturating_add(size + (size & 1));
         }
+        meta.fill_from(id3);
         let fmt = fmt.ok_or_else(|| Error::Demux("wav: no fmt chunk".into()))?;
         let (data_start, data_end) = data.ok_or_else(|| Error::Demux("wav: no data chunk".into()))?;
         let (codec, channels, rate, block_align) = format(&fmt).ok_or_else(|| Error::Demux("wav: malformed fmt chunk".into()))?;
@@ -122,6 +128,18 @@ fn format(f: &[u8]) -> Option<(Codec, u16, u32, u16)> {
             };
             Codec::Other(format!("WAV format {code:#06x}{name}"))
         }
+    };
+    // For PCM the frame size follows from the layout; a wrong stated block_align would misplace
+    // every packet.
+    let block_align = match &codec {
+        Codec::Pcm(p) => {
+            let frame = channels as u32 * (p.bits as u32).div_ceil(8);
+            if frame != block_align as u32 {
+                log::warn!("wav: block_align {block_align} does not match the format; using {frame}");
+            }
+            u16::try_from(frame).ok()?
+        }
+        _ => block_align,
     };
     Some((codec, channels, rate, block_align))
 }

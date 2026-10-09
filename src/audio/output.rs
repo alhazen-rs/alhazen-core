@@ -54,6 +54,9 @@ pub(crate) struct OutputShared {
     /// Audio played everything it had (end of stream); time must go on without it.
     /// Cleared by a seek.
     pub exhausted: AtomicBool,
+    /// Diagnostics: render calls, and the frames readable in the ring at the last one.
+    pub renders: AtomicU64,
+    pub ring_frames: AtomicU64,
 }
 
 impl OutputShared {
@@ -70,6 +73,8 @@ impl OutputShared {
             anchor: Default::default(),
             failed: AtomicBool::new(false),
             exhausted: AtomicBool::new(false),
+            renders: AtomicU64::new(0),
+            ring_frames: AtomicU64::new(0),
         }
     }
 
@@ -132,6 +137,8 @@ impl Renderer {
     /// can interpolate through it (device callbacks).
     pub fn render_at(&mut self, out: &mut [f32], delay: Option<Duration>) {
         let ch = self.shared.channels as usize;
+        self.shared.renders.fetch_add(1, Ordering::Relaxed);
+        self.shared.ring_frames.store((self.consumer.slots() / ch.max(1)) as u64, Ordering::Relaxed);
         let epoch = self.shared.epoch();
         if epoch != self.epoch {
             self.epoch = epoch;

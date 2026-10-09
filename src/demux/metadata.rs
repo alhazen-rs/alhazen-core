@@ -44,9 +44,24 @@ impl Metadata {
         *self == Metadata::default()
     }
 
+    /// Fills the fields (and the cover) still empty from `other`: a lower-priority tag, such as an
+    /// ID3 tag stuck in front of a FLAC or WAV file.
+    #[cfg(feature = "native")]
+    pub(crate) fn fill_from(&mut self, other: Metadata) {
+        let Metadata { title, artist, album, album_artist, track, year, genre, cover } = other;
+        self.title = self.title.take().or(title);
+        self.artist = self.artist.take().or(artist);
+        self.album = self.album.take().or(album);
+        self.album_artist = self.album_artist.take().or(album_artist);
+        self.track = self.track.or(track);
+        self.year = self.year.or(year);
+        self.genre = self.genre.take().or(genre);
+        self.cover = self.cover.take().or(cover);
+    }
+
     /// Sets `field` from tag text. The first value wins; blank or oversized text is ignored.
     /// Track numbers accept `3` and `3/12`; years take the first four digits (`2024-05-01`).
-        pub(crate) fn set(&mut self, field: Field, value: &str) {
+    pub(crate) fn set(&mut self, field: Field, value: &str) {
         let v = value.trim_matches(|c: char| c == '\0' || c.is_whitespace());
         if v.is_empty() || v.len() > MAX_TEXT {
             return;

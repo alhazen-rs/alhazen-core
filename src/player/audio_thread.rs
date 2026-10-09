@@ -88,6 +88,7 @@ impl AudioLoop {
                 shared.disable_audio("audio device lost");
                 return;
             }
+            crate::player::Diag::set(&shared.diag.audio, 1, self.expected);
             let msg = match rx.recv_timeout(POLL) {
                 Ok(m) => m,
                 // Decoders with delayed output (ffmpeg) produce samples after their packets: collect
@@ -116,6 +117,7 @@ impl AudioLoop {
                     true
                 }
                 Msg::Packet(p) => {
+                    crate::player::Diag::set(&shared.diag.audio, 2, p.pts);
                     if p.generation != self.generation || p.generation < shared.generation.load(Ordering::SeqCst) {
                         true
                     } else {
@@ -206,6 +208,7 @@ impl AudioLoop {
     fn push(&mut self, shared: &Shared, samples: &[f32]) -> bool {
         let generation = self.generation;
         let out = self.out.clone();
+        crate::player::Diag::set(&shared.diag.audio, 3, self.expected);
         let written = push_frames(&mut self.producer, &self.out, samples, || {
             // The ring is full: for audio-only media that is ready to play. Without this, a buffer
             // larger than the ring (8 kHz audio resampled to 48 kHz) waits for a playback start
@@ -218,6 +221,7 @@ impl AudioLoop {
                 && shared.generation.load(Ordering::SeqCst) == generation
         });
         self.pushed += written as u64;
+        crate::player::Diag::set(&shared.diag.audio, 2, self.expected);
         if shared.shutdown.load(Ordering::SeqCst) {
             return false;
         }
@@ -238,6 +242,7 @@ impl AudioLoop {
 
     /// Waits until the device has played everything queued, then reports the stream finished.
     fn on_eof(&mut self, shared: &Shared) -> bool {
+        crate::player::Diag::set(&shared.diag.audio, 4, self.expected);
         self.decoder.send_eof();
         if !self.drain(shared) {
             return false;
@@ -249,6 +254,7 @@ impl AudioLoop {
                 return false;
             }
         }
+        crate::player::Diag::set(&shared.diag.audio, 4, self.expected);
         let capacity = self.producer.buffer().capacity();
         loop {
             if shared.shutdown.load(Ordering::SeqCst) {

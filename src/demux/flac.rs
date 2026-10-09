@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use super::metadata::{CoverPick, MAX_PICTURE};
+use super::mpeg_audio::read_id3v2_tags;
 use super::window::ReadWindow;
 use super::{Codec, Demuxer, Metadata, Packet, StreamInfo, StreamKind, tags};
 use crate::source::MediaSource;
@@ -151,12 +152,16 @@ pub struct FlacDemuxer {
 impl FlacDemuxer {
     pub fn open(src: Box<dyn MediaSource>) -> Result<Self> {
         let mut w = ReadWindow::new(src);
-        if w.at(0, 4)? != b"fLaC" {
+        let (mut meta, mut covers) = (Metadata::default(), CoverPick::default());
+        // Some tools put an ID3v2 tag in front of FLAC files: it only fills what the file's own
+        // tags leave empty (as ffmpeg prefers the native tags).
+        let mut id3 = Metadata::default();
+        let start = read_id3v2_tags(&mut w, &mut id3)?;
+        if w.at(start, 4)? != b"fLaC" {
             return Err(Error::UnsupportedContainer);
         }
-        let (mut meta, mut covers) = (Metadata::default(), CoverPick::default());
         let (mut info, mut raw_info, mut seektable) = (None, Vec::new(), Vec::new());
-        let mut pos = 4u64;
+        let mut pos = start + 4;
         loop {
             let h = w.at(pos, 4)?.to_vec();
             if h.len() < 4 {
@@ -184,6 +189,7 @@ impl FlacDemuxer {
             }
         }
         covers.finish(&mut meta);
+        meta.fill_from(id3);
         let info = info.ok_or_else(|| Error::Demux("flac: no STREAMINFO".into()))?;
         let mut s = StreamInfo::new(0, StreamKind::Audio, Codec::Flac);
         s.sample_rate = info.rate;
@@ -264,7 +270,7 @@ impl FlacDemuxer {
     /// Bisection over byte offsets: a frame start at or before the frame holding `goal`.
     fn bisect(&mut self, goal: u64) -> Result<u64> {
         let (mut lo, mut hi) = (self.first_frame, self.end);
-        while hi - lo > CHUNK as u64 {
+        while hi.saturating_sub(lo) > CHUNK as u64 {
             let mid = lo + (hi - lo) / 2;
             match self.resync(mid)? {
                 Some((at, sample)) if sample <= goal && at < hi => lo = at,
@@ -306,8 +312,10 @@ impl Demuxer for FlacDemuxer {
 
     fn seek(&mut self, target: Duration) -> Result<Duration> {
         let goal = (target.as_secs_f64() * self.info.rate as f64) as u64;
-        let mut at = match self.seektable.iter().rev().find(|(sample, _)| *sample <= goal) {
-            Some(&(_, offset)) => self.first_frame + offset,
+        // A seek point is trusted only if it lands inside the file.
+        let point = self.seektable.iter().rev().find(|(sample, _)| *sample <= goal);
+        let mut at = match point.and_then(|&(_, offset)| self.first_frame.checked_add(offset)).filter(|&at| at < self.end && at < u64::MAX / 2) {
+            Some(at) => at,
             None if self.w.is_seekable() && self.end != u64::MAX => self.bisect(goal)?,
             None => self.first_frame,
         };
@@ -404,6 +412,42 @@ mod tests {
         });
         let ended = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("next_packet hung");
         assert!(ended.unwrap(), "no packet from junk");
+    }
+
+    #[test]
+    fn a_seektable_point_past_the_file_falls_back_to_bisection() {
+        let (mut a, mut b) = (open(), open());
+        a.seektable = vec![(0, u64::MAX), (1, u64::MAX / 2)];
+        b.seektable.clear();
+        let t = Duration::from_millis(1500);
+        assert_eq!(a.seek(t).unwrap(), b.seek(t).unwrap());
+        assert_eq!(a.next_packet().unwrap().unwrap().pts, b.next_packet().unwrap().unwrap().pts);
+    }
+
+    #[test]
+    fn metadata_running_past_the_end_of_the_file_is_survived() {
+        // STREAMINFO, then a last (padding) block claiming 1 MB in a 100-byte file.
+        let mut bytes = b"fLaC\x00\x00\x00\x22".to_vec();
+        let mut info = [0u8; 34];
+        info[..4].copy_from_slice(&[0x10, 0x00, 0x10, 0x00]);
+        info[10..14].copy_from_slice(&[0x0A, 0xC4, 0x42, 0xF0]);
+        bytes.extend(info);
+        bytes.extend([0x81, 0x0F, 0x42, 0x40]);
+        bytes.resize(100, 0);
+        let path = std::env::temp_dir().join(format!("flac_past_end_{}.flac", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let mut d = FlacDemuxer::open(Box::new(FileSource::open(&path).unwrap())).unwrap();
+        d.seek(Duration::from_secs(1)).unwrap();
+        assert!(d.next_packet().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_seektable_point_near_the_top_of_u64_with_an_unknown_length() {
+        let mut d = open();
+        d.end = u64::MAX; // a stream of unknown length
+        d.seektable = vec![(0, u64::MAX - 8 - d.first_frame)];
+        d.seek(Duration::from_millis(500)).unwrap();
+        assert!(d.next_packet().unwrap().is_some());
     }
 
     #[test]

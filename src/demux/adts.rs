@@ -29,6 +29,10 @@ impl AdtsDemuxer {
         let start = read_id3v2_tags(&mut w, &mut meta)?;
         let window = w.at(start, FIRST_FRAME_WINDOW)?.to_vec();
         let (i, h) = find_chain::<AdtsHeader>(&window, 2, None).ok_or(Error::Unsupported("no ADTS frames"))?;
+        if h.blocks > 1 {
+            // Block boundaries are only signalled with CRCs; ffmpeg doesn't support these either.
+            return Err(Error::Unsupported("ADTS frames with several AAC blocks"));
+        }
         let first = start + i as u64;
         // Average frame size over the frames chained in the first window.
         let (mut pos, mut count) = (i, 0u64);
@@ -76,7 +80,6 @@ impl Demuxer for AdtsDemuxer {
         self.metadata.as_ref()
     }
 
-    /// A frame with several raw data blocks is passed whole (encoders in use write one block).
     fn next_packet(&mut self) -> Result<Option<Packet>> {
         let Some((n, h, frame)) = self.frames.next()? else { return Ok(None) };
         Ok(Some(Packet { stream: 0, pts: self.time(n), keyframe: true, data: frame[h.header_len..].to_vec(), generation: 0 }))

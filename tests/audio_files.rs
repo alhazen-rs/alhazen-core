@@ -86,10 +86,21 @@ fn decode_all(name: &str) -> (StreamInfo, Decoded) {
 
 /// ffmpeg's decode of the first audio stream as interleaved f32, or `None` without ffmpeg.
 fn ffmpeg(name: &str) -> Option<Vec<f32>> {
-    let out = Command::new("ffmpeg")
-        .args(["-v", "error", "-i", &fixture(name), "-map", "0:a:0", "-f", "f32le", "-"])
-        .output()
-        .ok()?;
+    ffmpeg_with(name, None)
+}
+
+/// The same with a given ffmpeg decoder (e.g. `libopus`), or `None` when ffmpeg or that decoder
+/// is missing.
+fn ffmpeg_with(name: &str, decoder: Option<&str>) -> Option<Vec<f32>> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-v", "error"]);
+    if let Some(d) = decoder {
+        cmd.args(["-c:a", d]);
+    }
+    let out = cmd.args(["-i", &fixture(name), "-map", "0:a:0", "-f", "f32le", "-"]).output().ok()?;
+    if decoder.is_some() && !out.status.success() {
+        return None; // this ffmpeg lacks the decoder
+    }
     assert!(out.status.success(), "ffmpeg failed on {name}: {}", String::from_utf8_lossy(&out.stderr));
     Some(out.stdout.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect())
 }
@@ -397,9 +408,18 @@ fn ogg_vorbis_matches_ffmpeg() {
 #[test]
 fn ogg_opus_matches_ffmpeg() {
     assert_matches_ffmpeg("opus.opus", Exact::Db(50.0));
-    // The multistream (surround) decoder matches ffmpeg's to ≈ 30 dB per channel (the same on
-    // opus_51.webm); length, start and channel order are still exact.
-    assert_matches_ffmpeg("opus_51.opus", Exact::Db(25.0));
+    // Surround against libopus, the reference decoder: ffmpeg's native Opus decoder itself is only
+    // ≈ 30 dB from libopus on 5.1 (LFE is the least exact channel, ≈ 75 dB).
+    let (_, ours) = decode_all("opus_51.opus");
+    let Some(reference) = ffmpeg_with("opus_51.opus", Some("libopus")) else {
+        eprintln!("skipped the 5.1 comparison: no ffmpeg with libopus");
+        return;
+    };
+    assert_eq!(ours.samples.len(), reference.len());
+    for c in 0..6 {
+        let channel = |s: &[f32]| s.iter().skip(c).step_by(6).copied().collect::<Vec<f32>>();
+        assert_close("opus_51.opus", &format!("channel {c} vs libopus"), &channel(&ours.samples), &channel(&reference), Exact::Db(70.0));
+    }
 }
 
 #[test]
@@ -649,4 +669,108 @@ fn matroska_attachments_that_are_not_images_are_not_read() {
     let d = alhazen_core::demux::MatroskaDemuxer::open(src).unwrap();
     assert!(d.metadata().is_none_or(|m| m.cover.is_none()));
     assert!(read.load(Ordering::Relaxed) < 1 << 20, "opening read {} bytes", read.load(Ordering::Relaxed));
+}
+
+#[test]
+fn wav_with_a_wrong_block_align_still_decodes() {
+    let mut bytes = std::fs::read(fixture("wav_s16.wav")).unwrap();
+    let fmt = bytes.windows(4).position(|w| w == b"fmt ").unwrap() + 8;
+    bytes[fmt + 12..fmt + 14].copy_from_slice(&1u16.to_le_bytes()); // should be 4 (stereo s16)
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("bad_block_align.wav");
+    std::fs::write(&path, bytes).unwrap();
+    let mut d = open_path(path.to_str().unwrap());
+    let s = audio(&*d);
+    assert_eq!(s.duration, audio(&*open("wav_s16.wav")).duration);
+    assert_eq!(decode(&mut *d, &s, |_| false).samples, decode_all("wav_s16.wav").1.samples);
+}
+
+#[test]
+fn chained_ogg_open_does_not_scan_the_whole_file_back() {
+    use std::sync::atomic::Ordering;
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let first = dir.join("chain_a.opus");
+    let second = dir.join("chain_b.opus");
+    for (path, secs) in [(&first, "2"), (&second, "180")] {
+        let ok = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg(format!("aevalsrc=exprs='0.3*sin(2*PI*(200+t)*t)':s=48000:d={secs}"))
+            .args(["-c:a", "libopus", "-b:a", "96k"])
+            .arg(path)
+            .status();
+        if !ok.is_ok_and(|s| s.success()) {
+            eprintln!("skipped: no ffmpeg");
+            return;
+        }
+    }
+    let chained = dir.join("chained.opus");
+    std::fs::write(&chained, [std::fs::read(&first).unwrap(), std::fs::read(&second).unwrap()].concat()).unwrap();
+    // A local file may be read back cheaply: the first link keeps its duration.
+    let local = audio(&*open_path(chained.to_str().unwrap())).duration.expect("duration of the first link");
+    assert!(local.abs_diff(Duration::from_secs(2)) < ms(30), "{local:?}");
+    let read = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let src = Box::new(NetworkLike {
+        file: alhazen_core::source::FileSource::open(&chained).unwrap(),
+        pos: 0,
+        backward: Default::default(),
+        read: read.clone(),
+    });
+    let mut d: Box<dyn Demuxer> = Box::new(alhazen_core::demux::OggDemuxer::open(src).unwrap());
+    assert!(read.load(Ordering::Relaxed) < 1_500_000, "open read {} bytes", read.load(Ordering::Relaxed));
+    let s = audio(&*d);
+    assert!(decode(&mut *d, &s, |_| false).samples.len() > 48_000, "the first stream plays");
+}
+
+#[test]
+fn flac_and_wav_after_an_id3_tag_are_detected_and_play() {
+    let mp3 = std::fs::read(fixture("mp3_tagged.mp3")).unwrap();
+    let tag_len = 10 + (mp3[6..10].iter().fold(0usize, |v, &b| v << 7 | b as usize));
+    for (name, format) in [("flac.flac", alhazen_core::demux::ContainerFormat::Flac), ("wav_s16.wav", alhazen_core::demux::ContainerFormat::Wav)] {
+        let bytes = [&mp3[..tag_len], &std::fs::read(fixture(name)).unwrap()[..]].concat();
+        let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("id3_{name}"));
+        std::fs::write(&path, bytes).unwrap();
+        let mut src = alhazen_core::source::FileSource::open(&path).unwrap();
+        assert_eq!(alhazen_core::demux::probe(&mut src).unwrap(), Some(format), "{name}");
+        let mut d = open_path(path.to_str().unwrap());
+        assert_eq!(d.metadata().and_then(|m| m.title.clone()).as_deref(), Some("Test Title"), "{name}: the ID3 tag is read");
+        let s = audio(&*d);
+        assert_eq!(decode(&mut *d, &s, |_| false).samples, decode_all(name).1.samples, "{name}");
+    }
+}
+
+#[test]
+fn adts_frames_with_several_aac_blocks_are_refused_clearly() {
+    // AAC-LC 44.1 kHz stereo frames of 200 bytes, each claiming two raw data blocks.
+    let mut frame = vec![0xFF, 0xF1, 0x50, 0x80, (200 >> 3) as u8, ((200 & 7) << 5) as u8 | 0x1F, 0xFC | 1];
+    frame.resize(200, 0);
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("two_blocks.aac");
+    std::fs::write(&path, frame.repeat(5)).unwrap();
+    let source = Source::parse(path.to_str().unwrap()).unwrap();
+    let mut src = source.open().unwrap();
+    let format = alhazen_core::demux::probe(src.as_mut()).unwrap().unwrap();
+    let err = match Registry::empty_with_native().open_demuxer(&source, format, src, None) {
+        Ok(_) => panic!("opened"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("several AAC blocks"), "{err}");
+}
+
+
+#[test]
+fn a_stale_id3_prefix_does_not_override_native_tags() {
+    // An ID3v2.3 tag with only a title, in front of a FLAC file with its own tags and cover.
+    let title = b"\x00Stale ID3";
+    let mut frame = b"TIT2".to_vec();
+    frame.extend((title.len() as u32).to_be_bytes());
+    frame.extend([0, 0]);
+    frame.extend(title);
+    let mut tag = b"ID3\x03\x00\x00".to_vec();
+    tag.extend([0, 0, (frame.len() >> 7) as u8 & 0x7F, frame.len() as u8 & 0x7F]);
+    tag.extend(frame);
+    let bytes = [&tag[..], &std::fs::read(fixture("flac_tagged.flac")).unwrap()[..]].concat();
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("stale_id3.flac");
+    std::fs::write(&path, bytes).unwrap();
+    let d = open_path(path.to_str().unwrap());
+    let m = d.metadata().unwrap();
+    assert_eq!(m.title.as_deref(), Some("Test Title"), "the file's own Vorbis comment wins");
+    assert!(m.cover.is_some());
 }
