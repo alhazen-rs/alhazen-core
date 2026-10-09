@@ -86,10 +86,21 @@ fn decode_all(name: &str) -> (StreamInfo, Decoded) {
 
 /// ffmpeg's decode of the first audio stream as interleaved f32, or `None` without ffmpeg.
 fn ffmpeg(name: &str) -> Option<Vec<f32>> {
-    let out = Command::new("ffmpeg")
-        .args(["-v", "error", "-i", &fixture(name), "-map", "0:a:0", "-f", "f32le", "-"])
-        .output()
-        .ok()?;
+    ffmpeg_with(name, None)
+}
+
+/// The same with a given ffmpeg decoder (e.g. `libopus`), or `None` when ffmpeg or that decoder
+/// is missing.
+fn ffmpeg_with(name: &str, decoder: Option<&str>) -> Option<Vec<f32>> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-v", "error"]);
+    if let Some(d) = decoder {
+        cmd.args(["-c:a", d]);
+    }
+    let out = cmd.args(["-i", &fixture(name), "-map", "0:a:0", "-f", "f32le", "-"]).output().ok()?;
+    if decoder.is_some() && !out.status.success() {
+        return None; // this ffmpeg lacks the decoder
+    }
     assert!(out.status.success(), "ffmpeg failed on {name}: {}", String::from_utf8_lossy(&out.stderr));
     Some(out.stdout.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect())
 }
@@ -397,9 +408,18 @@ fn ogg_vorbis_matches_ffmpeg() {
 #[test]
 fn ogg_opus_matches_ffmpeg() {
     assert_matches_ffmpeg("opus.opus", Exact::Db(50.0));
-    // The multistream (surround) decoder matches ffmpeg's to ≈ 30 dB per channel (the same on
-    // opus_51.webm); length, start and channel order are still exact.
-    assert_matches_ffmpeg("opus_51.opus", Exact::Db(25.0));
+    // Surround against libopus, the reference decoder: ffmpeg's native Opus decoder itself is only
+    // ≈ 30 dB from libopus on 5.1 (LFE is the least exact channel, ≈ 75 dB).
+    let (_, ours) = decode_all("opus_51.opus");
+    let Some(reference) = ffmpeg_with("opus_51.opus", Some("libopus")) else {
+        eprintln!("skipped the 5.1 comparison: no ffmpeg with libopus");
+        return;
+    };
+    assert_eq!(ours.samples.len(), reference.len());
+    for c in 0..6 {
+        let channel = |s: &[f32]| s.iter().skip(c).step_by(6).copied().collect::<Vec<f32>>();
+        assert_close("opus_51.opus", &format!("channel {c} vs libopus"), &channel(&ours.samples), &channel(&reference), Exact::Db(70.0));
+    }
 }
 
 #[test]
@@ -730,3 +750,4 @@ fn adts_frames_with_several_aac_blocks_are_refused_clearly() {
     };
     assert!(err.contains("several AAC blocks"), "{err}");
 }
+
