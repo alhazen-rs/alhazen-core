@@ -46,7 +46,7 @@ impl Metadata {
 
     /// Sets `field` from tag text. The first value wins; blank or oversized text is ignored.
     /// Track numbers accept `3` and `3/12`; years take the first four digits (`2024-05-01`).
-        pub(crate) fn set(&mut self, field: Field, value: &str) {
+    pub(crate) fn set(&mut self, field: Field, value: &str) {
         let v = value.trim_matches(|c: char| c == '\0' || c.is_whitespace());
         if v.is_empty() || v.len() > MAX_TEXT {
             return;
