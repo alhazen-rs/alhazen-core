@@ -545,6 +545,36 @@ impl Player {
         self.seekable
     }
 
+    /// Internal state for diagnosing stalls (tests, `ALHAZEN_DEBUG`); the format may change.
+    #[doc(hidden)]
+    pub fn debug_snapshot(&self) -> String {
+        let s = &self.shared;
+        let audio = s.audio_out.as_ref().map(|o| {
+            format!(
+                "played {} paused {} discard_until {} exhausted {} failed {}",
+                o.frames_played.load(Ordering::SeqCst),
+                o.paused.load(Ordering::SeqCst),
+                o.discard_until.load(Ordering::SeqCst),
+                o.exhausted.load(Ordering::SeqCst),
+                o.failed.load(Ordering::SeqCst)
+            )
+        });
+        format!(
+            "state {:?} clock {:?} generation {} ready {} wants_play {} queue {} (next pts {:?}) video_done {} audio_done {} audio_active {} audio [{}]",
+            s.state(),
+            s.clock.now(),
+            s.generation.load(Ordering::SeqCst),
+            s.ready_generation.load(Ordering::SeqCst),
+            s.wants_play.load(Ordering::SeqCst),
+            s.queue.len(),
+            s.queue.peek_pts(),
+            s.video_done.load(Ordering::SeqCst),
+            s.audio_done.load(Ordering::SeqCst),
+            s.audio_active.load(Ordering::SeqCst),
+            audio.unwrap_or_default()
+        )
+    }
+
     /// Tags and cover art (title, artist, album, …), when the file has any.
     ///
     /// ```no_run

@@ -171,12 +171,13 @@ fn decoder_that_fell_behind_the_sound_is_replaced() {
     while player.state() != PlayerState::Ended {
         assert!(
             start.elapsed() < Duration::from_secs(20),
-            "never ended: {:?} at {:?}, slow {} fast {}, {:?}",
+            "never ended: {:?} at {:?}, slow {} fast {}, {:?}\n{}",
             player.state(),
             player.position(),
             slow.load(Ordering::SeqCst),
             fast.load(Ordering::SeqCst),
-            player.stats()
+            player.stats(),
+            player.debug_snapshot()
         );
         player.current_frame(); // a UI drawing at 100 Hz
         null.pull(48_000 / 100); // the sound plays in real time: 10 ms every 10 ms
