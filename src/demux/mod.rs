@@ -42,6 +42,8 @@ pub use ogg::OggDemuxer;
 #[cfg(feature = "native")]
 pub use ts::TsDemuxer;
 #[cfg(feature = "native")]
+pub(crate) use ts::is_ts as ts_is_ts;
+#[cfg(feature = "native")]
 pub use wav::WavDemuxer;
 
 use crate::Result;

@@ -5,3 +5,4 @@
 pub mod playlist;
 pub(crate) mod abr;
 pub(crate) mod crypto;
+pub(crate) mod segment;
