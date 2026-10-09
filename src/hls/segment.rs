@@ -47,14 +47,14 @@ pub(crate) struct RawPacket {
 }
 
 enum Inner {
-    Ts(demux::TsDemuxer),
+    Ts(Box<demux::TsDemuxer>),
     Other(Box<dyn Demuxer>),
 }
 
 impl Inner {
     fn get(&mut self) -> &mut dyn Demuxer {
         match self {
-            Inner::Ts(d) => d,
+            Inner::Ts(d) => d.as_mut(),
             Inner::Other(d) => d.as_mut(),
         }
     }
@@ -75,7 +75,7 @@ impl SegmentDemuxer {
     pub fn open(data: Vec<u8>, init: Option<&[u8]>, ts_reference: Option<u64>) -> Result<Self> {
         let format = detect(&data).or_else(|| init.map(|_| SegmentFormat::Fmp4));
         let (inner, offset) = match format {
-            Some(SegmentFormat::Ts) => (Inner::Ts(demux::TsDemuxer::open_segment(data, ts_reference)?), Duration::ZERO),
+            Some(SegmentFormat::Ts) => (Inner::Ts(Box::new(demux::TsDemuxer::open_segment(data, ts_reference)?)), Duration::ZERO),
             Some(SegmentFormat::Fmp4) => {
                 let bytes = match init {
                     Some(init) => [init, &data].concat(),
