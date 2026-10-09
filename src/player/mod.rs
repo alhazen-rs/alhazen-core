@@ -14,7 +14,7 @@ use crossbeam_channel::{Receiver, Sender};
 use crate::audio::{AudioClock, AudioOutputConfig, OutputShared, Volume, open_output};
 use crate::backend::Registry;
 use crate::clock::{Clock, SystemClock};
-use crate::demux::{self, Metadata, StreamInfo, StreamKind};
+use crate::demux::{self, Demuxer, Metadata, StreamInfo, StreamKind};
 use crate::frame::{FrameQueue, VideoFrame};
 use crate::source::Source;
 use crate::{Error, Result};
@@ -394,6 +394,18 @@ impl Player {
         let seekable = src.is_seekable() && !src.is_live();
         let format = demux::probe(src.as_mut())?.ok_or(Error::UnsupportedContainer)?;
         let demuxer = registry.open_demuxer(&source, format, src, order)?;
+        Self::open_demuxer_inner(demuxer, seekable, registry, config)
+    }
+
+    /// Plays from a ready demuxer (tests, and demuxers not reached through `Source`).
+    #[doc(hidden)]
+    pub fn open_with_demuxer(demuxer: Box<dyn Demuxer>, seekable: bool, config: PlayerConfig) -> Result<Player> {
+        let registry = config.registry.clone().unwrap_or_else(|| Arc::new(Registry::with_options(&config.ffmpeg, config.prefer_hardware)));
+        Self::open_demuxer_inner(demuxer, seekable, registry, config)
+    }
+
+    fn open_demuxer_inner(demuxer: Box<dyn Demuxer>, seekable: bool, registry: Arc<Registry>, config: PlayerConfig) -> Result<Player> {
+        let order = config.backend_order.as_deref();
         let streams = demuxer.streams().to_vec();
         let metadata = demuxer.metadata().cloned();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
@@ -468,10 +480,15 @@ impl Player {
             diag: Diag::default(),
         });
         let pool = config.thread_pool.clone().unwrap_or_else(shared_thread_pool);
+        let reopen = pipeline::Reopen {
+            registry: registry.clone(),
+            threads: config.decoder_threads,
+            order: config.backend_order.clone(),
+        };
         let mut audio_guard = None;
         let audio_pipe = audio.map(|(info, decoder, out)| {
             audio_guard = out._guard;
-            pipeline::AudioPipe { info, decoder, producer: out.producer, out: out.shared }
+            pipeline::AudioPipe { info, decoder, producer: out.producer, out: out.shared, reopen: reopen.clone() }
         });
         let threads = pipeline::spawn(
             shared.clone(),
@@ -487,6 +504,7 @@ impl Player {
                     current: backend,
                     speed: config.auto_fallback,
                 }),
+                reopen: reopen.clone(),
             }),
             audio_pipe,
             cmd_rx,

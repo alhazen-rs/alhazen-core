@@ -1,6 +1,7 @@
 //! Byte-level media inputs.
 
 mod file;
+mod memory;
 #[cfg(feature = "http")]
 mod http;
 
@@ -8,6 +9,7 @@ use std::io::{Read, Seek};
 use std::path::PathBuf;
 
 pub use file::FileSource;
+pub use memory::MemorySource;
 #[cfg(feature = "http")]
 pub use http::HttpSource;
 use url::Url;

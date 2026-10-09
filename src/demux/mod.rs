@@ -230,6 +230,12 @@ pub trait Demuxer: Send {
     fn metadata(&self) -> Option<&Metadata> {
         None
     }
+    /// A stream whose format changed (an HLS variant switch or discontinuity: new codec, size or
+    /// setup data), checked after every packet. The packet just returned and the ones after it
+    /// are in the new format; the player reopens that stream's decoder.
+    fn take_stream_update(&mut self) -> Option<StreamInfo> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

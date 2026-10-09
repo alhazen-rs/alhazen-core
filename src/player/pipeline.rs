@@ -35,6 +35,9 @@ pub(super) enum Msg {
     /// A seek happened: drop decoder state; frames before `target` are decoded but not shown.
     Flush { generation: u64, target: Duration },
     Eof { generation: u64 },
+    /// The stream's format changes from the next packet on (an HLS variant switch): reopen the
+    /// decoder for it.
+    Reconfigure(StreamInfo),
 }
 
 /// The video stream's decoder, and where to find a faster one if it cannot keep up.
@@ -42,6 +45,15 @@ pub(crate) struct VideoPipe {
     pub stream: u32,
     pub decoder: Box<dyn VideoDecoder>,
     pub fallback: Option<Fallback>,
+    pub reopen: Reopen,
+}
+
+/// What a decode thread needs to open a decoder for a stream whose format changed mid-way.
+#[derive(Clone)]
+pub(crate) struct Reopen {
+    pub registry: Arc<Registry>,
+    pub threads: usize,
+    pub order: Option<Vec<&'static str>>,
 }
 
 /// What the decode thread needs to open another backend's decoder for the same stream: used
@@ -63,6 +75,7 @@ pub(crate) struct AudioPipe {
     pub decoder: Box<dyn AudioDecoder>,
     pub producer: rtrb::Producer<f32>,
     pub out: Arc<OutputShared>,
+    pub reopen: Reopen,
 }
 
 /// Where the demux thread sends one stream's packets.
@@ -83,7 +96,7 @@ pub(super) fn spawn(
     let mut threads = Vec::new();
     let mut routes = Vec::new();
     let has_video = video.is_some();
-    if let Some(VideoPipe { stream, decoder, fallback }) = video {
+    if let Some(VideoPipe { stream, decoder, fallback, reopen }) = video {
         let (tx, rx) = crossbeam_channel::bounded(packet_queue_len.max(1));
         routes.push(Route { stream, tx: Some(tx) });
         let s = shared.clone();
@@ -91,6 +104,7 @@ pub(super) fn spawn(
             guarded(&s, |s| {
                 let mut lp = DecodeLoop::new(decoder, pool);
                 lp.fallback = fallback;
+                lp.reopen = Some(reopen);
                 lp.run(s, rx)
             })
         })?);
@@ -192,6 +206,12 @@ fn demux_loop(
         match demuxer.next_packet() {
             Ok(Some(mut p)) => {
                 p.generation = generation;
+                if let Some(info) = demuxer.take_stream_update()
+                    && let Some(route) = routes.iter_mut().find(|r| r.stream == info.id)
+                    && !send_to(shared, route, &commands, Msg::Reconfigure(info))
+                {
+                    return;
+                }
                 let audio = shared.audio_out.is_some() && routes.last().is_some_and(|r| r.stream == p.stream) && routes.len() > 1;
                 crate::player::Diag::set(&shared.diag.demux, if audio { 2 } else { 3 }, p.pts);
                 for (r, slot) in routes.iter().zip([&shared.diag.video_queued, &shared.diag.audio_queued]) {
@@ -277,6 +297,8 @@ struct DecodeLoop {
     waiting_for_keyframe: bool,
     /// Set until the one allowed switch to another backend has happened.
     fallback: Option<Fallback>,
+    /// For reopening the decoder when the stream's format changes.
+    reopen: Option<Reopen>,
     /// The current decoder has produced a frame (an error before that means it can't decode
     /// this stream at all).
     decoded_any: bool,
@@ -299,6 +321,7 @@ impl DecodeLoop {
             errors: 0,
             waiting_for_keyframe: false,
             fallback: None,
+            reopen: None,
             decoded_any: false,
             monitor: SpeedMonitor::new(),
             busy: Duration::ZERO,
@@ -332,6 +355,7 @@ impl DecodeLoop {
                     true
                 }
                 Msg::Packet(p) => self.on_packet(shared, p),
+                Msg::Reconfigure(info) => self.on_reconfigure(shared, info),
                 Msg::Eof { generation } if generation == self.generation => self.on_eof(shared),
                 Msg::Eof { .. } => true,
             };
@@ -467,6 +491,36 @@ impl DecodeLoop {
                     f.current
                 )));
                 false
+            }
+        }
+    }
+
+    /// The stream changes format: finish the old decoder's frames, then decode the rest with a
+    /// decoder for the new format, starting at a keyframe.
+    fn on_reconfigure(&mut self, shared: &Shared, info: StreamInfo) -> bool {
+        self.decoder.send_eof();
+        if !self.drain(shared) {
+            return false;
+        }
+        let Some(r) = self.reopen.clone() else { return true };
+        match r.registry.open_video_decoder_except(&info, r.threads, r.order.as_deref(), None) {
+            Ok((name, decoder)) => {
+                log::info!("video format changed ({} {}x{}): decoding with {name}", info.codec, info.width, info.height);
+                self.decoder = decoder;
+                self.decoded_any = false;
+                self.waiting_for_keyframe = true;
+                self.monitor.reset();
+                self.busy = Duration::ZERO;
+                *shared.video_backend.lock().unwrap() = Some(name);
+                if let Some(f) = self.fallback.as_mut() {
+                    f.stream = info;
+                    f.current = name;
+                }
+                true
+            }
+            Err(e) => {
+                self.waiting_for_keyframe = true;
+                self.on_decode_error(shared, e)
             }
         }
     }

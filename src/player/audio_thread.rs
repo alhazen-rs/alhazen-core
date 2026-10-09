@@ -6,10 +6,11 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 
-use super::pipeline::{AudioPipe, Msg};
+use super::pipeline::{AudioPipe, Msg, Reopen};
 use super::Shared;
 use crate::audio::{OutputShared, Resampler, push_frames, remix};
 use crate::decode::{AudioBuffer, AudioDecoder};
+use crate::demux::StreamInfo;
 
 const POLL: Duration = Duration::from_millis(50);
 const MAX_DECODE_ERRORS: u32 = 3;
@@ -62,6 +63,7 @@ pub(super) struct AudioLoop {
     /// Frames pushed into the ring so far (the ring's sequence numbers).
     pushed: u64,
     errors: u32,
+    reopen: Reopen,
 }
 
 impl AudioLoop {
@@ -76,6 +78,7 @@ impl AudioLoop {
             last_pts: None,
             pushed: 0,
             errors: 0,
+            reopen: pipe.reopen,
         }
     }
 
@@ -127,11 +130,32 @@ impl AudioLoop {
                         }
                     }
                 }
+                Msg::Reconfigure(info) => self.on_reconfigure(shared, info),
                 Msg::Eof { generation } if generation == self.generation => self.on_eof(shared),
                 Msg::Eof { .. } => true,
             };
             if !keep_going {
                 return;
+            }
+        }
+    }
+
+    /// The stream changes format: play out the old decoder's samples, then open one for the new
+    /// format (the resampler follows a rate change by itself).
+    fn on_reconfigure(&mut self, shared: &Shared, info: StreamInfo) -> bool {
+        self.decoder.send_eof();
+        if !self.drain(shared) {
+            return false;
+        }
+        match self.reopen.registry.open_audio_decoder(&info, self.reopen.order.as_deref()) {
+            Ok(decoder) => {
+                self.decoder = decoder;
+                self.last_pts = None;
+                true
+            }
+            Err(e) => {
+                shared.disable_audio(&format!("audio format changed to one that cannot be decoded: {e}"));
+                false
             }
         }
     }
