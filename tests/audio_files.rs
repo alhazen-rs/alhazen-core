@@ -663,3 +663,36 @@ fn wav_with_a_wrong_block_align_still_decodes() {
     assert_eq!(s.duration, audio(&*open("wav_s16.wav")).duration);
     assert_eq!(decode(&mut *d, &s, |_| false).samples, decode_all("wav_s16.wav").1.samples);
 }
+
+#[test]
+fn chained_ogg_open_does_not_scan_the_whole_file_back() {
+    use std::sync::atomic::Ordering;
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let first = dir.join("chain_a.opus");
+    let second = dir.join("chain_b.opus");
+    for (path, secs) in [(&first, "2"), (&second, "180")] {
+        let ok = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg(format!("aevalsrc=exprs='0.3*sin(2*PI*(200+t)*t)':s=48000:d={secs}"))
+            .args(["-c:a", "libopus", "-b:a", "96k"])
+            .arg(path)
+            .status();
+        if !ok.is_ok_and(|s| s.success()) {
+            eprintln!("skipped: no ffmpeg");
+            return;
+        }
+    }
+    let chained = dir.join("chained.opus");
+    std::fs::write(&chained, [std::fs::read(&first).unwrap(), std::fs::read(&second).unwrap()].concat()).unwrap();
+    let read = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let src = Box::new(NetworkLike {
+        file: alhazen_core::source::FileSource::open(&chained).unwrap(),
+        pos: 0,
+        backward: Default::default(),
+        read: read.clone(),
+    });
+    let mut d: Box<dyn Demuxer> = Box::new(alhazen_core::demux::OggDemuxer::open(src).unwrap());
+    assert!(read.load(Ordering::Relaxed) < 1_500_000, "open read {} bytes", read.load(Ordering::Relaxed));
+    let s = audio(&*d);
+    assert!(decode(&mut *d, &s, |_| false).samples.len() > 48_000, "the first stream plays");
+}
