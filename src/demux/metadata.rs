@@ -25,13 +25,12 @@ pub struct Picture {
 
 /// Pictures larger than this are skipped.
 #[cfg(feature = "native")]
-#[allow(dead_code)] // used from Task 2
 pub(crate) const MAX_PICTURE: usize = 16 << 20;
 /// Text fields longer than this are ignored.
 pub(crate) const MAX_TEXT: usize = 64 << 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // used from Task 2
+#[cfg_attr(not(feature = "native"), allow(dead_code))] // used without `native` from Task 11
 pub(crate) enum Field {
     Title,
     Artist,
@@ -49,7 +48,7 @@ impl Metadata {
 
     /// Sets `field` from tag text. The first value wins; blank or oversized text is ignored.
     /// Track numbers accept `3` and `3/12`; years take the first four digits (`2024-05-01`).
-    #[allow(dead_code)] // used from Task 2
+    #[cfg_attr(not(feature = "native"), allow(dead_code))] // used without `native` from Task 11
     pub(crate) fn set(&mut self, field: Field, value: &str) {
         let v = value.trim_matches(|c: char| c == '\0' || c.is_whitespace());
         if v.is_empty() || v.len() > MAX_TEXT {
@@ -83,14 +82,12 @@ impl Metadata {
 /// Chooses the cover among a file's pictures: the front cover, else the first one offered.
 #[cfg(feature = "native")]
 #[derive(Default)]
-#[allow(dead_code)] // used from Task 2
 pub(crate) struct CoverPick {
     pic: Option<Picture>,
     front: bool,
 }
 
 #[cfg(feature = "native")]
-#[allow(dead_code)] // used from Task 2
 impl CoverPick {
     pub fn offer(&mut self, front: bool, mime: &str, data: &[u8]) {
         if data.is_empty() || data.len() > MAX_PICTURE || self.front || (self.pic.is_some() && !front) {
@@ -110,7 +107,6 @@ impl CoverPick {
 
 /// MIME type from an image's magic bytes.
 #[cfg(feature = "native")]
-#[allow(dead_code)] // used from Task 2
 pub(crate) fn sniff_mime(data: &[u8]) -> String {
     if data.starts_with(b"\x89PNG") {
         "image/png"
