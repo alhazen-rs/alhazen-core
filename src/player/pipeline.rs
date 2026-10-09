@@ -670,6 +670,7 @@ mod tests {
             seekable: true,
             video_backend: Mutex::new(None),
             max_output_size: AtomicU64::new(0),
+            diag: Default::default(),
         }
     }
 
