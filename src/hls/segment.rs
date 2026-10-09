@@ -75,6 +75,7 @@ pub(crate) struct SegmentDemuxer {
 impl SegmentDemuxer {
     /// `init`: the fMP4 initialization section (`EXT-X-MAP`); `ts_reference`: the previous TS
     /// segment's last timestamp, for unwrapping.
+    #[cfg(test)]
     pub fn open(data: Vec<u8>, init: Option<&[u8]>, ts_reference: Option<u64>) -> Result<Self> {
         Self::open_with(data, init, ts_reference, None)
     }
