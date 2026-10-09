@@ -195,6 +195,9 @@ impl Backend for NativeBackend {
         Ok(match format {
             ContainerFormat::Matroska => Box::new(crate::demux::MatroskaDemuxer::open(src)?),
             ContainerFormat::Mp4 => Box::new(crate::demux::Mp4Demuxer::open(src)?),
+            ContainerFormat::Mp3 | ContainerFormat::Adts | ContainerFormat::Flac | ContainerFormat::Wav | ContainerFormat::Ogg => {
+                return Err(Error::UnsupportedContainer);
+            }
         })
     }
     fn supports_video(&self, stream: &StreamInfo) -> bool {

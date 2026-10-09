@@ -24,6 +24,11 @@ pub trait MediaSource: Read + Seek + Send {
     fn is_live(&self) -> bool;
     /// Human readable description for errors and logs.
     fn description(&self) -> String;
+    /// A file on this machine: scanning it costs little (readers may build exact seek indexes,
+    /// read trailing tags). `false` for network sources.
+    fn is_local(&self) -> bool {
+        false
+    }
 }
 
 /// Where media comes from. `Player::open` takes this rather than a `MediaSource`

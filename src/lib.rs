@@ -17,6 +17,7 @@ pub mod nvdec;
 mod scale;
 pub mod source;
 
+pub use demux::{Metadata, Picture};
 pub use error::{Error, Result};
 pub use ffmpeg::FfmpegConfig;
 pub use frame::VideoFrame;

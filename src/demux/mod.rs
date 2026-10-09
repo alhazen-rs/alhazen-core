@@ -2,13 +2,19 @@
 
 mod ebml;
 mod matroska;
+mod metadata;
 #[cfg(feature = "native")]
 mod mp4;
+pub(crate) mod mpeg_audio;
+pub(crate) mod tags;
+#[cfg(feature = "native")]
+pub(crate) mod window;
 
 use std::io::SeekFrom;
 use std::time::Duration;
 
 pub use matroska::MatroskaDemuxer;
+pub use metadata::{Metadata, Picture};
 #[cfg(feature = "native")]
 pub(crate) use matroska::split_xiph_lacing;
 #[cfg(feature = "native")]
@@ -150,6 +156,9 @@ pub struct StreamInfo {
     pub codec_delay: Duration,
     /// Audio only: how much earlier decoding must start for a seek to be clean (SeekPreRoll).
     pub seek_preroll: Duration,
+    /// Audio only: the exact presentation length, when the file states it (MP3 LAME tag, Ogg final
+    /// granule). Decoders drop samples presented at or after it (encoder end padding).
+    pub end_trim: Option<Duration>,
     /// Video only: colour matrix as signalled by the container (ITU-T H.273 MatrixCoefficients:
     /// 1 BT.709, 5/6 BT.601, 9/10 BT.2020), when present.
     pub color_matrix: Option<u8>,
@@ -173,6 +182,7 @@ impl StreamInfo {
             channels: 0,
             codec_delay: Duration::ZERO,
             seek_preroll: Duration::ZERO,
+            end_trim: None,
             color_matrix: None,
             full_range: None,
         }
@@ -196,27 +206,40 @@ pub trait Demuxer: Send {
     /// Repositions so the next video packet is a keyframe at or before `target`.
     /// Returns that keyframe's timestamp (or the closest position reached).
     fn seek(&mut self, target: Duration) -> Result<Duration>;
+    /// Tags and cover art, when the file has any.
+    fn metadata(&self) -> Option<&Metadata> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContainerFormat {
     Matroska,
     Mp4,
+    /// MPEG audio Layer III frames (optionally after ID3v2 tags).
+    Mp3,
+    /// AAC in ADTS frames (`.aac`).
+    Adts,
+    /// Native FLAC (`fLaC`).
+    Flac,
+    /// RIFF/WAVE.
+    Wav,
+    /// Ogg (Vorbis, Opus or FLAC).
+    Ogg,
 }
 
-/// Detects the container from magic bytes, then rewinds.
+/// Bytes searched for MPEG/ADTS frames after any ID3v2 tags.
+const PROBE_WINDOW: usize = 64 * 1024;
+
+/// Detects the container from its content (never the file name), then rewinds.
 pub fn probe(src: &mut dyn MediaSource) -> Result<Option<ContainerFormat>> {
-    let mut head = [0u8; 12];
-    let mut filled = 0;
-    while filled < head.len() {
-        let n = src.read(&mut head[filled..])?;
-        if n == 0 {
-            break;
-        }
-        filled += n;
-    }
+    let found = probe_content(src);
     src.seek(SeekFrom::Start(0))?;
-    let head = &head[..filled];
+    found
+}
+
+fn probe_content(src: &mut dyn MediaSource) -> Result<Option<ContainerFormat>> {
+    let head = read_at(src, 0, 12)?;
     if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
         return Ok(Some(ContainerFormat::Matroska));
     }
@@ -224,7 +247,48 @@ pub fn probe(src: &mut dyn MediaSource) -> Result<Option<ContainerFormat>> {
     if head.len() >= 8 && matches!(&head[4..8], b"ftyp" | b"moov" | b"styp" | b"wide" | b"mdat" | b"free") {
         return Ok(Some(ContainerFormat::Mp4));
     }
-    Ok(None)
+    if head.starts_with(b"fLaC") {
+        return Ok(Some(ContainerFormat::Flac));
+    }
+    if head.len() >= 12 && head.starts_with(b"RIFF") && &head[8..12] == b"WAVE" {
+        return Ok(Some(ContainerFormat::Wav));
+    }
+    if head.starts_with(b"OggS") {
+        return Ok(Some(ContainerFormat::Ogg));
+    }
+    // MPEG audio or ADTS, after any ID3v2 tags (skipped by their declared size).
+    let mut start = 0u64;
+    for _ in 0..4 {
+        match tags::id3::id3v2_len(&read_at(src, start, 10)?) {
+            Some(len) => start += len,
+            None => break,
+        }
+    }
+    let window = read_at(src, start, PROBE_WINDOW)?;
+    let mp3 = mpeg_audio::find_chain::<mpeg_audio::MpegHeader>(&window, 3, None).map(|(i, _)| i);
+    let adts = mpeg_audio::find_chain::<mpeg_audio::AdtsHeader>(&window, 3, None).map(|(i, _)| i);
+    Ok(match (mp3, adts) {
+        (Some(m), Some(a)) if a < m => Some(ContainerFormat::Adts),
+        (Some(_), _) => Some(ContainerFormat::Mp3),
+        (None, Some(_)) => Some(ContainerFormat::Adts),
+        (None, None) => None,
+    })
+}
+
+/// Up to `len` bytes at `pos`.
+fn read_at(src: &mut dyn MediaSource, pos: u64, len: usize) -> Result<Vec<u8>> {
+    src.seek(SeekFrom::Start(pos))?;
+    let mut buf = vec![0u8; len];
+    let mut filled = 0;
+    while filled < len {
+        let n = src.read(&mut buf[filled..])?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    buf.truncate(filled);
+    Ok(buf)
 }
 
 #[cfg(test)]

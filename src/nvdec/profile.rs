@@ -98,6 +98,7 @@ mod tests {
         let d: Box<dyn Demuxer> = match container {
             ContainerFormat::Mp4 => Box::new(Mp4Demuxer::open(src).unwrap()),
             ContainerFormat::Matroska => Box::new(MatroskaDemuxer::open(src).unwrap()),
+            _ => unreachable!("video fixtures only"),
         };
         super::format(d.streams().iter().find(|s| s.kind == StreamKind::Video).unwrap())
     }
