@@ -181,7 +181,7 @@ impl Demuxer for Mp4Demuxer {
     fn seek(&mut self, target: Duration) -> Result<Duration> {
         let video = self.video_track;
         let is_video_key = |s: &SampleRef| Some(s.stream) == video && s.keyframe;
-        let index = self
+        let key = self
             .samples
             .iter()
             .enumerate()
@@ -190,8 +190,13 @@ impl Demuxer for Mp4Demuxer {
             .or_else(|| self.samples.iter().enumerate().find(|(_, s)| is_video_key(s)))
             .map(|(i, _)| i)
             .unwrap_or(0);
+        // Samples of other tracks with the keyframe's decode time sort before it (by track id).
+        let mut index = key;
+        while index > 0 && self.samples[index - 1].dts == self.samples[key].dts {
+            index -= 1;
+        }
         self.cursor = index;
-        Ok(self.samples.get(index).map(|s| s.pts).unwrap_or_default())
+        Ok(self.samples.get(key).map(|s| s.pts).unwrap_or_default())
     }
 }
 
@@ -513,6 +518,26 @@ mod tests {
         assert_eq!(audio.codec_delay, ticks(1024, 44_100), "same rounding as every MP4 timestamp");
         let video = d.streams().iter().find(|s| s.kind == StreamKind::Video).unwrap();
         assert_eq!(video.codec_delay, Duration::ZERO, "video is unchanged");
+    }
+
+    #[test]
+    fn seek_to_the_start_keeps_audio_stored_before_the_keyframe() {
+        // Audio is track 1, video track 2: at dts 0 the audio packet sorts before the keyframe.
+        let mut d = Mp4Demuxer::open(Box::new(FileSource::open("tests/fixtures/audio_first.mp4").unwrap())).unwrap();
+        let audio = d.streams().iter().find(|s| s.kind == StreamKind::Audio).unwrap().id;
+        let first_audio = |d: &mut Mp4Demuxer| loop {
+            let p = d.next_packet().unwrap().unwrap();
+            if p.stream == audio {
+                break p.pts;
+            }
+        };
+        assert_eq!(first_audio(&mut d), Duration::ZERO);
+        for _ in 0..20 {
+            d.next_packet().unwrap();
+        }
+        let landed = d.seek(Duration::ZERO).unwrap();
+        assert_eq!(landed, Duration::ZERO, "lands on the keyframe");
+        assert_eq!(first_audio(&mut d), Duration::ZERO, "the first audio packet (the padding) survives the seek");
     }
 
     fn open() -> Mp4Demuxer {
