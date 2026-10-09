@@ -11,8 +11,8 @@ use crossbeam_channel::{RecvTimeoutError, Sender};
 use super::locate::FfmpegInfo;
 use super::mkv::{BlockWriter, header};
 use super::process::FfmpegProcess;
-use crate::decode::{AudioBuffer, AudioDecoder};
-use crate::demux::{Packet, StreamInfo};
+use crate::decode::{AudioBuffer, AudioDecoder, DelayTrim};
+use crate::demux::{Codec, Packet, StreamInfo};
 use crate::{Error, Result};
 
 const STALL: Duration = Duration::from_secs(10);
@@ -31,22 +31,36 @@ pub struct FfmpegAudioDecoder {
     emitted: u64,
     ready: VecDeque<Vec<f32>>,
     eof: bool,
+    /// Start-up padding. Every ffmpeg trims Opus's pre-skip itself (even with no CodecDelay);
+    /// for other codecs ffmpeg 6 ignores Matroska's CodecDelay and newer versions honour it, so
+    /// it is not declared to ffmpeg and is trimmed here.
+    trim: DelayTrim,
 }
 
 impl FfmpegAudioDecoder {
     pub fn new(info: Arc<FfmpegInfo>, stream: &StreamInfo) -> Result<Self> {
         header(stream).ok_or(Error::Unsupported("codec cannot be passed to ffmpeg"))?;
+        let rate = if stream.sample_rate > 0 { stream.sample_rate } else { 48_000 };
+        let channels = if stream.channels > 0 { stream.channels } else { 2 };
+        let (rate, channels) = match (&stream.codec, stream.extradata.as_deref()) {
+            (Codec::Aac, Some(asc)) => aac_output(asc, rate, channels),
+            _ => (rate, channels),
+        };
+        let ffmpeg_trims = stream.codec == Codec::Opus;
+        let (declared, trimmed) =
+            if ffmpeg_trims { (stream.codec_delay, Duration::ZERO) } else { (Duration::ZERO, stream.codec_delay) };
         Ok(Self {
             info,
-            stream: stream.clone(),
-            rate: if stream.sample_rate > 0 { stream.sample_rate } else { 48_000 },
-            channels: if stream.channels > 0 { stream.channels } else { 2 },
+            stream: StreamInfo { codec_delay: declared, ..stream.clone() },
+            rate,
+            channels,
             process: None,
             blocks: BlockWriter::default(),
             start: None,
             emitted: 0,
             ready: VecDeque::new(),
             eof: false,
+            trim: DelayTrim::new(trimmed),
         })
     }
 
@@ -59,13 +73,50 @@ impl FfmpegAudioDecoder {
         a
     }
 
-    fn buffer(&mut self, samples: Vec<f32>) -> AudioBuffer {
-        // ffmpeg drops the stream's CodecDelay (we declare it) from the start of every run, so the
-        // first sample it emits is presented at the first packet's time.
+    /// Times ffmpeg's output from the first packet of the run, then trims the start-up padding;
+    /// `None` when all of it was padding.
+    fn buffer(&mut self, samples: Vec<f32>) -> Option<AudioBuffer> {
         let start = self.start.unwrap_or_default();
         let pts = start + Duration::from_secs_f64(self.emitted as f64 / self.rate as f64);
         self.emitted += (samples.len() / self.channels as usize) as u64;
-        AudioBuffer { rate: self.rate, channels: self.channels, samples, pts }
+        self.trim.apply(samples, self.channels, self.rate, pts)
+    }
+
+    /// The next block of ffmpeg's output, waiting for it only after end of stream.
+    fn receive_raw(&mut self) -> Result<Option<Vec<f32>>> {
+        if let Some(s) = self.ready.pop_front() {
+            return Ok(Some(s));
+        }
+        let eof = self.eof;
+        let Some(p) = self.process.as_mut() else { return Ok(None) };
+        if let Some(s) = p.try_recv() {
+            return Ok(Some(s));
+        }
+        if !eof {
+            if p.is_drained() {
+                let err = p.failure("ffmpeg exited during decoding");
+                self.process = None;
+                return Err(err);
+            }
+            return Ok(None);
+        }
+        let started = Instant::now();
+        loop {
+            match p.recv_timeout(Duration::from_millis(50)) {
+                Ok(s) => return Ok(Some(s)),
+                Err(RecvTimeoutError::Disconnected) => {
+                    let err = p.exit_failed().then(|| p.failure("ffmpeg failed"));
+                    self.process = None;
+                    return err.map_or(Ok(None), Err);
+                }
+                Err(RecvTimeoutError::Timeout) if started.elapsed() > STALL => {
+                    let err = p.failure("ffmpeg stalled");
+                    self.process = None;
+                    return Err(err);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        }
     }
 }
 
@@ -75,6 +126,7 @@ impl AudioDecoder for FfmpegAudioDecoder {
             return Ok(());
         }
         self.eof = false;
+        self.trim.on_packet(packet.pts);
         if self.process.is_none() {
             let head = header(&self.stream).expect("checked in new");
             let frame_bytes = self.channels as usize * 4;
@@ -94,37 +146,13 @@ impl AudioDecoder for FfmpegAudioDecoder {
     }
 
     fn receive_samples(&mut self) -> Result<Option<AudioBuffer>> {
-        if let Some(s) = self.ready.pop_front() {
-            return Ok(Some(self.buffer(s)));
-        }
-        let eof = self.eof;
-        let Some(p) = self.process.as_mut() else { return Ok(None) };
-        if let Some(s) = p.try_recv() {
-            return Ok(Some(self.buffer(s)));
-        }
-        if !eof {
-            if p.is_drained() {
-                let err = p.failure("ffmpeg exited during decoding");
-                self.process = None;
-                return Err(err);
-            }
-            return Ok(None);
-        }
-        let started = Instant::now();
         loop {
-            match p.recv_timeout(Duration::from_millis(50)) {
-                Ok(s) => return Ok(Some(self.buffer(s))),
-                Err(RecvTimeoutError::Disconnected) => {
-                    let err = p.exit_failed().then(|| p.failure("ffmpeg failed"));
-                    self.process = None;
-                    return err.map_or(Ok(None), Err);
-                }
-                Err(RecvTimeoutError::Timeout) if started.elapsed() > STALL => {
-                    let err = p.failure("ffmpeg stalled");
-                    self.process = None;
-                    return Err(err);
-                }
-                Err(RecvTimeoutError::Timeout) => {}
+            match self.receive_raw()? {
+                Some(s) => match self.buffer(s) {
+                    Some(b) => return Ok(Some(b)),
+                    None => continue, // padding only
+                },
+                None => return Ok(None),
             }
         }
     }
@@ -143,6 +171,53 @@ impl AudioDecoder for FfmpegAudioDecoder {
         self.start = None;
         self.emitted = 0;
         self.eof = false;
+        self.trim.reset();
+    }
+}
+
+/// AAC's decoded rate and channels from its AudioSpecificConfig (ISO 14496-3 1.6.2.1), which may
+/// differ from the container's: SBR (HE-AAC) doubles the core rate, PS (HE-AACv2) makes mono
+/// stereo. Implicitly signalled SBR/PS is only found in the stream, so a core rate of 24 kHz or
+/// less is assumed to carry them (as decoders do); a stream without them is merely upsampled.
+fn aac_output(asc: &[u8], rate: u32, channels: u16) -> (u32, u16) {
+    const RATES: [u32; 13] = [96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025, 8_000, 7_350];
+    let mut r = Bits { data: asc, pos: 0 };
+    let parsed = (|| {
+        let aot = r.object_type()?;
+        let core = r.frequency(&RATES)?;
+        let config = r.read(4)?;
+        Some(match aot {
+            5 | 29 => (r.frequency(&RATES)?, if aot == 29 && config == 1 { 2 } else { channels }),
+            _ if core <= 24_000 => (core * 2, if config == 1 { 2 } else { channels }),
+            _ => (rate, channels),
+        })
+    })();
+    parsed.unwrap_or((rate, channels))
+}
+
+/// MSB-first bit reader over an AudioSpecificConfig.
+struct Bits<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl Bits<'_> {
+    fn read(&mut self, n: u32) -> Option<u32> {
+        (0..n).try_fold(0, |v, _| {
+            let bit = (self.data.get(self.pos / 8)? >> (7 - self.pos % 8)) & 1;
+            self.pos += 1;
+            Some(v << 1 | bit as u32)
+        })
+    }
+
+    fn object_type(&mut self) -> Option<u32> {
+        let t = self.read(5)?;
+        if t == 31 { Some(32 + self.read(6)?) } else { Some(t) }
+    }
+
+    fn frequency(&mut self, rates: &[u32]) -> Option<u32> {
+        let i = self.read(4)?;
+        if i == 15 { self.read(24) } else { rates.get(i as usize).copied() }
     }
 }
 
@@ -168,5 +243,37 @@ fn read_f32(mut out: ChildStdout, tx: Sender<Vec<f32>>, frame_bytes: usize) {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod aac_tests {
+    use super::aac_output;
+
+    #[test]
+    fn aac_lc_keeps_the_container_rate() {
+        assert_eq!(aac_output(&[0x12, 0x10], 44_100, 2), (44_100, 2)); // AOT 2, 44.1 kHz, stereo
+    }
+
+    #[test]
+    fn explicit_sbr_uses_the_extension_rate() {
+        // AOT 5, core 24 kHz, stereo, extension 48 kHz, then AOT 2.
+        assert_eq!(aac_output(&[0x2B, 0x11, 0x88, 0x00], 24_000, 2), (48_000, 2));
+    }
+
+    #[test]
+    fn explicit_ps_is_stereo() {
+        // AOT 29, core 24 kHz, mono, extension 48 kHz, then AOT 2.
+        assert_eq!(aac_output(&[0xEB, 0x09, 0x88, 0x00], 24_000, 1), (48_000, 2));
+    }
+
+    #[test]
+    fn low_core_rates_assume_implicit_sbr() {
+        assert_eq!(aac_output(&[0x13, 0x88], 22_050, 1), (44_100, 2)); // AOT 2, 22.05 kHz, mono
+    }
+
+    #[test]
+    fn garbage_keeps_the_container_values() {
+        assert_eq!(aac_output(&[], 44_100, 2), (44_100, 2));
     }
 }

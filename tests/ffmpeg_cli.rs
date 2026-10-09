@@ -206,6 +206,49 @@ fn decodes_aac_audio() {
     assert!(peak > 0.08, "silent output ({peak})");
 }
 
+/// The start-up padding is trimmed once, whichever ffmpeg version decodes: Opus (whose CodecDelay
+/// every ffmpeg honours) lines up with ffmpeg decoding the file itself, from the first sample.
+#[test]
+fn opus_padding_is_trimmed_once() {
+    let Some(b) = backend() else { return };
+    let path = fixture_path("opus_only.webm");
+    let mut d = MatroskaDemuxer::open(Box::new(FileSource::open(&path).unwrap())).unwrap();
+    let stream = d.streams().iter().find(|s| s.kind == StreamKind::Audio).unwrap().clone();
+    assert!(!stream.codec_delay.is_zero(), "the fixture has a CodecDelay");
+    let mut dec = b.open_audio_decoder(&stream).unwrap();
+    let (mut first, mut ours) = (None, Vec::new());
+    let mut take = |buf: alhazen_core::decode::AudioBuffer| {
+        first.get_or_insert(buf.pts);
+        ours.extend(buf.samples);
+    };
+    while let Some(p) = d.next_packet().unwrap() {
+        if p.stream == stream.id {
+            dec.send_packet(&p).unwrap();
+            while let Some(buf) = dec.receive_samples().unwrap() {
+                take(buf);
+            }
+        }
+    }
+    dec.send_eof();
+    while let Some(buf) = dec.receive_samples().unwrap() {
+        take(buf);
+    }
+    assert_eq!(first, Some(Duration::ZERO));
+    let out = std::process::Command::new(b.ffmpeg().unwrap().path.as_os_str())
+        .args(["-v", "error", "-i", &path, "-f", "f32le", "-ac", "1", "-ar", "48000", "-"])
+        .output()
+        .unwrap();
+    let reference: Vec<f32> = out.stdout.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+    let error = |off: usize| -> f32 { ours[..4800].iter().zip(&reference[off..]).map(|(a, b)| (a - b).abs()).sum() };
+    let best = (0..1024).min_by(|&a, &b| error(a).total_cmp(&error(b))).unwrap();
+    assert_eq!(best, 0, "our first sample is the reference's sample {best}");
+    let behind = (0..1024).min_by(|&a, &b| {
+        let e = |off: usize| -> f32 { reference[..4800].iter().zip(&ours[off..]).map(|(a, b)| (a - b).abs()).sum() };
+        e(a).total_cmp(&e(b))
+    });
+    assert_eq!(behind, Some(0), "the reference's first sample is ours");
+}
+
 #[test]
 fn h264_aac_plays_to_the_end_in_sync() {
     if backend().is_none() {
