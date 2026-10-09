@@ -196,7 +196,8 @@ fn aac_audio_only_m4a_plays() {
     until("sound", 5, || (peak(&play_ms(&null, 50)) > 0.05).then_some(()));
 }
 
-/// No AAC decoder at all: native decoders only (no `native-aac`, ffmpeg or platform decoders).
+/// No AAC decoder at all: native decoders only, built without `native-aac` (CI's reduced-feature
+/// run), no ffmpeg or platform decoders.
 #[cfg(not(feature = "native-aac"))]
 fn without_ffmpeg() -> PlayerConfig {
     PlayerConfig {

@@ -154,3 +154,26 @@ ffmpeg -v error -y -f concat -safe 0 -i list.txt -c copy vp9_too_wide.webm
 ```
 
 - `vp9_too_wide.webm`: 15 frames 320×240, 15 at 8448×128 (wider than NVDEC's 8192), 15 at 320×240.
+
+## AAC 5.1 (channel order)
+
+```bash
+ffmpeg -v error -y -f lavfi -i "sine=frequency=440:sample_rate=48000" -t 1 -af "pan=5.1|FL=0*c0|FR=0*c0|FC=c0|LFE=0*c0|BL=0*c0|BR=0*c0" -c:a aac -b:a 192k aac_51_center.mp4
+```
+
+- `aac_51_center.mp4`: AAC-LC 5.1, 1 s, the tone only on the centre channel.
+
+## A/V content sync (flash and beep at 1.0 s)
+
+```bash
+ffmpeg -v error -y -f lavfi -i "color=c=black:s=320x240:r=30:d=2,drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill:enable='between(t,1,1.099)'" -f lavfi -i "aevalsrc='0.5*sin(2*PI*1000*t)*between(t,1,1.1)':s=48000:d=2" -c:v libvpx-vp9 -deadline realtime -g 30 -b:v 200k -c:a aac -b:a 96k -shortest sync.mp4
+ffmpeg -v error -y -ss 0.5 -i sync.mp4 -c copy sync_cut.mp4
+ffmpeg -v error -y -i sync.mp4 -c copy sync.mkv
+ffmpeg -v error -y -i sync.mp4 -map 0:a -map 0:v -c copy audio_first.mp4
+```
+
+- A white frame and a 1 kHz beep both start at 1.0 s. `sync.mp4`: audio edit list 1024 (AAC
+  priming), video 0. `sync_cut.mp4`: a stream-copy cut at 0.5 s; both tracks' edit lists skip
+  0.5 s (video 7680/15360, audio 24000/48000), so the flash and beep are at 0.5 s of playback.
+  `sync.mkv`: AAC with Matroska CodecDelay. `audio_first.mp4`: `sync.mp4` with the audio as
+  track 1 and the video as track 2, so at decode time 0 the audio packet comes before the keyframe.

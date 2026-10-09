@@ -26,6 +26,11 @@ mod vp8;
 #[cfg(feature = "native")]
 mod vp9;
 
+#[cfg(any(feature = "native-aac", feature = "ffmpeg-cli", all(windows, feature = "media-foundation")))]
+mod delay;
+#[cfg(any(feature = "native-aac", feature = "ffmpeg-cli", all(windows, feature = "media-foundation")))]
+pub(crate) use delay::DelayTrim;
+
 use std::time::Duration;
 
 #[cfg(feature = "native-aac")]

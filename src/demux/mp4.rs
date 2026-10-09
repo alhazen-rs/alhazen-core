@@ -39,6 +39,9 @@ impl Mp4Demuxer {
 
         let mut streams = Vec::new();
         let mut samples = Vec::new();
+        // The part of a video edit list's skip that re_mp4 doesn't apply (a stream-copy cut): audio
+        // skips it too, and only the audio's skip beyond it is encoder priming.
+        let mut video_unapplied_skip = Duration::ZERO;
         for track in mp4.tracks().values() {
             let kind = match track.kind {
                 Some(re_mp4::TrackKind::Video) => StreamKind::Video,
@@ -50,6 +53,22 @@ impl Mp4Demuxer {
                 .map(|s| Codec::from_mp4_codec_string(&s))
                 .unwrap_or_else(|| Codec::Other("unknown".into()));
             let timescale = track.timescale.max(1);
+            let trak = track.trak(&mp4);
+            let edit_skip = trak.edts.as_ref().and_then(|e| e.elst.as_ref()).and_then(|elst| {
+                leading_skip(elst.entries.iter().map(|e| e.media_time))
+            });
+            if kind == StreamKind::Video
+                && let Some(skip) = edit_skip
+            {
+                let stbl = &trak.mdia.minf.stbl;
+                let stts: Vec<(u32, u32)> = stbl.stts.entries.iter().map(|e| (e.sample_count, e.sample_delta)).collect();
+                let ctts: Vec<(u32, i32)> =
+                    stbl.ctts.iter().flat_map(|c| &c.entries).map(|e| (e.sample_count, e.sample_offset)).collect();
+                let unapplied = skip as i64 - min_composition(&stts, &ctts);
+                if unapplied > 0 {
+                    video_unapplied_skip = video_unapplied_skip.max(ticks(unapplied, timescale));
+                }
+            }
             let mut info = StreamInfo::new(track.track_id, kind, codec);
             info.width = track.width as u32;
             info.height = track.height as u32;
@@ -70,6 +89,12 @@ impl Mp4Demuxer {
                         audio_specific_config(d.profile, d.freq_index, d.chan_conf)
                     })
                 });
+                // Encoder priming (AAC: 1024 frames, HE-AAC: more): the edit list says where the
+                // presentation starts, which is what Matroska calls CodecDelay. Adjusted for the
+                // video's own skip after the loop.
+                if let Some(skip) = edit_skip {
+                    info.codec_delay = ticks(skip as i64, timescale);
+                }
             }
             // re_mp4 only knows a few sample entries; QuickTime ProRes tracks come out as
             // "unknown" with no kind, so read the sample entry's FourCC ourselves.
@@ -128,6 +153,9 @@ impl Mp4Demuxer {
             }
             streams.push(info);
         }
+        for s in streams.iter_mut().filter(|s| s.kind == StreamKind::Audio) {
+            s.codec_delay = s.codec_delay.saturating_sub(video_unapplied_skip);
+        }
         let samples = interleave_by_time(samples);
         let video_track = streams.iter().find(|s| s.kind == StreamKind::Video).map(|s| s.id);
         Ok(Self { src, streams, samples, cursor: 0, video_track })
@@ -153,7 +181,7 @@ impl Demuxer for Mp4Demuxer {
     fn seek(&mut self, target: Duration) -> Result<Duration> {
         let video = self.video_track;
         let is_video_key = |s: &SampleRef| Some(s.stream) == video && s.keyframe;
-        let index = self
+        let key = self
             .samples
             .iter()
             .enumerate()
@@ -162,8 +190,13 @@ impl Demuxer for Mp4Demuxer {
             .or_else(|| self.samples.iter().enumerate().find(|(_, s)| is_video_key(s)))
             .map(|(i, _)| i)
             .unwrap_or(0);
+        // Samples of other tracks with the keyframe's decode time sort before it (by track id).
+        let mut index = key;
+        while index > 0 && self.samples[index - 1].dts == self.samples[key].dts {
+            index -= 1;
+        }
         self.cursor = index;
-        Ok(self.samples.get(index).map(|s| s.pts).unwrap_or_default())
+        Ok(self.samples.get(key).map(|s| s.pts).unwrap_or_default())
     }
 }
 
@@ -370,6 +403,28 @@ fn raw_audio_specific_config(moov: &[u8], track_id: u32) -> Option<Vec<u8>> {
 }
 
 /// The DecSpecificInfo (AudioSpecificConfig) bytes inside an `esds` payload (ISO 14496-1).
+/// The earliest composition (presentation) time among a track's samples, in media ticks, from its
+/// `stts` (sample_count, delta) and `ctts` (sample_count, offset) tables. re_mp4 shifts every
+/// timestamp by this; an edit list's `media_time` beyond it is a skip re_mp4 does not apply.
+fn min_composition(stts: &[(u32, u32)], ctts: &[(u32, i32)]) -> i64 {
+    let offsets = ctts.iter().flat_map(|&(n, o)| std::iter::repeat_n(o as i64, n as usize));
+    let mut dts = 0i64;
+    let decode_times = stts.iter().flat_map(|&(n, d)| std::iter::repeat_n(d as i64, n as usize)).map(move |d| {
+        let t = dts;
+        dts += d;
+        t
+    });
+    let mut offsets = offsets.chain(std::iter::repeat(0));
+    decode_times.map(|t| t + offsets.next().unwrap()).min().unwrap_or(0)
+}
+
+/// The media time the presentation starts at: the first edit-list entry that is not an "empty
+/// edit" (media_time −1, stored as u32::MAX in version 0 or u64::MAX in version 1). `None` for 0
+/// or no such entry.
+fn leading_skip(media_times: impl IntoIterator<Item = u64>) -> Option<u64> {
+    media_times.into_iter().find(|&t| t != u32::MAX as u64 && t != u64::MAX).filter(|&t| t > 0)
+}
+
 fn parse_esds_asc(esds: &[u8]) -> Option<Vec<u8>> {
     parse_esds(esds)?.1
 }
@@ -434,6 +489,56 @@ fn ticks(t: i64, timescale: u64) -> Duration {
 mod tests {
     use super::*;
     use crate::source::FileSource;
+    use std::time::Duration;
+
+    #[test]
+    fn min_composition_is_the_earliest_presented_sample() {
+        // No ctts: presentation = decode order, first sample at 0.
+        assert_eq!(min_composition(&[(10, 512)], &[]), 0);
+        // B-frames (offsets 1024, 2048, 512, ...): earliest presentation is sample 0 at 1024.
+        assert_eq!(min_composition(&[(4, 512)], &[(1, 1024), (1, 2048), (1, 512), (1, 1024)]), 1024);
+        assert_eq!(min_composition(&[], &[]), 0, "no samples");
+    }
+
+    #[test]
+    fn leading_skip_ignores_empty_edits() {
+        assert_eq!(leading_skip([1024]), Some(1024));
+        assert_eq!(leading_skip([u32::MAX as u64, 2048]), Some(2048), "empty edit (v0) then the media");
+        assert_eq!(leading_skip([u64::MAX, 7106]), Some(7106), "empty edit (v1)");
+        assert_eq!(leading_skip([0]), None);
+        assert_eq!(leading_skip([u32::MAX as u64]), None);
+        assert_eq!(leading_skip(Vec::<u64>::new()), None);
+    }
+
+    #[test]
+    fn aac_tracks_report_their_edit_list_skip_as_codec_delay() {
+        // ffmpeg writes elst media_time 1024 (AAC-LC priming) for its AAC tracks.
+        let d = Mp4Demuxer::open(Box::new(FileSource::open("tests/fixtures/h264_aac.mp4").unwrap())).unwrap();
+        let audio = d.streams().iter().find(|s| s.kind == StreamKind::Audio).unwrap();
+        assert_eq!(audio.codec_delay, ticks(1024, 44_100), "same rounding as every MP4 timestamp");
+        let video = d.streams().iter().find(|s| s.kind == StreamKind::Video).unwrap();
+        assert_eq!(video.codec_delay, Duration::ZERO, "video is unchanged");
+    }
+
+    #[test]
+    fn seek_to_the_start_keeps_audio_stored_before_the_keyframe() {
+        // Audio is track 1, video track 2: at dts 0 the audio packet sorts before the keyframe.
+        let mut d = Mp4Demuxer::open(Box::new(FileSource::open("tests/fixtures/audio_first.mp4").unwrap())).unwrap();
+        let audio = d.streams().iter().find(|s| s.kind == StreamKind::Audio).unwrap().id;
+        let first_audio = |d: &mut Mp4Demuxer| loop {
+            let p = d.next_packet().unwrap().unwrap();
+            if p.stream == audio {
+                break p.pts;
+            }
+        };
+        assert_eq!(first_audio(&mut d), Duration::ZERO);
+        for _ in 0..20 {
+            d.next_packet().unwrap();
+        }
+        let landed = d.seek(Duration::ZERO).unwrap();
+        assert_eq!(landed, Duration::ZERO, "lands on the keyframe");
+        assert_eq!(first_audio(&mut d), Duration::ZERO, "the first audio packet (the padding) survives the seek");
+    }
 
     fn open() -> Mp4Demuxer {
         Mp4Demuxer::open(Box::new(FileSource::open("tests/fixtures/av1.mp4").unwrap())).unwrap()
