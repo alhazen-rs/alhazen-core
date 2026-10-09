@@ -153,8 +153,10 @@ impl FlacDemuxer {
     pub fn open(src: Box<dyn MediaSource>) -> Result<Self> {
         let mut w = ReadWindow::new(src);
         let (mut meta, mut covers) = (Metadata::default(), CoverPick::default());
-        // Some tools put an ID3v2 tag in front of FLAC files.
-        let start = read_id3v2_tags(&mut w, &mut meta)?;
+        // Some tools put an ID3v2 tag in front of FLAC files: it only fills what the file's own
+        // tags leave empty (as ffmpeg prefers the native tags).
+        let mut id3 = Metadata::default();
+        let start = read_id3v2_tags(&mut w, &mut id3)?;
         if w.at(start, 4)? != b"fLaC" {
             return Err(Error::UnsupportedContainer);
         }
@@ -187,6 +189,7 @@ impl FlacDemuxer {
             }
         }
         covers.finish(&mut meta);
+        meta.fill_from(id3);
         let info = info.ok_or_else(|| Error::Demux("flac: no STREAMINFO".into()))?;
         let mut s = StreamInfo::new(0, StreamKind::Audio, Codec::Flac);
         s.sample_rate = info.rate;
@@ -311,7 +314,7 @@ impl Demuxer for FlacDemuxer {
         let goal = (target.as_secs_f64() * self.info.rate as f64) as u64;
         // A seek point is trusted only if it lands inside the file.
         let point = self.seektable.iter().rev().find(|(sample, _)| *sample <= goal);
-        let mut at = match point.and_then(|&(_, offset)| self.first_frame.checked_add(offset)).filter(|&at| at < self.end) {
+        let mut at = match point.and_then(|&(_, offset)| self.first_frame.checked_add(offset)).filter(|&at| at < self.end && at < u64::MAX / 2) {
             Some(at) => at,
             None if self.w.is_seekable() && self.end != u64::MAX => self.bisect(goal)?,
             None => self.first_frame,
@@ -436,6 +439,15 @@ mod tests {
         let mut d = FlacDemuxer::open(Box::new(FileSource::open(&path).unwrap())).unwrap();
         d.seek(Duration::from_secs(1)).unwrap();
         assert!(d.next_packet().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_seektable_point_near_the_top_of_u64_with_an_unknown_length() {
+        let mut d = open();
+        d.end = u64::MAX; // a stream of unknown length
+        d.seektable = vec![(0, u64::MAX - 8 - d.first_frame)];
+        d.seek(Duration::from_millis(500)).unwrap();
+        assert!(d.next_packet().unwrap().is_some());
     }
 
     #[test]

@@ -42,7 +42,7 @@ impl ReadWindow {
     /// Up to `len` bytes at `pos`; fewer only at the end of the file.
     pub fn at(&mut self, pos: u64, len: usize) -> Result<&[u8]> {
         let end = self.start + self.buf.len() as u64;
-        let inside = pos >= self.start && pos + len as u64 <= end;
+        let inside = pos >= self.start && pos.saturating_add(len as u64) <= end;
         let continues = pos >= self.start && pos <= end && self.src_pos == Some(end);
         if !inside && !(continues && self.eof) {
             if continues {

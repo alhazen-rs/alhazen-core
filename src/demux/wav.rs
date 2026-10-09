@@ -30,8 +30,10 @@ impl WavDemuxer {
     pub fn open(src: Box<dyn MediaSource>) -> Result<Self> {
         let mut w = ReadWindow::new(src);
         let mut meta = Metadata::default();
-        // Some tools put an ID3v2 tag in front of WAV files.
-        let start = read_id3v2_tags(&mut w, &mut meta)?;
+        // Some tools put an ID3v2 tag in front of WAV files: it only fills what the file's own
+        // tags leave empty.
+        let mut id3 = Metadata::default();
+        let start = read_id3v2_tags(&mut w, &mut id3)?;
         let head = w.at(start, 12)?;
         if head.len() < 12 || &head[..4] != b"RIFF" || &head[8..12] != b"WAVE" {
             return Err(Error::UnsupportedContainer);
@@ -70,6 +72,7 @@ impl WavDemuxer {
             }
             pos = body.saturating_add(size + (size & 1));
         }
+        meta.fill_from(id3);
         let fmt = fmt.ok_or_else(|| Error::Demux("wav: no fmt chunk".into()))?;
         let (data_start, data_end) = data.ok_or_else(|| Error::Demux("wav: no data chunk".into()))?;
         let (codec, channels, rate, block_align) = format(&fmt).ok_or_else(|| Error::Demux("wav: malformed fmt chunk".into()))?;

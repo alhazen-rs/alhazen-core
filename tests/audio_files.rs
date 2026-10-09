@@ -704,6 +704,9 @@ fn chained_ogg_open_does_not_scan_the_whole_file_back() {
     }
     let chained = dir.join("chained.opus");
     std::fs::write(&chained, [std::fs::read(&first).unwrap(), std::fs::read(&second).unwrap()].concat()).unwrap();
+    // A local file may be read back cheaply: the first link keeps its duration.
+    let local = audio(&*open_path(chained.to_str().unwrap())).duration.expect("duration of the first link");
+    assert!(local.abs_diff(Duration::from_secs(2)) < ms(30), "{local:?}");
     let read = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let src = Box::new(NetworkLike {
         file: alhazen_core::source::FileSource::open(&chained).unwrap(),
@@ -751,3 +754,23 @@ fn adts_frames_with_several_aac_blocks_are_refused_clearly() {
     assert!(err.contains("several AAC blocks"), "{err}");
 }
 
+
+#[test]
+fn a_stale_id3_prefix_does_not_override_native_tags() {
+    // An ID3v2.3 tag with only a title, in front of a FLAC file with its own tags and cover.
+    let title = b"\x00Stale ID3";
+    let mut frame = b"TIT2".to_vec();
+    frame.extend((title.len() as u32).to_be_bytes());
+    frame.extend([0, 0]);
+    frame.extend(title);
+    let mut tag = b"ID3\x03\x00\x00".to_vec();
+    tag.extend([0, 0, (frame.len() >> 7) as u8 & 0x7F, frame.len() as u8 & 0x7F]);
+    tag.extend(frame);
+    let bytes = [&tag[..], &std::fs::read(fixture("flac_tagged.flac")).unwrap()[..]].concat();
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("stale_id3.flac");
+    std::fs::write(&path, bytes).unwrap();
+    let d = open_path(path.to_str().unwrap());
+    let m = d.metadata().unwrap();
+    assert_eq!(m.title.as_deref(), Some("Test Title"), "the file's own Vorbis comment wins");
+    assert!(m.cover.is_some());
+}

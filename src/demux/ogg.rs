@@ -151,9 +151,9 @@ fn last_granule(w: &mut ReadWindow, serial: u32, end: u64) -> Result<Option<u64>
             }
             i += off + 1;
         }
-        // Give up after 1 MiB: a tail of another stream (chained Ogg) would otherwise be read
-        // all the way back, a request per step over HTTP. The duration is then unknown.
-        if found.is_some() || from == 0 || end - from >= MAX_TAIL_SCAN {
+        // Over a network, give up after 1 MiB: a tail of another stream (chained Ogg) would
+        // otherwise be read all the way back, a request per step. The duration is then unknown.
+        if found.is_some() || from == 0 || (!w.is_local() && end - from >= MAX_TAIL_SCAN) {
             return Ok(found);
         }
         from = from.saturating_sub(SEARCH as u64 - 64);
