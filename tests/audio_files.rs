@@ -713,3 +713,20 @@ fn flac_and_wav_after_an_id3_tag_are_detected_and_play() {
         assert_eq!(decode(&mut *d, &s, |_| false).samples, decode_all(name).1.samples, "{name}");
     }
 }
+
+#[test]
+fn adts_frames_with_several_aac_blocks_are_refused_clearly() {
+    // AAC-LC 44.1 kHz stereo frames of 200 bytes, each claiming two raw data blocks.
+    let mut frame = vec![0xFF, 0xF1, 0x50, 0x80, (200 >> 3) as u8, ((200 & 7) << 5) as u8 | 0x1F, 0xFC | 1];
+    frame.resize(200, 0);
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("two_blocks.aac");
+    std::fs::write(&path, frame.repeat(5)).unwrap();
+    let source = Source::parse(path.to_str().unwrap()).unwrap();
+    let mut src = source.open().unwrap();
+    let format = alhazen_core::demux::probe(src.as_mut()).unwrap().unwrap();
+    let err = match Registry::empty_with_native().open_demuxer(&source, format, src, None) {
+        Ok(_) => panic!("opened"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("several AAC blocks"), "{err}");
+}
