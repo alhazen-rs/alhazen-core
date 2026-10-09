@@ -510,3 +510,21 @@ fn files_without_tags_have_no_metadata() {
         assert_eq!(open(name).metadata(), None, "{name}");
     }
 }
+
+#[test]
+fn every_reader_survives_edge_seeks() {
+    for name in ["wav_s16.wav", "flac.flac", "mp3_cbr.mp3", "mp3_no_xing.mp3", "aac.aac", "vorbis.ogg", "opus.opus", "flac.oga"] {
+        let mut d = open(name);
+        let duration = audio(&*d).duration.unwrap_or_else(|| panic!("{name}: duration"));
+        for t in [Duration::ZERO, duration, duration + Duration::from_secs(5), ms(1)] {
+            d.seek(t).unwrap_or_else(|e| panic!("{name}: seek to {t:?}: {e}"));
+            let mut last = None;
+            while let Some(p) = d.next_packet().unwrap() {
+                assert!(last.is_none_or(|l| p.pts >= l), "{name}: pts went back after seeking to {t:?}");
+                last = Some(p.pts);
+            }
+        }
+        d.seek(Duration::ZERO).unwrap();
+        assert_eq!(d.next_packet().unwrap().expect("audio after seeking to 0").pts, Duration::ZERO, "{name}");
+    }
+}
