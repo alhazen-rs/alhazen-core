@@ -40,7 +40,7 @@ pub use mp4::Mp4Demuxer;
 #[cfg(feature = "native")]
 pub use ogg::OggDemuxer;
 #[cfg(feature = "native")]
-pub use ts::TsDemuxer;
+pub use ts::{TsDemuxer, VideoParams};
 #[cfg(feature = "hls")]
 pub(crate) use ts::is_ts as ts_is_ts;
 #[cfg(feature = "native")]

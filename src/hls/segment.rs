@@ -76,9 +76,14 @@ impl SegmentDemuxer {
     /// `init`: the fMP4 initialization section (`EXT-X-MAP`); `ts_reference`: the previous TS
     /// segment's last timestamp, for unwrapping.
     pub fn open(data: Vec<u8>, init: Option<&[u8]>, ts_reference: Option<u64>) -> Result<Self> {
+        Self::open_with(data, init, ts_reference, None)
+    }
+
+    /// `params`: the previous TS segment's video parameter sets.
+    pub fn open_with(data: Vec<u8>, init: Option<&[u8]>, ts_reference: Option<u64>, params: Option<demux::VideoParams>) -> Result<Self> {
         let format = detect(&data).or_else(|| init.map(|_| SegmentFormat::Fmp4));
         let (inner, offset) = match format {
-            Some(SegmentFormat::Ts) => (Inner::Ts(Box::new(demux::TsDemuxer::open_segment(data, ts_reference)?)), Duration::ZERO),
+            Some(SegmentFormat::Ts) => (Inner::Ts(Box::new(demux::TsDemuxer::open_segment_with(data, ts_reference, params)?)), Duration::ZERO),
             Some(SegmentFormat::Fmp4) => {
                 let bytes = match init {
                     Some(init) => [init, &data].concat(),
@@ -153,6 +158,14 @@ impl SegmentDemuxer {
     /// A stream whose format changed with the packet just returned.
     pub fn take_update(&mut self) -> Option<StreamInfo> {
         self.update.take()
+    }
+
+    /// TS only: the video parameter sets, for the next segment.
+    pub fn ts_video_params(&self) -> Option<demux::VideoParams> {
+        match &self.inner {
+            Inner::Ts(d) => d.video_params(),
+            Inner::Other(_) => None,
+        }
     }
 
     /// TS only: the highest timestamp seen, to unwrap the next segment's.

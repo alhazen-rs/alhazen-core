@@ -75,6 +75,16 @@ impl Pid {
     }
 }
 
+/// A video stream's parameter sets, carried from one HLS segment to the next (a segment need not
+/// repeat them).
+#[derive(Clone, Debug)]
+pub struct VideoParams {
+    hevc: bool,
+    vps: Option<Vec<u8>>,
+    sps: Vec<u8>,
+    pps: Vec<u8>,
+}
+
 /// A demuxed packet with its timestamp still in unwrapped 90 kHz ticks.
 struct Raw {
     stream: u32,
@@ -103,6 +113,8 @@ pub struct TsDemuxer {
     zero: Option<u64>,
     file: bool,
     ended: bool,
+    /// Parameter sets from the previous segment, for video streams that have none yet.
+    seed: Option<VideoParams>,
     /// Tests: the furthest byte read.
     #[cfg(test)]
     furthest: u64,
@@ -111,7 +123,7 @@ pub struct TsDemuxer {
 impl TsDemuxer {
     /// A `.ts`/`.m2ts` file: timestamps start at 0; duration and seeking from the file.
     pub fn open(src: Box<dyn MediaSource>) -> Result<Self> {
-        let mut d = Self::new(ReadWindow::new(src), true, None)?;
+        let mut d = Self::new(ReadWindow::new(src), true, None, None)?;
         d.zero = d.out.iter().map(|r| r.ticks).min().or(d.last_raw);
         if let Some(duration) = d.file_duration()? {
             for s in &mut d.streams {
@@ -124,7 +136,19 @@ impl TsDemuxer {
     /// An HLS segment in memory. Timestamps stay raw (unwrapped 90 kHz ticks as `Duration`),
     /// unwrapped near `reference` (the previous segment's [`last_raw_pts`](Self::last_raw_pts)).
     pub fn open_segment(data: Vec<u8>, reference: Option<u64>) -> Result<Self> {
-        Self::new(ReadWindow::new(Box::new(MemorySource::new(data, "TS segment"))), false, reference)
+        Self::open_segment_with(data, reference, None)
+    }
+
+    /// Like `open_segment`, with the previous segment's video parameter sets
+    /// ([`video_params`](Self::video_params)) for a segment that does not repeat them.
+    pub fn open_segment_with(data: Vec<u8>, reference: Option<u64>, params: Option<VideoParams>) -> Result<Self> {
+        Self::new(ReadWindow::new(Box::new(MemorySource::new(data, "TS segment"))), false, reference, params)
+    }
+
+    /// The first video stream's latest parameter sets.
+    pub fn video_params(&self) -> Option<VideoParams> {
+        let (_, p) = self.pids.iter().filter(|(_, p)| p.es.is_video()).min_by_key(|(pid, _)| **pid)?;
+        Some(VideoParams { hevc: p.es == Es::Hevc, vps: p.vps.clone(), sps: p.sps.clone()?, pps: p.pps.clone()? })
     }
 
     /// The highest timestamp seen (unwrapped ticks), to continue unwrapping in the next segment.
@@ -132,7 +156,7 @@ impl TsDemuxer {
         self.last_raw
     }
 
-    fn new(mut w: ReadWindow, file: bool, reference: Option<u64>) -> Result<Self> {
+    fn new(mut w: ReadWindow, file: bool, reference: Option<u64>, seed: Option<VideoParams>) -> Result<Self> {
         let head = w.at(0, 4 + 3 * 192)?.to_vec();
         let packet_size = packet_size(&head).ok_or_else(|| Error::Demux("not an MPEG transport stream".into()))?;
         let mut d = Self {
@@ -150,6 +174,7 @@ impl TsDemuxer {
             zero: None,
             file,
             ended: false,
+            seed,
             #[cfg(test)]
             furthest: 0,
         };
@@ -304,7 +329,11 @@ impl TsDemuxer {
             };
             // One video and one audio stream of each kind is plenty; keep all, the player picks.
             if let Some(es) = es {
-                self.pids.insert(pid, Pid::new(es));
+                let mut p = Pid::new(es);
+                if let Some(seed) = self.seed.take_if(|s| es.is_video() && s.hevc == (es == Es::Hevc)) {
+                    (p.vps, p.sps, p.pps) = (seed.vps, Some(seed.sps), Some(seed.pps));
+                }
+                self.pids.insert(pid, p);
             }
             i += 5 + es_len;
         }
@@ -912,5 +941,26 @@ mod tests {
         assert!(d.furthest < len * 9 / 10, "read up to {} of {len} bytes", d.furthest);
         let first = d.next_packet().unwrap().unwrap();
         assert!(first.keyframe && first.pts == Duration::ZERO);
+    }
+
+    #[test]
+    fn parameter_sets_carry_over_to_a_segment_without_them() {
+        let sps = [0x67, 0x64, 0x00, 0x0d, 0xac, 0xd9, 0x41, 0x41, 0xfe, 0xab, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x03, 0x20, 0xf1, 0x42, 0x99, 0x60];
+        let pps = [0x68, 0xeb, 0xe3, 0xcb, 0x22, 0xc0];
+        let mut cc = 0;
+        let mut first = psi(&[(0x1B, 0x100)]);
+        let es = [&[0, 0, 0, 1][..], &sps, &[0, 0, 1], &pps, &[0, 0, 1, 0x65, 0x88, 0x80]].concat();
+        first.extend(packetize(0x100, &mut cc, &pes(0xE0, 3000, &es, false)));
+        let a = segment(first);
+        let params = a.video_params();
+        assert!(params.is_some());
+        // The next segment repeats no SPS/PPS (RFC 8216 only says it SHOULD).
+        let mut cc = 0;
+        let mut second = psi(&[(0x1B, 0x100)]);
+        second.extend(packetize(0x100, &mut cc, &pes(0xE0, 93000, &[0, 0, 0, 1, 0x65, 0x88, 0x84], false)));
+        let mut b = TsDemuxer::open_segment_with(second, a.last_raw_pts(), params).unwrap();
+        assert_eq!((b.streams()[0].width, b.streams()[0].height), (318, 238));
+        let p = b.next_packet().unwrap().unwrap();
+        assert!(p.keyframe);
     }
 }

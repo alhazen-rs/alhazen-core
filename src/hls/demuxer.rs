@@ -131,6 +131,8 @@ struct Lane {
     formats: HashMap<StreamKind, Arc<StreamInfo>>,
     /// TS timestamp unwrapping reference, and the discontinuity sequence it belongs to.
     ts_ref: Option<(u64, u64)>,
+    /// TS video parameter sets of the last segment, and its discontinuity sequence.
+    ts_params: Option<(crate::demux::VideoParams, u64)>,
     ended: bool,
     /// Seeks sent to the track: older segments are dropped.
     epoch: u64,
@@ -148,7 +150,7 @@ struct Lane {
 
 impl Lane {
     fn new(role: Role, track: Track, use_audio: bool) -> Self {
-        Self { role, track, seg: None, pending: None, formats: HashMap::new(), ts_ref: None, ended: false, epoch: 0, use_audio, wait_key: false, skip_before: None, jump_by_peer: false, jumped: false }
+        Self { role, track, seg: None, pending: None, formats: HashMap::new(), ts_ref: None, ts_params: None, ended: false, epoch: 0, use_audio, wait_key: false, skip_before: None, jump_by_peer: false, jumped: false }
     }
 }
 
@@ -409,6 +411,9 @@ impl HlsDemuxer {
                     if let Some(r) = open.demux.ts_last_raw() {
                         lane.ts_ref = Some((r, open.disc));
                     }
+                    if let Some(p) = open.demux.ts_video_params() {
+                        lane.ts_params = Some((p, open.disc));
+                    }
                     lane.seg = None;
                     continue;
                 };
@@ -472,7 +477,8 @@ impl HlsDemuxer {
             let raw = s.start.as_nanos() as i128 - offset;
             (raw >= 0).then(|| (raw * 90_000 / 1_000_000_000) as u64)
         });
-        let mut demux = match SegmentDemuxer::open(s.data, s.init.as_deref().map(Vec::as_slice), reference) {
+        let params = lane.ts_params.clone().filter(|(_, disc)| *disc == s.discontinuity_seq).map(|(p, _)| p);
+        let mut demux = match SegmentDemuxer::open_with(s.data, s.init.as_deref().map(Vec::as_slice), reference, params) {
             Ok(d) => d,
             Err(e) if lane.track.is_live() => {
                 log::warn!("HLS: skipping segment {}: {e}", s.seq);
