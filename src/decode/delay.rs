@@ -17,10 +17,11 @@ impl DelayTrim {
         Self { delay: codec_delay, skip: None, armed: true }
     }
 
-    /// Call with each packet's pts before its samples: the stream start (pts 0, also when seeking
-    /// back to it) re-arms the trim.
+    /// Call with each packet's pts before its samples: seeking back to the stream start (pts 0
+    /// after a [`reset`](Self::reset)) re-arms the trim. Further pts-0 packets (laced frames of the
+    /// first block) do not.
     pub fn on_packet(&mut self, pts: Duration) {
-        if pts.is_zero() {
+        if pts.is_zero() && !self.armed {
             self.armed = true;
             self.skip = None;
         }
@@ -87,6 +88,18 @@ mod tests {
         t.on_packet(MS(0)); // seek back to the start: padding again
         let b = t.apply(buf(100, 1), 1, 1000, MS(0)).unwrap();
         assert_eq!((b.frames(), b.pts), (90, MS(0)));
+    }
+
+    #[test]
+    fn repeated_pts_zero_packets_trim_once() {
+        // Laced Matroska frames without DefaultDuration all carry the block's pts (0).
+        let mut t = DelayTrim::new(MS(10));
+        t.on_packet(MS(0));
+        let b = t.apply(buf(100, 1), 1, 1000, MS(0)).unwrap();
+        assert_eq!(b.frames(), 90);
+        t.on_packet(MS(0));
+        let b = t.apply(buf(100, 1), 1, 1000, MS(0)).unwrap();
+        assert_eq!(b.frames(), 100, "the second frame of the block is not padding");
     }
 
     #[test]
