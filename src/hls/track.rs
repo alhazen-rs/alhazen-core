@@ -39,9 +39,10 @@ pub(crate) struct TrackConfig {
 #[derive(Debug)]
 pub(crate) enum TrackEvent {
     Segment(SegmentData),
-    /// The playlist ended (VOD end, or a live stream that stopped).
-    End,
-    Failed(Error),
+    /// The playlist ended (VOD end, or a live stream that stopped). Carries the seek epoch it
+    /// belongs to, like segments: an end reached before a seek is stale after it.
+    End(u64),
+    Failed(Error, u64),
 }
 
 pub(crate) struct SegmentData {
@@ -126,8 +127,13 @@ impl Track {
     }
 
     /// The next event, or `None` after `timeout` (or once the thread has stopped).
+    /// A fetch thread that stopped without a final event (it panicked) is reported as a failure.
     pub fn recv(&self, timeout: Duration) -> Option<TrackEvent> {
-        self.events.recv_timeout(timeout).ok()
+        match self.events.recv_timeout(timeout) {
+            Ok(e) => Some(e),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => Some(TrackEvent::Failed(Error::Http("the HLS download thread stopped".into()), u64::MAX)),
+        }
     }
 
     /// Restarts fetching at the segment holding `t` (VOD); events after it carry a new epoch.
@@ -302,6 +308,22 @@ impl Worker {
         }
     }
 
+    /// Sends a last event (`End`, `Failed`): unlike `send`, a waiting command does not make it
+    /// give up, or the reader would wait for an event that never comes.
+    fn send_final(&mut self, e: TrackEvent) -> bool {
+        let mut e = e;
+        loop {
+            if self.stopped() {
+                return false;
+            }
+            match self.events.send_timeout(e, POLL) {
+                Ok(()) => return true,
+                Err(SendTimeoutError::Timeout(back)) => e = back,
+                Err(SendTimeoutError::Disconnected(_)) => return false,
+            }
+        }
+    }
+
     /// Waits up to `d` for a command (handled) or cancellation.
     fn idle(&mut self, d: Duration) {
         match self.commands.recv_timeout(d.min(POLL)) {
@@ -315,7 +337,7 @@ impl Worker {
         let p = match self.playlist(self.variant) {
             Ok(p) => p,
             Err(e) => {
-                let _ = self.send(TrackEvent::Failed(e));
+                let _ = self.send_final(TrackEvent::Failed(e, self.epoch));
                 return Flow::Stop;
             }
         };
@@ -340,8 +362,8 @@ impl Worker {
         }
         if !self.live || p.ended {
             // The end: wait for a seek (or for the track to be dropped).
-            if !self.send(TrackEvent::End) {
-                return Flow::Continue;
+            if !self.send_final(TrackEvent::End(self.epoch)) {
+                return Flow::Stop;
             }
             while !self.stopped() {
                 let epoch = self.epoch;
@@ -388,7 +410,7 @@ impl Worker {
         }
         if self.last_change.elapsed() > target * LIVE_STALL_TARGETS {
             log::info!("HLS: the live playlist stopped updating; treating the stream as ended");
-            if self.send(TrackEvent::End) {
+            if self.send_final(TrackEvent::End(self.epoch)) {
                 while !self.stopped() {
                     self.idle(POLL);
                 }
@@ -429,7 +451,7 @@ impl Worker {
                 Flow::Continue
             }
             Err(e) => {
-                let _ = self.send(TrackEvent::Failed(e));
+                let _ = self.send_final(TrackEvent::Failed(e, self.epoch));
                 Flow::Stop
             }
         }
@@ -530,7 +552,7 @@ mod tests {
         assert_eq!(segs[1].data, std::fs::read(root().join("fmp4/seg1.m4s")).unwrap());
         assert_eq!(**segs[0].init.as_ref().unwrap(), std::fs::read(root().join("fmp4/init.mp4")).unwrap());
         assert!(segs[0].bytes > 0);
-        assert!(matches!(events.last(), Some(TrackEvent::End)));
+        assert!(matches!(events.last(), Some(TrackEvent::End(_))));
         assert_eq!(server.hits("fmp4/init.mp4"), 1, "the init section is fetched once");
     }
 
@@ -561,7 +583,7 @@ mod tests {
         let events = collect(&track, Duration::from_secs(15));
         assert_eq!(segments(&events).len(), 2);
         match events.last() {
-            Some(TrackEvent::Failed(Error::Http(m))) => assert!(m.contains("404") && m.contains("seg2.ts"), "{m}"),
+            Some(TrackEvent::Failed(Error::Http(m), _)) => assert!(m.contains("404") && m.contains("seg2.ts"), "{m}"),
             other => panic!("{other:?}"),
         }
         assert_eq!(server.hits("ts/seg2.ts"), 2, "a 404 is retried once");
@@ -585,7 +607,7 @@ mod tests {
         let segs = segments(&events);
         assert_eq!(segs.iter().map(|s| s.seq).collect::<Vec<_>>(), [0, 1, 2, 3, 4, 5], "joined 3 target durations back, then followed: {events:?}");
         assert_eq!(segs[3].start, Duration::from_secs(3), "live time counts from the first segment played");
-        assert!(matches!(events.last(), Some(TrackEvent::End)), "{:?}", events.last());
+        assert!(matches!(events.last(), Some(TrackEvent::End(_))), "{:?}", events.last());
         let took = started.elapsed();
         assert!(took >= Duration::from_secs(5) && took < Duration::from_secs(12), "{took:?}");
     }
@@ -633,5 +655,27 @@ mod tests {
         assert_eq!(seqs.windows(2).filter(|w| w[1] != w[0] + 1).count(), 0, "no gap or repeat: {seqs:?}");
         assert_eq!(segs.last().unwrap().variant, 1);
         assert_eq!(segs.last().unwrap().seq, 5);
+    }
+
+    #[test]
+    fn a_failure_is_reported_even_when_a_command_is_waiting() {
+        let server = Server::dir(root());
+        server.fail("ts/seg3.ts", 404, usize::MAX);
+        let track = start(&server, "ts/index.m3u8", Start::At(Duration::ZERO)).unwrap();
+        // Nobody reads: segments 0-2 fill the channel, segment 3 fails and its Failed waits.
+        std::thread::sleep(Duration::from_millis(2500));
+        track.seek(Duration::from_secs(5)); // a command arrives while the Failed is waiting
+        std::thread::sleep(Duration::from_millis(200));
+        let events = collect(&track, Duration::from_secs(10));
+        assert!(matches!(events.last(), Some(TrackEvent::Failed(..))), "{events:?}");
+    }
+
+    #[test]
+    fn a_stopped_fetch_thread_is_reported_not_waited_for() {
+        let server = Server::dir(root());
+        let track = start(&server, "ts/index.m3u8", Start::At(Duration::ZERO)).unwrap();
+        track.cancel.store(true, std::sync::atomic::Ordering::Relaxed); // the thread exits
+        let events = collect(&track, Duration::from_secs(5));
+        assert!(matches!(events.last(), Some(TrackEvent::Failed(..) | TrackEvent::End(_))), "{events:?}");
     }
 }

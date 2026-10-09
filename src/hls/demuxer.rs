@@ -418,8 +418,10 @@ impl HlsDemuxer {
                     }
                     Self::open_segment(lane, timeline, s)?
                 }
-                Some(TrackEvent::End) => lane.ended = true,
-                Some(TrackEvent::Failed(e)) => return Err(e),
+                Some(TrackEvent::End(epoch)) if epoch < lane.epoch => {}
+                Some(TrackEvent::End(_)) => lane.ended = true,
+                Some(TrackEvent::Failed(_, epoch)) if epoch < lane.epoch => {}
+                Some(TrackEvent::Failed(e, _)) => return Err(e),
             }
         }
         Ok(())

@@ -335,3 +335,15 @@ fn switching_audio_rendition_keeps_playing() {
     assert_eq!(player.state(), PlayerState::Ended, "{:?}", player.debug_snapshot());
     assert!(audio.hits("multi/audio/seg5.ts") >= 2, "the second rendition was fetched too");
 }
+
+#[test]
+fn seeking_back_after_everything_was_downloaded_plays_again() {
+    let server = Server::dir(root());
+    let mut d = demux(&server.url("fmp4/index.m3u8"));
+    // Two segments: both, and the end of the playlist, are downloaded and waiting.
+    std::thread::sleep(Duration::from_millis(1500));
+    d.seek(Duration::ZERO).unwrap();
+    let streams = d.streams().to_vec();
+    let (_, _, vn) = span(&streams, &all(&mut d), StreamKind::Video);
+    assert_eq!(vn, 100, "a stale end-of-playlist from before the seek does not end playback");
+}

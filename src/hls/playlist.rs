@@ -7,6 +7,10 @@ use url::Url;
 
 use crate::{Error, Result};
 
+/// Longer target or segment durations are treated as malformed (and keep all time arithmetic
+/// far from overflow).
+const MAX_DURATION: Duration = Duration::from_secs(24 * 3600);
+
 #[derive(Clone, Debug)]
 pub enum Playlist {
     Master(MasterPlaylist),
@@ -182,7 +186,9 @@ pub fn parse(text: &str, base: &Url) -> Result<Playlist> {
                 }
                 "EXT-X-TARGETDURATION" => {
                     let secs: u64 = value.trim().parse().map_err(|_| err(n, "bad EXT-X-TARGETDURATION"))?;
-                    media.target_duration = Duration::from_secs(secs);
+                    media.target_duration = Some(Duration::from_secs(secs.min(u64::MAX / 2)))
+                        .filter(|d| *d <= MAX_DURATION)
+                        .ok_or_else(|| err(n, "EXT-X-TARGETDURATION too large"))?;
                 }
                 "EXT-X-MEDIA-SEQUENCE" => {
                     media.media_sequence = value.trim().parse().map_err(|_| err(n, "bad EXT-X-MEDIA-SEQUENCE"))?;
@@ -202,10 +208,8 @@ pub fn parse(text: &str, base: &Url) -> Result<Playlist> {
                 "EXTINF" => {
                     let secs = value.split(',').next().unwrap_or("").trim();
                     let secs: f64 = secs.parse().map_err(|_| err(n, "bad EXTINF duration"))?;
-                    if !secs.is_finite() || secs < 0.0 {
-                        return Err(err(n, "bad EXTINF duration"));
-                    }
-                    duration = Some(Duration::from_secs_f64(secs));
+                    let d = Duration::try_from_secs_f64(secs).ok().filter(|d| *d <= MAX_DURATION);
+                    duration = Some(d.ok_or_else(|| err(n, "bad EXTINF duration"))?);
                 }
                 "EXT-X-BYTERANGE" => range = Some(parse_range(value).ok_or_else(|| err(n, "bad EXT-X-BYTERANGE"))?),
                 "EXT-X-DISCONTINUITY" => discontinuity += 1,
@@ -415,6 +419,17 @@ mod tests {
         match parse(bad, &base()) {
             Err(Error::InvalidSource(m)) => assert!(m.contains("line 3"), "{m}"),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn absurd_durations_are_errors_not_panics() {
+        for text in [
+            "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:1e300,\na.ts\n",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:18446744073709551615\n#EXTINF:2,\na.ts\n",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:100000,\na.ts\n",
+        ] {
+            assert!(matches!(parse(text, &base()), Err(Error::InvalidSource(_))), "{text:?}");
         }
     }
 }
