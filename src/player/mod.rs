@@ -546,6 +546,15 @@ impl Player {
     }
 
     /// Tags and cover art (title, artist, album, …), when the file has any.
+    ///
+    /// ```no_run
+    /// # use alhazen_core::{Player, PlayerConfig, Source};
+    /// let player = Player::open(Source::parse("song.mp3")?, PlayerConfig::default())?;
+    /// if let Some(m) = player.metadata() {
+    ///     println!("{} — {}", m.artist.as_deref().unwrap_or("?"), m.title.as_deref().unwrap_or("?"));
+    /// }
+    /// # Ok::<(), alhazen_core::Error>(())
+    /// ```
     pub fn metadata(&self) -> Option<Metadata> {
         self.metadata.clone()
     }
