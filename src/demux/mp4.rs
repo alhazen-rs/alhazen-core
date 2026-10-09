@@ -39,6 +39,9 @@ impl Mp4Demuxer {
 
         let mut streams = Vec::new();
         let mut samples = Vec::new();
+        // The part of a video edit list's skip that re_mp4 doesn't apply (a stream-copy cut): audio
+        // skips it too, and only the audio's skip beyond it is encoder priming.
+        let mut video_unapplied_skip = Duration::ZERO;
         for track in mp4.tracks().values() {
             let kind = match track.kind {
                 Some(re_mp4::TrackKind::Video) => StreamKind::Video,
@@ -50,6 +53,22 @@ impl Mp4Demuxer {
                 .map(|s| Codec::from_mp4_codec_string(&s))
                 .unwrap_or_else(|| Codec::Other("unknown".into()));
             let timescale = track.timescale.max(1);
+            let trak = track.trak(&mp4);
+            let edit_skip = trak.edts.as_ref().and_then(|e| e.elst.as_ref()).and_then(|elst| {
+                leading_skip(elst.entries.iter().map(|e| e.media_time))
+            });
+            if kind == StreamKind::Video
+                && let Some(skip) = edit_skip
+            {
+                let stbl = &trak.mdia.minf.stbl;
+                let stts: Vec<(u32, u32)> = stbl.stts.entries.iter().map(|e| (e.sample_count, e.sample_delta)).collect();
+                let ctts: Vec<(u32, i32)> =
+                    stbl.ctts.iter().flat_map(|c| &c.entries).map(|e| (e.sample_count, e.sample_offset)).collect();
+                let unapplied = skip as i64 - min_composition(&stts, &ctts);
+                if unapplied > 0 {
+                    video_unapplied_skip = video_unapplied_skip.max(ticks(unapplied, timescale));
+                }
+            }
             let mut info = StreamInfo::new(track.track_id, kind, codec);
             info.width = track.width as u32;
             info.height = track.height as u32;
@@ -71,12 +90,9 @@ impl Mp4Demuxer {
                     })
                 });
                 // Encoder priming (AAC: 1024 frames, HE-AAC: more): the edit list says where the
-                // presentation starts, which is what Matroska calls CodecDelay.
-                let trak = track.trak(&mp4);
-                let skip = trak.edts.as_ref().and_then(|e| e.elst.as_ref()).and_then(|elst| {
-                    leading_skip(elst.entries.iter().map(|e| e.media_time))
-                });
-                if let Some(skip) = skip {
+                // presentation starts, which is what Matroska calls CodecDelay. Adjusted for the
+                // video's own skip after the loop.
+                if let Some(skip) = edit_skip {
                     info.codec_delay = ticks(skip as i64, timescale);
                 }
             }
@@ -136,6 +152,9 @@ impl Mp4Demuxer {
                 _ => samples.extend(track_samples),
             }
             streams.push(info);
+        }
+        for s in streams.iter_mut().filter(|s| s.kind == StreamKind::Audio) {
+            s.codec_delay = s.codec_delay.saturating_sub(video_unapplied_skip);
         }
         let samples = interleave_by_time(samples);
         let video_track = streams.iter().find(|s| s.kind == StreamKind::Video).map(|s| s.id);
@@ -379,6 +398,21 @@ fn raw_audio_specific_config(moov: &[u8], track_id: u32) -> Option<Vec<u8>> {
 }
 
 /// The DecSpecificInfo (AudioSpecificConfig) bytes inside an `esds` payload (ISO 14496-1).
+/// The earliest composition (presentation) time among a track's samples, in media ticks, from its
+/// `stts` (sample_count, delta) and `ctts` (sample_count, offset) tables. re_mp4 shifts every
+/// timestamp by this; an edit list's `media_time` beyond it is a skip re_mp4 does not apply.
+fn min_composition(stts: &[(u32, u32)], ctts: &[(u32, i32)]) -> i64 {
+    let offsets = ctts.iter().flat_map(|&(n, o)| std::iter::repeat_n(o as i64, n as usize));
+    let mut dts = 0i64;
+    let decode_times = stts.iter().flat_map(|&(n, d)| std::iter::repeat_n(d as i64, n as usize)).map(move |d| {
+        let t = dts;
+        dts += d;
+        t
+    });
+    let mut offsets = offsets.chain(std::iter::repeat(0));
+    decode_times.map(|t| t + offsets.next().unwrap()).min().unwrap_or(0)
+}
+
 /// The media time the presentation starts at: the first edit-list entry that is not an "empty
 /// edit" (media_time −1, stored as u32::MAX in version 0 or u64::MAX in version 1). `None` for 0
 /// or no such entry.
@@ -451,6 +485,15 @@ mod tests {
     use super::*;
     use crate::source::FileSource;
     use std::time::Duration;
+
+    #[test]
+    fn min_composition_is_the_earliest_presented_sample() {
+        // No ctts: presentation = decode order, first sample at 0.
+        assert_eq!(min_composition(&[(10, 512)], &[]), 0);
+        // B-frames (offsets 1024, 2048, 512, ...): earliest presentation is sample 0 at 1024.
+        assert_eq!(min_composition(&[(4, 512)], &[(1, 1024), (1, 2048), (1, 512), (1, 1024)]), 1024);
+        assert_eq!(min_composition(&[], &[]), 0, "no samples");
+    }
 
     #[test]
     fn leading_skip_ignores_empty_edits() {

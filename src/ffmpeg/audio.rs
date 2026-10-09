@@ -60,8 +60,9 @@ impl FfmpegAudioDecoder {
     }
 
     fn buffer(&mut self, samples: Vec<f32>) -> AudioBuffer {
-        // ffmpeg drops the stream's CodecDelay (we declare it) from the start of every run.
-        let start = self.start.unwrap_or_default() + self.stream.codec_delay;
+        // ffmpeg drops the stream's CodecDelay (we declare it) from the start of every run, so the
+        // first sample it emits is presented at the first packet's time.
+        let start = self.start.unwrap_or_default();
         let pts = start + Duration::from_secs_f64(self.emitted as f64 / self.rate as f64);
         self.emitted += (samples.len() / self.channels as usize) as u64;
         AudioBuffer { rate: self.rate, channels: self.channels, samples, pts }
