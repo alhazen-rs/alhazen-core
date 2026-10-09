@@ -200,6 +200,7 @@ impl Backend for NativeBackend {
             ContainerFormat::Mp3 => Box::new(crate::demux::Mp3Demuxer::open(src)?),
             ContainerFormat::Adts => Box::new(crate::demux::AdtsDemuxer::open(src)?),
             ContainerFormat::Ogg => Box::new(crate::demux::OggDemuxer::open(src)?),
+            ContainerFormat::MpegTs => Box::new(crate::demux::TsDemuxer::open(src)?),
         })
     }
     fn supports_video(&self, stream: &StreamInfo) -> bool {

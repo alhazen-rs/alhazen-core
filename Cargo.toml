@@ -26,7 +26,7 @@ native-mp3 = ["dep:rusty_mp3"]
 http = ["dep:ureq"]
 # HTTP Live Streaming (`.m3u8`): VOD and live, MPEG-TS / fragmented MP4 / packed audio segments,
 # separate audio renditions, adaptive bitrate, AES-128.
-hls = ["http", "dep:aes", "dep:cbc"]
+hls = ["http", "native", "dep:aes", "dep:cbc"]
 # Decode through the user's own `ffmpeg` program (found at runtime; nothing is linked). Used only
 # for codecs no native decoder handles, or when native decoding is too slow (auto fallback).
 ffmpeg-cli = ["dep:windows"]
