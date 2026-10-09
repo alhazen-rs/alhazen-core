@@ -94,3 +94,7 @@ rm -rf wrap && mkdir wrap
 ffmpeg -v error -y -f lavfi -t 6 -i "$(v 320x180)" -f lavfi -t 6 -i "$(a)" \
   -c:v libx264 -g 25 -pix_fmt yuv420p -x264-params log-level=error:scenecut=0 -c:a aac -b:a 64k -ac 1 \
   -output_ts_offset 95441 -f hls -hls_time 1 -hls_playlist_type vod -hls_segment_filename 'wrap/seg%d.ts' wrap/index.m3u8
+
+# A .ts file with 10 s GOPs (x264's default keyint at 25 fps), 12 s: seeking must not scan the file.
+ffmpeg -v error -y -f lavfi -t 12 -i "testsrc=size=160x90:rate=25" \
+  -c:v libx264 -g 250 -pix_fmt yuv420p -x264-params log-level=error:scenecut=0 -f mpegts ../long_gop.ts

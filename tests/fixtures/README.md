@@ -214,3 +214,4 @@ packed audio is assembled by the script itself, as ffmpeg's HLS muxer writes TS 
 - `hls/disc/`: three segments of `ts/`, `#EXT-X-DISCONTINUITY`, then a 160×90 encode whose clock
   starts over.
 - `hls/wrap/`: TS VOD whose 33-bit clock starts at 95441 s and wraps 2.7 s in.
+- `long_gop.ts`: 160×90 H.264 with 10 s GOPs, 12 s (seeking must not scan the whole file).

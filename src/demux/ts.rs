@@ -103,6 +103,9 @@ pub struct TsDemuxer {
     zero: Option<u64>,
     file: bool,
     ended: bool,
+    /// Tests: the furthest byte read.
+    #[cfg(test)]
+    furthest: u64,
 }
 
 impl TsDemuxer {
@@ -147,6 +150,8 @@ impl TsDemuxer {
             zero: None,
             file,
             ended: false,
+            #[cfg(test)]
+            furthest: 0,
         };
         // Read until every stream's format is known.
         while !d.pmt_seen || d.pids.values().any(|p| p.stream.is_none()) {
@@ -181,6 +186,10 @@ impl TsDemuxer {
             if buf[skip] == 0x47 {
                 let p: [u8; TS_PACKET] = buf[skip..].try_into().unwrap();
                 self.pos += self.packet_size as u64;
+                #[cfg(test)]
+                {
+                    self.furthest = self.furthest.max(self.pos);
+                }
                 return Ok(Some(p));
             }
             let window = self.w.at(self.pos + 1, 64 * 1024)?.to_vec();
@@ -609,8 +618,12 @@ impl Demuxer for TsDemuxer {
             let mut key = None;
             while let Some(r) = self.next_raw()? {
                 let primary_packet = r.stream == primary as u32;
-                if primary_packet && r.ticks > target_ticks && key.is_some() {
-                    kept.push(r);
+                if primary_packet && r.ticks > target_ticks {
+                    // Past the target: done, with the keyframe found, or without one (then the
+                    // search starts further back), never reading on to the end of the file.
+                    if key.is_some() {
+                        kept.push(r);
+                    }
                     break;
                 }
                 if primary_packet && r.keyframe && r.ticks <= target_ticks {
@@ -886,5 +899,18 @@ mod tests {
         let next = d.next_packet().unwrap().unwrap();
         assert!(!next.keyframe);
         assert_eq!(next.data, [0, 0, 0, 2, 0x41, 0x9a]);
+    }
+
+    #[test]
+    fn a_seek_between_distant_keyframes_does_not_read_the_whole_file() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/long_gop.ts");
+        let len = std::fs::metadata(path).unwrap().len();
+        let mut d = TsDemuxer::open(Box::new(crate::source::FileSource::open(path).unwrap())).unwrap();
+        d.furthest = 0;
+        let at = d.seek(Duration::from_secs(9)).unwrap();
+        assert_eq!(at, Duration::ZERO, "the only keyframe before 9 s is the first");
+        assert!(d.furthest < len * 9 / 10, "read up to {} of {len} bytes", d.furthest);
+        let first = d.next_packet().unwrap().unwrap();
+        assert!(first.keyframe && first.pts == Duration::ZERO);
     }
 }
