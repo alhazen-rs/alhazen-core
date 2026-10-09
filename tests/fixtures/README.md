@@ -177,3 +177,15 @@ ffmpeg -v error -y -i sync.mp4 -map 0:a -map 0:v -c copy audio_first.mp4
   0.5 s (video 7680/15360, audio 24000/48000), so the flash and beep are at 0.5 s of playback.
   `sync.mkv`: AAC with Matroska CodecDelay. `audio_first.mp4`: `sync.mp4` with the audio as
   track 1 and the video as track 2, so at decode time 0 the audio packet comes before the keyframe.
+
+## Audio files (alhazen-core 0.5)
+
+`bash make_audio_fixtures.sh` regenerates every fixture below. The signals are chirps, so a seek that lands on the wrong sample cannot line up by accident.
+
+- `mp3_cbr.mp3` (CBR 96k, 44.1 kHz stereo, LAME/Info header), `mp3_vbr.mp3` (VBR, Xing TOC, 48 kHz), `mp3_mpeg2.mp3` (22.05 kHz mono), `mp3_mpeg25.mp3` (8 kHz mono), `mp3_no_xing.mp3` (no Xing/Info frame), `mp3_tagged.mp3` (ID3v2.3 with all test tags and a front-cover APIC of `cover.png`).
+- `aac.aac` and `aac_tagged.aac` (ID3v2 before the ADTS frames): `aac_only.m4a` as ADTS.
+- `flac.flac` and `flac_tagged.flac` (Vorbis comment and PICTURE block).
+- `wav_s16.wav`, `wav_s24.wav` (WAVE_FORMAT_EXTENSIBLE), `wav_f32.wav`, `wav_u8.wav`, `wav_51.wav` (extensible, 6 channels), `wav_adpcm.wav` (IMA ADPCM, unsupported on purpose), `wav_tagged.wav` (LIST/INFO).
+- `vorbis.ogg`, `opus.opus` (both tagged), `opus_51.opus`, `flac.oga` (FLAC in Ogg).
+- `m4a_tagged.m4a` (iTunes `ilst` tags and `covr`), `mka_tagged.mka` (Matroska tags and a `cover.png` attachment).
+- `cover.png`: 16×16 red; the cover in every tagged fixture.

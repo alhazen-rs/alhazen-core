@@ -27,7 +27,9 @@ if let Some(frame) = player.current_frame() { /* draw it */ }
 ## Features
 
 - **Plays out of the box, on every platform:** AV1, VP9 (multi-threaded), VP8, ProRes, Opus,
-  Vorbis, FLAC, AAC (LC, HE-AAC v1/v2) and PCM in pure Rust, under permissive licences.
+  Vorbis, FLAC, AAC (LC, HE-AAC v1/v2), MP3 and PCM in pure Rust, under permissive licences.
+- **Music files too:** `.mp3`, `.aac`, `.flac`, `.wav`, `.ogg` and `.opus` play natively, with
+  their tags and cover art (`Player::metadata()`).
 - **The OS's own decoders on Windows:** H.264, HEVC, VP9 and AV1 on the GPU, plus AAC, MP3,
   AC-3, E-AC-3 and ALAC, through Media Foundation. Nothing to install; Windows covers the
   codec licences.
@@ -40,7 +42,8 @@ if let Some(frame) = player.current_frame() { /* draw it */ }
   automatic reconnects.
 - **A/V sync done right:** audio drives the clock; video follows, drops late frames and catches
   up after stalls. The encoder's start-up padding (MP4 edit lists, Matroska CodecDelay) is
-  trimmed, so sound lines up with the picture.
+  trimmed, so sound lines up with the picture, and MP3/Opus/Vorbis files play gapless (LAME
+  delay and padding, Ogg granules).
 - **Smooth on big files:** frames are scaled to the size you display them at before colour
   conversion, and a decoder that can't keep up hands over to a faster one automatically.
 
@@ -63,7 +66,7 @@ if let Some(frame) = player.current_frame() { /* draw it */ }
 
 ```toml
 [dependencies]
-alhazen-core = "0.2"
+alhazen-core = "0.5"
 
 # Decoding unoptimized is many times slower than real time: optimize the decoders even in
 # debug builds.
@@ -107,7 +110,7 @@ fn main() -> alhazen_core::Result<()> {
 | `seek(Duration)` | `position()`, `duration()`, `is_seekable()` |
 | `set_volume(0.0..=1.0)`, `set_muted(bool)` | `volume()`, `is_muted()` |
 | `set_max_output_size(Option<(w, h)>)` | `has_video()`, `has_audio()`, `video_size()` |
-| | `current_frame()`, `events()`, `stats()` |
+| | `current_frame()`, `events()`, `stats()`, `metadata()` |
 
 ## Integrating with a UI toolkit
 
@@ -141,8 +144,29 @@ lines for the player entity and the element.
 |---|---|
 | Matroska / WebM | `.mkv`, `.webm`, `.mka` |
 | ISO BMFF / QuickTime | `.mp4`, `.m4v`, `.m4a`, `.mov` |
+| MP3 | `.mp3` (gapless with a LAME/Xing header) |
+| AAC (ADTS) | `.aac` |
+| FLAC | `.flac` |
+| WAV | `.wav` (PCM, float, WAVE_FORMAT_EXTENSIBLE) |
+| Ogg (Vorbis, Opus, FLAC) | `.ogg`, `.opus`, `.oga` |
 
-Raw elementary streams (a bare `.mp3`, `.aac`, `.flac`, `.h264`) need a container for now.
+Containers are recognised by their content, not their extension. Raw video streams (`.h264`,
+`.hevc`) need a container for now.
+
+### Tags and cover art
+
+`Player::metadata()` returns the title, artist, album, album artist, track, year, genre and the
+embedded cover (still encoded, with its MIME type) from ID3v2/ID3v1, Vorbis comments, FLAC
+pictures, MP4 `ilst`, Matroska tags and attachments, and RIFF INFO.
+
+```rust,no_run
+# use alhazen_core::{Player, PlayerConfig, Source};
+let player = Player::open(Source::parse("song.mp3")?, PlayerConfig::default())?;
+if let Some(m) = player.metadata() {
+    println!("{} — {}", m.artist.as_deref().unwrap_or("?"), m.title.as_deref().unwrap_or("?"));
+}
+# Ok::<(), alhazen_core::Error>(())
+```
 
 ### Video
 
@@ -172,7 +196,7 @@ stream's BT.601/BT.709 matrix and range.
 | FLAC | ✅ claxon | | ✅ |
 | PCM (8–32-bit int, 32/64-bit float) | ✅ | | ✅ |
 | AAC (LC, HE-AAC v1/v2) | ✅ rusty_aac | ✅ | ✅ |
-| MP3 | | ✅ | ✅ |
+| MP3 | ✅ rusty_mp3 | ✅ | ✅ |
 | AC-3, E-AC-3 | | ✅ | ✅ |
 | ALAC | | ✅ | ✅ |
 
@@ -214,13 +238,14 @@ ffmpeg behind a Chocolatey/Scoop shim.
 
 | Feature | Default | Adds |
 |---|---|---|
-| `native` | ✅ | Pure-Rust decoders (AV1, VP9, VP8, ProRes, Opus, Vorbis, FLAC) and the MP4/MOV demuxer. |
+| `native` | ✅ | Pure-Rust decoders (AV1, VP9, VP8, ProRes, Opus, Vorbis, FLAC, PCM), the MP4/MOV demuxer and the audio-file readers (MP3, AAC/ADTS, FLAC, WAV, Ogg). |
 | `http` | ✅ | HTTP(S) sources (`ureq`, rustls). |
 | `audio-output` | ✅ | Sound through the default output device (`cpal`). Without it, audio is ignored and video runs on the system clock. |
 | `ffmpeg-cli` | ✅ | The runtime ffmpeg backend. Costs nothing when ffmpeg isn't installed. |
 | `media-foundation` | ✅ | Windows' decoders. Compiles to nothing on other platforms. |
 | `nvdec` | ✅ | NVIDIA GPU decoding on Linux (NVDEC), loaded from the driver at runtime. Compiles to nothing on other platforms. |
 | `native-aac` | ✅ | AAC (LC, Main, LTP, HE-AAC v1/v2) through rusty_aac (pure Rust, Apache-2.0). |
+| `native-mp3` | ✅ | MP3 (MPEG-1/2/2.5 Layer III) through rusty_mp3 (pure Rust, Apache-2.0). |
 
 ## Configuration
 

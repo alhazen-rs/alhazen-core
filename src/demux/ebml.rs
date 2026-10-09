@@ -46,6 +46,17 @@ pub mod id {
     pub const BLOCK_GROUP: u32 = 0xA0;
     pub const BLOCK: u32 = 0xA1;
     pub const REFERENCE_BLOCK: u32 = 0xFB;
+    pub const TITLE: u32 = 0x7BA9;
+    pub const TAGS: u32 = 0x1254_C367;
+    pub const TAG: u32 = 0x7373;
+    pub const SIMPLE_TAG: u32 = 0x67C8;
+    pub const TAG_NAME: u32 = 0x45A3;
+    pub const TAG_STRING: u32 = 0x4487;
+    pub const ATTACHMENTS: u32 = 0x1941_A469;
+    pub const ATTACHED_FILE: u32 = 0x61A7;
+    pub const FILE_NAME: u32 = 0x466E;
+    pub const FILE_MIME_TYPE: u32 = 0x4660;
+    pub const FILE_DATA: u32 = 0x465C;
 }
 
 /// `size` is `None` for "unknown size" elements (live-written Segments/Clusters).

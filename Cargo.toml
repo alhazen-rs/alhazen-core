@@ -15,12 +15,14 @@ categories = ["multimedia::video", "multimedia::audio", "multimedia"]
 include = ["src/**", "examples/**", "LICENSE", "NOTICE", "README.md"]
 
 [features]
-default = ["native", "http", "audio-output", "ffmpeg-cli", "media-foundation", "nvdec", "native-aac"]
+default = ["native", "http", "audio-output", "ffmpeg-cli", "media-foundation", "nvdec", "native-aac", "native-mp3"]
 # Pure-Rust, permissively licensed decoders: AV1 (rav1d), VP9 (vp9-mt), VP8 (oximedia-codec),
 # ProRes (oxideav-prores), Opus, Vorbis, FLAC (claxon); MP4/MOV demuxing.
 native = ["dep:rav1d", "dep:vp9-mt", "dep:oximedia-codec", "dep:oxideav-prores", "dep:re_mp4", "dep:opus-pure", "dep:lewton", "dep:claxon"]
 # AAC (LC, Main, LTP, HE-AAC v1/v2) via rusty_aac: pure Rust, Apache-2.0.
 native-aac = ["dep:rusty_aac"]
+# MP3 in pure Rust (rusty_mp3, Apache-2.0), in any container.
+native-mp3 = ["dep:rusty_mp3"]
 http = ["dep:ureq"]
 # Decode through the user's own `ffmpeg` program (found at runtime; nothing is linked). Used only
 # for codecs no native decoder handles, or when native decoding is too slow (auto fallback).
@@ -55,6 +57,7 @@ fast_image_resize = { version = "6", features = ["rayon"] }
 rtrb = "0.4"
 cpal = { version = "0.18", optional = true }
 rusty_aac = { version = "1.1", optional = true }
+rusty_mp3 = { version = "=1.0.0", optional = true }
 
 # rav1d 1.1.0's crate omits `src/arm/asm-offsets.h`, so its ARM assembly cannot build: on
 # aarch64 it is used without assembly (slower AV1; platform decoders take over there).

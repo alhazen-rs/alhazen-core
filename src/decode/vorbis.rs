@@ -7,6 +7,7 @@ use lewton::header::{IdentHeader, SetupHeader, read_header_ident, read_header_se
 use lewton::samples::InterleavedSamples;
 
 use super::audio::{AudioBuffer, AudioDecoder};
+use super::clip_end;
 use super::channels::to_wave_order;
 use crate::demux::{Packet, StreamInfo, split_xiph_lacing};
 use crate::{Error, Result};
@@ -17,6 +18,8 @@ pub struct VorbisAudioDecoder {
     pwr: PreviousWindowRight,
     /// Presentation time is the Matroska block time minus CodecDelay (as ffmpeg reports it).
     codec_delay: std::time::Duration,
+    /// The stream's exact presentation length (Ogg final granule): later samples are padding.
+    end: Option<std::time::Duration>,
     out: VecDeque<AudioBuffer>,
 }
 
@@ -30,7 +33,7 @@ impl VorbisAudioDecoder {
         let ident = read_header_ident(headers[0]).map_err(err)?;
         let setup = read_header_setup(headers[2], ident.audio_channels, (ident.blocksize_0, ident.blocksize_1))
             .map_err(err)?;
-        Ok(Self { ident, setup, pwr: PreviousWindowRight::new(), codec_delay: stream.codec_delay, out: VecDeque::new() })
+        Ok(Self { ident, setup, pwr: PreviousWindowRight::new(), codec_delay: stream.codec_delay, end: stream.end_trim, out: VecDeque::new() })
     }
 }
 
@@ -42,12 +45,12 @@ impl AudioDecoder for VorbisAudioDecoder {
         // The first packet after (re)start only primes the overlap window and yields nothing.
         if !decoded.samples.is_empty() {
             let channels = self.ident.audio_channels as u16;
-            self.out.push_back(AudioBuffer {
-                rate: self.ident.audio_sample_rate,
-                channels,
-                samples: to_wave_order(decoded.samples, channels),
-                pts: packet.pts.saturating_sub(self.codec_delay),
-            });
+            let rate = self.ident.audio_sample_rate;
+            let pts = packet.pts.saturating_sub(self.codec_delay);
+            let samples = clip_end(to_wave_order(decoded.samples, channels), channels, rate, pts, self.end);
+            if !samples.is_empty() {
+                self.out.push_back(AudioBuffer { rate, channels, samples, pts });
+            }
         }
         Ok(())
     }

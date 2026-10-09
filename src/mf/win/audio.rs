@@ -38,7 +38,7 @@ unsafe impl Send for MfAudioDecoder {}
 
 impl MfAudioDecoder {
     pub fn new(codec: HwCodec, stream: &StreamInfo) -> Result<Self> {
-        Ok(Self { codec, stream: stream.clone(), state: None, ready: VecDeque::new(), trim: DelayTrim::new(stream.codec_delay) })
+        Ok(Self { codec, stream: stream.clone(), state: None, ready: VecDeque::new(), trim: DelayTrim::new(stream.codec_delay).with_end(stream.end_trim) })
     }
 
     pub fn description(&self) -> Option<String> {

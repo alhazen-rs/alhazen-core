@@ -195,6 +195,11 @@ impl Backend for NativeBackend {
         Ok(match format {
             ContainerFormat::Matroska => Box::new(crate::demux::MatroskaDemuxer::open(src)?),
             ContainerFormat::Mp4 => Box::new(crate::demux::Mp4Demuxer::open(src)?),
+            ContainerFormat::Wav => Box::new(crate::demux::WavDemuxer::open(src)?),
+            ContainerFormat::Flac => Box::new(crate::demux::FlacDemuxer::open(src)?),
+            ContainerFormat::Mp3 => Box::new(crate::demux::Mp3Demuxer::open(src)?),
+            ContainerFormat::Adts => Box::new(crate::demux::AdtsDemuxer::open(src)?),
+            ContainerFormat::Ogg => Box::new(crate::demux::OggDemuxer::open(src)?),
         })
     }
     fn supports_video(&self, stream: &StreamInfo) -> bool {
@@ -215,6 +220,7 @@ impl Backend for NativeBackend {
         use crate::demux::Codec;
         matches!(stream.codec, Codec::Opus | Codec::Vorbis | Codec::Flac | Codec::Pcm(_))
             || (cfg!(feature = "native-aac") && stream.codec == Codec::Aac)
+            || (cfg!(feature = "native-mp3") && stream.codec == Codec::Mp3)
     }
     fn open_audio_decoder(&self, stream: &StreamInfo) -> Result<Box<dyn AudioDecoder>> {
         use crate::demux::Codec;
@@ -225,6 +231,8 @@ impl Backend for NativeBackend {
             Codec::Pcm(_) => Box::new(crate::decode::PcmAudioDecoder::new(stream)?),
             #[cfg(feature = "native-aac")]
             Codec::Aac => Box::new(crate::decode::AacAudioDecoder::new(stream)?),
+            #[cfg(feature = "native-mp3")]
+            Codec::Mp3 => Box::new(crate::decode::Mp3AudioDecoder::new(stream)?),
             _ => return Err(Error::Unsupported("audio codec")),
         })
     }

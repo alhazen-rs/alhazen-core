@@ -60,7 +60,7 @@ impl FfmpegAudioDecoder {
             emitted: 0,
             ready: VecDeque::new(),
             eof: false,
-            trim: DelayTrim::new(trimmed),
+            trim: DelayTrim::new(trimmed).with_end(stream.end_trim),
         })
     }
 

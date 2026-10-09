@@ -34,6 +34,9 @@ impl Seek for FileSource {
 }
 
 impl MediaSource for FileSource {
+    fn is_local(&self) -> bool {
+        true
+    }
     fn byte_len(&self) -> Option<u64> {
         Some(self.len)
     }

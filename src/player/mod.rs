@@ -14,7 +14,7 @@ use crossbeam_channel::{Receiver, Sender};
 use crate::audio::{AudioClock, AudioOutputConfig, OutputShared, Volume, open_output};
 use crate::backend::Registry;
 use crate::clock::{Clock, SystemClock};
-use crate::demux::{self, StreamInfo, StreamKind};
+use crate::demux::{self, Metadata, StreamInfo, StreamKind};
 use crate::frame::{FrameQueue, VideoFrame};
 use crate::source::Source;
 use crate::{Error, Result};
@@ -122,6 +122,7 @@ impl Default for PlayerConfig {
 fn codec_hint(codec: &demux::Codec) -> &'static str {
     match codec {
         demux::Codec::Aac => " (install ffmpeg, or enable alhazen-core's default `native-aac` feature)",
+        demux::Codec::Mp3 => " (install ffmpeg, or enable alhazen-core's default `native-mp3` feature)",
         demux::Codec::H264 | demux::Codec::Hevc => " (install ffmpeg)",
         _ => "",
     }
@@ -352,6 +353,8 @@ pub struct Player {
     seekable: bool,
     /// Keeps the audio device stream alive; dropped after the threads.
     _audio_guard: Option<Box<dyn Send + Sync>>,
+    /// Tags and cover art read when the media was opened.
+    metadata: Option<Metadata>,
 }
 
 impl Player {
@@ -366,6 +369,7 @@ impl Player {
         let format = demux::probe(src.as_mut())?.ok_or(Error::UnsupportedContainer)?;
         let demuxer = registry.open_demuxer(&source, format, src, order)?;
         let streams = demuxer.streams().to_vec();
+        let metadata = demuxer.metadata().cloned();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
         let warn = |msg: String| {
             let _ = event_tx.send(PlayerEvent::Warning(msg));
@@ -470,6 +474,7 @@ impl Player {
             video_size: video.as_ref().map(|v| (v.width, v.height)).unwrap_or_default(),
             seekable,
             _audio_guard: audio_guard,
+            metadata,
         };
         if config.autoplay {
             player.play();
@@ -538,6 +543,20 @@ impl Player {
     /// `seek` is then ignored with a `Warning` event.
     pub fn is_seekable(&self) -> bool {
         self.seekable
+    }
+
+    /// Tags and cover art (title, artist, album, …), when the file has any.
+    ///
+    /// ```no_run
+    /// # use alhazen_core::{Player, PlayerConfig, Source};
+    /// let player = Player::open(Source::parse("song.mp3")?, PlayerConfig::default())?;
+    /// if let Some(m) = player.metadata() {
+    ///     println!("{} — {}", m.artist.as_deref().unwrap_or("?"), m.title.as_deref().unwrap_or("?"));
+    /// }
+    /// # Ok::<(), alhazen_core::Error>(())
+    /// ```
+    pub fn metadata(&self) -> Option<Metadata> {
+        self.metadata.clone()
     }
 
     pub fn duration(&self) -> Option<Duration> {
