@@ -10,6 +10,8 @@ mod error;
 pub mod ffmpeg;
 pub mod frame;
 pub mod hw;
+#[cfg(feature = "hls")]
+pub mod hls;
 mod player;
 pub mod mf;
 pub mod nal;
