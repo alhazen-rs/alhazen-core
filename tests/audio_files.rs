@@ -13,7 +13,7 @@ use alhazen_core::{FfmpegConfig, Player, PlayerConfig, PlayerState, Source};
 
 /// A fixture by name, or a file generated at test time by absolute path.
 fn fixture(name: &str) -> String {
-    if name.starts_with('/') { name.to_owned() } else { format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR")) }
+    if std::path::Path::new(name).is_absolute() { name.to_owned() } else { format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR")) }
 }
 
 fn open_path(path: &str) -> Box<dyn Demuxer> {
@@ -160,7 +160,7 @@ fn plays_to_the_end(name: &str) -> Player {
         ffmpeg: FfmpegConfig { enabled: false, ..Default::default() },
         ..Default::default()
     };
-    let player = Player::open(Source::parse(if name.starts_with('/') { name.to_string() } else { fixture(name) }.as_str()).unwrap(), config).unwrap();
+    let player = Player::open(Source::parse(&fixture(name)).unwrap(), config).unwrap();
     assert!(!player.has_video() && player.has_audio(), "{name}: audio only");
     assert!(player.duration().is_some_and(|d| d > Duration::ZERO), "{name}: has a duration");
     player.play();
