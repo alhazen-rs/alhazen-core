@@ -11,6 +11,12 @@ ffmpeg -v error -y -f lavfi -t 3 -i "$(v 320x180)" -f lavfi -t 3 -i "$(a)" \
   -c:v libx264 -g 25 -pix_fmt yuv420p -x264-params log-level=error -c:a aac -b:a 64k -ac 1 \
   -f mpegts ../h264_aac.ts
 
+# MPEG-TS VOD: H.264 + AAC, 1 s segments, 6 s (also served as a sliding live window in tests).
+rm -rf ts && mkdir ts
+ffmpeg -v error -y -f lavfi -t 6 -i "$(v 320x180)" -f lavfi -t 6 -i "$(a)" \
+  -c:v libx264 -g 25 -pix_fmt yuv420p -x264-params log-level=error:scenecut=0 -c:a aac -b:a 64k -ac 1 \
+  -f hls -hls_time 1 -hls_playlist_type vod -hls_segment_filename 'ts/seg%d.ts' ts/index.m3u8
+
 # Fragmented MP4 (CMAF) VOD: HEVC + AAC, 2 s segments.
 rm -rf fmp4 && mkdir fmp4
 ffmpeg -v error -y -f lavfi -t 4 -i "$(v 320x180)" -f lavfi -t 4 -i "$(a)" \
