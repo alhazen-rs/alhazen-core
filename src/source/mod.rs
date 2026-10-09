@@ -39,7 +39,8 @@ pub trait MediaSource: Read + Seek + Send {
 pub enum Source {
     File(PathBuf),
     Http(Url),
-    /// HLS (`.m3u8`) or DASH (`.mpd`). Not playable until phase 5.
+    /// HLS (`.m3u8`, played by `Player` with the `hls` feature) or DASH (`.mpd`, not playable
+    /// yet).
     Adaptive(Url),
 }
 
@@ -72,7 +73,8 @@ impl Source {
         Ok(Source::File(PathBuf::from(s)))
     }
 
-    /// Opens a byte-level source. Adaptive sources are rejected until phase 5.
+    /// Opens a byte-level source. Adaptive sources are segment-based, not byte streams:
+    /// `Player::open` plays them.
     pub fn open(&self) -> Result<Box<dyn MediaSource>> {
         match self {
             Source::File(path) => Ok(Box::new(FileSource::open(path)?)),
