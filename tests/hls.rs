@@ -238,3 +238,100 @@ fn dash_is_still_unsupported() {
     let config = PlayerConfig { audio_output: AudioOutputConfig::Disabled, ..Default::default() };
     assert!(matches!(Player::open(Source::parse("https://example.com/a.mpd").unwrap(), config), Err(Error::Unsupported(_))));
 }
+
+#[test]
+fn throttling_switches_down_through_a_resolution_change() {
+    let (video, audio) = (Server::dir(root()), Server::dir(root()));
+    master_with_remote_audio(&video, &audio);
+    // About 240 kb/s from the start: the 433 kb/s variant does not fit, the 143 kb/s one does.
+    video.throttle(Some(30_000));
+    let null = NullOutput::new(48_000, 2);
+    let config = PlayerConfig { audio_output: AudioOutputConfig::Null(null.clone()), decoder_threads: 2, ..Default::default() };
+    let player = Player::open(Source::parse(&video.url("multi/master.m3u8")).unwrap(), config).unwrap();
+    let variants = player.variants();
+    assert_eq!(variants.iter().map(|v| v.resolution).collect::<Vec<_>>(), [Some((640, 360)), Some((320, 180))]);
+    assert_eq!(player.current_variant(), Some(0), "the higher one first (no measurement yet)");
+    let events = player.events();
+    player.play();
+    let start = Instant::now();
+    let (mut pulled, mut sizes) = (0usize, Vec::new());
+    while start.elapsed() < Duration::from_secs(40) && !matches!(player.state(), PlayerState::Ended | PlayerState::Error(_)) {
+        if let Some(f) = player.current_frame()
+            && sizes.last() != Some(&f.size())
+        {
+            sizes.push(f.size());
+        }
+        let due = (start.elapsed().as_secs_f64() * 48_000.0) as usize;
+        null.pull(due - pulled);
+        pulled = due;
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(player.state(), PlayerState::Ended, "{:?}", player.state());
+    assert_eq!(sizes.first(), Some(&(640, 360)));
+    assert_eq!(sizes.last(), Some(&(320, 180)), "switched down: {sizes:?}");
+    assert!(events.try_iter().any(|e| matches!(e, alhazen_core::PlayerEvent::VariantChanged(1))));
+    assert_eq!(player.current_variant(), Some(1));
+}
+
+#[test]
+fn manual_variant_then_auto() {
+    let (video, audio) = (Server::dir(root()), Server::dir(root()));
+    master_with_remote_audio(&video, &audio);
+    let config = PlayerConfig { audio_output: AudioOutputConfig::Disabled, decoder_threads: 2, ..Default::default() };
+    let player = Player::open(Source::parse(&video.url("multi/master.m3u8")).unwrap(), config).unwrap();
+    player.set_variant(alhazen_core::hls::Variant::Index(1));
+    player.play();
+    let start = Instant::now();
+    let mut sizes = BTreeSet::new();
+    while start.elapsed() < Duration::from_secs(30) && !matches!(player.state(), PlayerState::Ended | PlayerState::Error(_)) {
+        if let Some(f) = player.current_frame() {
+            sizes.insert(f.size());
+            if f.size() == (320, 180) {
+                player.set_variant(alhazen_core::hls::Variant::Auto);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(player.state(), PlayerState::Ended);
+    assert!(sizes.contains(&(320, 180)), "{sizes:?}");
+}
+
+#[test]
+fn non_hls_media_has_no_variants() {
+    let config = PlayerConfig { audio_output: AudioOutputConfig::Disabled, ..Default::default() };
+    let player = Player::open(Source::parse(&format!("{}/tests/fixtures/av1.webm", env!("CARGO_MANIFEST_DIR"))).unwrap(), config).unwrap();
+    assert!(player.variants().is_empty());
+    assert_eq!(player.current_variant(), None);
+    player.set_variant(alhazen_core::hls::Variant::Index(3)); // ignored
+}
+
+#[test]
+fn switching_audio_rendition_keeps_playing() {
+    let (video, audio) = (Server::dir(root()), Server::dir(root()));
+    let text = std::fs::read_to_string(root().join("multi/master.m3u8")).unwrap();
+    let remote = audio.url("multi/audio/index.m3u8");
+    let second = format!("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"group_aud\",NAME=\"Second\",LANGUAGE=\"fr\",URI=\"{remote}?second\"\n");
+    let text = text.replace("URI=\"audio/index.m3u8\"\n", &format!("URI=\"{remote}\"\n{second}"));
+    video.set_body("multi/master.m3u8", text);
+    let null = NullOutput::new(48_000, 2);
+    let config = PlayerConfig { audio_output: AudioOutputConfig::Null(null.clone()), decoder_threads: 2, ..Default::default() };
+    let player = Player::open(Source::parse(&video.url("multi/master.m3u8")).unwrap(), config).unwrap();
+    let names: Vec<_> = player.audio_renditions().into_iter().map(|r| (r.name, r.language)).collect();
+    assert_eq!(names, [("audio_2".to_owned(), Some("en".to_owned())), ("Second".to_owned(), Some("fr".to_owned()))]);
+    player.play();
+    let start = Instant::now();
+    let (mut pulled, mut switched) = (0usize, false);
+    while start.elapsed() < Duration::from_secs(30) && !matches!(player.state(), PlayerState::Ended | PlayerState::Error(_)) {
+        player.current_frame(); // a UI drawing
+        if !switched && start.elapsed() > Duration::from_secs(2) {
+            player.set_audio_rendition(1);
+            switched = true;
+        }
+        let due = (start.elapsed().as_secs_f64() * 48_000.0) as usize;
+        null.pull(due - pulled);
+        pulled = due;
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(player.state(), PlayerState::Ended, "{:?}", player.debug_snapshot());
+    assert!(audio.hits("multi/audio/seg5.ts") >= 2, "the second rendition was fetched too");
+}

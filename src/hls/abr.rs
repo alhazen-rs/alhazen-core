@@ -12,43 +12,57 @@ const UP_SAMPLES: usize = 3;
 /// A first download smaller than this is too short to time.
 const MIN_PROBE_BYTES: u64 = 16 * 1024;
 
-/// Throughput estimate (the lower of a fast and a slow moving average, so drops count at once
-/// and rises only once they last) and the switching rules built on it.
+/// A moving average weighted by download time, bias-corrected so that the first samples are not
+/// mistaken for history (as in hls.js): a tiny download that happens to be very fast counts for
+/// as little as the time it took.
+struct Ewma {
+    half_life: f64,
+    est: f64,
+    total: f64,
+}
+
+impl Ewma {
+    fn new(half_life: f64) -> Self {
+        Self { half_life, est: 0.0, total: 0.0 }
+    }
+
+    fn add(&mut self, weight: f64, value: f64) {
+        let keep = 0.5f64.powf(weight / self.half_life);
+        self.est = keep * self.est + (1.0 - keep) * value;
+        self.total += weight;
+    }
+
+    fn get(&self) -> Option<f64> {
+        (self.total > 0.0).then(|| self.est / (1.0 - 0.5f64.powf(self.total / self.half_life)))
+    }
+}
+
+/// Throughput estimate (the lower of a fast and a slow average, so drops count at once and rises
+/// only once they last) and the switching rules built on it.
 pub(crate) struct Abr {
     bitrates: Vec<u64>,
-    fast: Option<f64>,
-    slow: Option<f64>,
+    fast: Ewma,
+    slow: Ewma,
     /// The latest estimates, for the "sustained surplus" rule.
     recent: VecDeque<f64>,
 }
 
 impl Abr {
     pub fn new(bitrates: Vec<u64>) -> Self {
-        Self { bitrates, fast: None, slow: None, recent: VecDeque::new() }
+        Self { bitrates, fast: Ewma::new(2.0), slow: Ewma::new(5.0), recent: VecDeque::new() }
     }
 
     /// Bits per second, if anything was measured.
     pub fn estimate(&self) -> Option<f64> {
-        Some(self.fast?.min(self.slow?))
+        Some(self.fast.get()?.min(self.slow.get()?))
     }
 
     /// One download of `bytes` that took `elapsed`.
     pub fn sample(&mut self, bytes: u64, elapsed: Duration) {
-        let bps = bytes as f64 * 8.0 / elapsed.as_secs_f64().max(1e-3);
-        let mix = |avg: Option<f64>, half_life: f64| {
-            let alpha = 1.0 - 0.5f64.powf(1.0 / half_life);
-            Some(avg.map_or(bps, |a| a + alpha * (bps - a)))
-        };
-        self.fast = mix(self.fast, 2.0);
-        self.slow = mix(self.slow, 5.0);
-        self.push_recent();
-    }
-
-    /// A download failed: treated as a collapse of throughput.
-    pub fn fail(&mut self) {
-        let collapsed = self.estimate().unwrap_or(0.0) / 4.0;
-        self.fast = Some(collapsed);
-        self.slow = Some(collapsed);
+        let secs = elapsed.as_secs_f64().max(1e-3);
+        let bps = bytes as f64 * 8.0 / secs;
+        self.fast.add(secs, bps);
+        self.slow.add(secs, bps);
         self.push_recent();
     }
 
@@ -174,12 +188,13 @@ mod tests {
     }
 
     #[test]
-    fn failures_count_as_a_collapse() {
+    fn a_tiny_fast_download_does_not_outweigh_slow_ones() {
         let mut abr = Abr::new(RATES.to_vec());
-        feed(&mut abr, 10_000_000, 6);
-        abr.fail();
-        abr.fail();
-        assert_eq!(abr.choose(2, secs(20.0), secs(4.0), &[false; 3]), 0);
+        abr.sample(54_000, Duration::from_millis(1)); // 432 Mb/s, for 1 ms
+        abr.sample(54_000, secs(1.8)); // 240 kb/s
+        let e = abr.estimate().unwrap();
+        assert!(e < 1_000_000.0, "time-weighted: {e}");
+        assert_eq!(abr.choose(2, secs(20.0), secs(1.0), &[false; 3]), 0);
     }
 
     #[test]

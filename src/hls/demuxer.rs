@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crossbeam_channel::Sender;
 use url::Url;
 
 use super::abr::Abr;
@@ -17,6 +18,7 @@ use super::timeline::{Role, Timeline};
 use super::track::{SegmentData, Start, Track, TrackConfig, TrackEvent};
 use crate::backend::Registry;
 use crate::demux::{Codec, Demuxer, Packet, StreamInfo, StreamKind};
+use crate::player::PlayerEvent;
 use crate::{Error, Result};
 
 const VIDEO_ID: u32 = 1;
@@ -55,6 +57,9 @@ pub struct HlsControl {
     renditions: Vec<AudioRendition>,
     current: AtomicUsize,
     requested: Mutex<Option<Variant>>,
+    requested_audio: Mutex<Option<usize>>,
+    /// Where `VariantChanged` goes (the player's event channel).
+    events: Mutex<Option<Sender<PlayerEvent>>>,
     /// The player is going away: stop waiting for downloads.
     shutdown: AtomicBool,
 }
@@ -73,8 +78,26 @@ impl HlsControl {
         *self.requested.lock().unwrap() = Some(v);
     }
 
+    /// The audio renditions of the variant being played (empty when its audio is muxed in).
     pub fn audio_renditions(&self) -> Vec<AudioRendition> {
         self.renditions.clone()
+    }
+
+    /// Switches to another of `audio_renditions()`.
+    pub fn set_audio_rendition(&self, index: usize) {
+        *self.requested_audio.lock().unwrap() = Some(index);
+    }
+
+    pub(crate) fn set_events(&self, events: Sender<PlayerEvent>) {
+        *self.events.lock().unwrap() = Some(events);
+    }
+
+    fn variant_changed(&self, variant: usize) {
+        if self.current.swap(variant, Ordering::Relaxed) != variant
+            && let Some(tx) = self.events.lock().unwrap().as_ref()
+        {
+            let _ = tx.send(PlayerEvent::VariantChanged(variant));
+        }
     }
 
     pub(crate) fn shut_down(&self) {
@@ -95,7 +118,6 @@ struct Out {
 struct Open {
     demux: SegmentDemuxer,
     offset: i128,
-    variant: usize,
     disc: u64,
 }
 
@@ -116,11 +138,55 @@ struct Lane {
     use_audio: bool,
     /// After a seek: drop packets until a video keyframe.
     wait_key: bool,
+    /// A new audio rendition: drop what comes before where the old one was.
+    skip_before: Option<Duration>,
 }
 
 impl Lane {
     fn new(role: Role, track: Track, use_audio: bool) -> Self {
-        Self { role, track, seg: None, pending: None, formats: HashMap::new(), ts_ref: None, ended: false, epoch: 0, use_audio, wait_key: false }
+        Self { role, track, seg: None, pending: None, formats: HashMap::new(), ts_ref: None, ended: false, epoch: 0, use_audio, wait_key: false, skip_before: None }
+    }
+}
+
+/// Variant selection for the main lane.
+struct Selection {
+    abr: Abr,
+    blacklist: Vec<bool>,
+    /// The variant the track is fetching.
+    fetching: usize,
+    /// Chosen by the application (`Variant::Index`); `None`: ABR decides.
+    manual: Option<usize>,
+    /// End of the newest main segment received, and pts of the last main packet returned: the
+    /// difference is the media buffered ahead.
+    received_end: Duration,
+    returned: Duration,
+}
+
+impl Selection {
+    /// After a main segment arrived: measure, then pick the variant to fetch next.
+    fn on_segment(&mut self, s: &SegmentData, control: &HlsControl, track: &Track) {
+        if s.bytes > 0 {
+            self.abr.sample(s.bytes, s.elapsed);
+        }
+        self.received_end = s.start + s.duration;
+        control.variant_changed(s.variant);
+        let n = self.blacklist.len();
+        match control.requested.lock().unwrap().take() {
+            Some(Variant::Index(i)) if i < n && !self.blacklist[i] => self.manual = Some(i),
+            Some(Variant::Index(i)) => log::warn!("HLS: variant {i} cannot be chosen"),
+            Some(Variant::Auto) => self.manual = None,
+            None => {}
+        }
+        let buffer = self.received_end.saturating_sub(self.returned);
+        let next = match self.manual {
+            Some(i) => i,
+            None => self.abr.choose(self.fetching, buffer, s.duration, &self.blacklist),
+        };
+        if next != self.fetching {
+            log::info!("HLS: switching to variant {next} (buffer {buffer:?}, estimate {:?} b/s)", self.abr.estimate());
+            track.switch(next);
+            self.fetching = next;
+        }
     }
 }
 
@@ -135,16 +201,19 @@ pub struct HlsDemuxer {
     reported: HashMap<u32, Arc<StreamInfo>>,
     live: bool,
     duration: Option<Duration>,
-    abr: Abr,
-    blacklist: Vec<bool>,
+    selection: Selection,
+    /// Playlists of the current variant's audio renditions, and which one plays.
+    rendition_uris: Vec<Url>,
+    rendition: Option<usize>,
 }
 
 impl HlsDemuxer {
     /// Opens the playlist at `url` (master or media) and the first segments. `registry` decides
     /// which variants are playable.
     pub fn open(url: &Url, registry: &Registry) -> Result<HlsDemuxer> {
-        let cancel = Arc::new(AtomicBool::new(false));
-        let fetch = Fetcher::new(cancel.clone());
+        // Each track has its own cancel flag: dropping one (a replaced audio rendition) must not
+        // stop the others.
+        let fetch = Fetcher::new(Arc::new(AtomicBool::new(false)));
         let first = fetch.get(url, None)?;
         let text = String::from_utf8_lossy(&first.data);
         let (variants, renditions) = match playlist::parse(&text, &first.url)? {
@@ -174,7 +243,7 @@ impl HlsDemuxer {
         // The first variant whose playlist is playable (DRM-protected ones are left out).
         let (main, chosen) = loop {
             let chosen = Abr::initial(&bitrates, first.data.len() as u64, first.elapsed, &blacklist);
-            let cfg = TrackConfig { playlists: playlists.clone(), variant: chosen, start: Start::LiveEdge, cancel: cancel.clone() };
+            let cfg = TrackConfig { playlists: playlists.clone(), variant: chosen, start: Start::LiveEdge, cancel: Arc::new(AtomicBool::new(false)) };
             match Track::start(cfg) {
                 Ok(t) => break (t, chosen),
                 Err(e @ Error::Unsupported(_)) => {
@@ -187,10 +256,14 @@ impl HlsDemuxer {
                 Err(e) => return Err(e),
             }
         };
-        let rendition = pick_rendition(&renditions, variants[chosen].audio_group.as_deref());
-        let audio = match rendition.and_then(|r| r.uri.clone()) {
+        let group: Vec<&Rendition> = match variants[chosen].audio_group.as_deref() {
+            Some(g) => renditions.iter().filter(|r| r.group == g && r.uri.is_some()).collect(),
+            None => Vec::new(),
+        };
+        let rendition = group.iter().position(|r| r.default).or((!group.is_empty()).then_some(0));
+        let audio = match rendition.and_then(|i| group[i].uri.clone()) {
             Some(uri) => {
-                let cfg = TrackConfig { playlists: vec![uri], variant: 0, start: Start::LiveEdge, cancel: cancel.clone() };
+                let cfg = TrackConfig { playlists: vec![uri], variant: 0, start: Start::LiveEdge, cancel: Arc::new(AtomicBool::new(false)) };
                 Some(Lane::new(Role::Audio, Track::start(cfg)?, true))
             }
             None => None,
@@ -203,11 +276,14 @@ impl HlsDemuxer {
                 .iter()
                 .map(|v| VariantInfo { bandwidth: v.bandwidth, resolution: v.resolution, codecs: v.codecs.clone(), frame_rate: v.frame_rate })
                 .collect(),
-            renditions: renditions.iter().map(|r| AudioRendition { name: r.name.clone(), language: r.language.clone() }).collect(),
+            renditions: group.iter().map(|r| AudioRendition { name: r.name.clone(), language: r.language.clone() }).collect(),
             current: AtomicUsize::new(chosen),
             requested: Mutex::new(None),
+            requested_audio: Mutex::new(None),
+            events: Mutex::new(None),
             shutdown: AtomicBool::new(false),
         });
+        let rendition_uris = group.iter().filter_map(|r| r.uri.clone()).collect();
         let mut d = HlsDemuxer {
             control,
             main: Lane::new(Role::Main, main, audio.is_none()),
@@ -218,8 +294,16 @@ impl HlsDemuxer {
             reported: HashMap::new(),
             live,
             duration,
-            abr: Abr::new(bitrates),
-            blacklist,
+            selection: Selection {
+                abr: Abr::new(bitrates),
+                blacklist,
+                fetching: chosen,
+                manual: None,
+                received_end: Duration::ZERO,
+                returned: Duration::ZERO,
+            },
+            rendition_uris,
+            rendition,
         };
         d.fill_all()?;
         let video = d.main.formats.get(&StreamKind::Video).cloned();
@@ -253,15 +337,35 @@ impl HlsDemuxer {
     }
 
     fn fill_all(&mut self) -> Result<()> {
-        Self::fill(&mut self.main, &mut self.timeline, &self.control)?;
+        Self::fill(&mut self.main, &mut self.timeline, &self.control, Some(&mut self.selection))?;
         if let Some(a) = self.audio.as_mut() {
-            Self::fill(a, &mut self.timeline, &self.control)?;
+            Self::fill(a, &mut self.timeline, &self.control, None)?;
         }
         Ok(())
     }
 
+    /// Applies an audio rendition change the application asked for: a new audio lane from where
+    /// the audio is now.
+    fn switch_rendition(&mut self) -> Result<()> {
+        let Some(i) = self.control.requested_audio.lock().unwrap().take() else { return Ok(()) };
+        if Some(i) == self.rendition || i >= self.rendition_uris.len() {
+            return Ok(());
+        }
+        let now = self.audio.as_ref().and_then(|a| a.pending.as_ref()).map_or(self.selection.returned, |p| p.pts);
+        let start = if self.live { Start::LiveEdge } else { Start::At(now) };
+        let cfg = TrackConfig { playlists: vec![self.rendition_uris[i].clone()], variant: 0, start, cancel: Arc::new(AtomicBool::new(false)) };
+        let track = Track::start(cfg)?;
+        self.timeline.forget(Role::Audio);
+        let mut lane = Lane::new(Role::Audio, track, true);
+        // Nothing before where the old rendition was.
+        lane.skip_before = Some(now);
+        self.audio = Some(lane);
+        self.rendition = Some(i);
+        Ok(())
+    }
+
     /// Makes `lane.pending` hold the lane's next packet, unless the lane has ended.
-    fn fill(lane: &mut Lane, timeline: &mut Timeline, control: &HlsControl) -> Result<()> {
+    fn fill(lane: &mut Lane, timeline: &mut Timeline, control: &HlsControl, mut selection: Option<&mut Selection>) -> Result<()> {
         while lane.pending.is_none() && !lane.ended {
             if control.shutdown.load(Ordering::Relaxed) {
                 lane.ended = true;
@@ -297,13 +401,23 @@ impl HlsDemuxer {
                     StreamKind::Video => (VIDEO_ID, lane.formats[&StreamKind::Video].clone()),
                     _ => (AUDIO_ID, lane.formats[&StreamKind::Audio].clone()),
                 };
-                lane.pending = Some(Out { id, pts: Timeline::map(open.offset, raw.raw), keyframe: raw.keyframe, data: raw.data, info });
+                let pts = Timeline::map(open.offset, raw.raw);
+                if lane.skip_before.is_some_and(|t| pts < t) {
+                    continue;
+                }
+                lane.skip_before = None;
+                lane.pending = Some(Out { id, pts, keyframe: raw.keyframe, data: raw.data, info });
                 continue;
             }
             match lane.track.recv(POLL) {
                 None => {}
                 Some(TrackEvent::Segment(s)) if s.epoch < lane.epoch => {}
-                Some(TrackEvent::Segment(s)) => Self::open_segment(lane, timeline, s)?,
+                Some(TrackEvent::Segment(s)) => {
+                    if let Some(sel) = selection.as_deref_mut() {
+                        sel.on_segment(&s, control, &lane.track);
+                    }
+                    Self::open_segment(lane, timeline, s)?
+                }
                 Some(TrackEvent::End) => lane.ended = true,
                 Some(TrackEvent::Failed(e)) => return Err(e),
             }
@@ -326,7 +440,7 @@ impl HlsDemuxer {
         }
         let first = demux.first_raw()?.unwrap_or_default();
         let offset = timeline.anchor(lane.role, s.discontinuity_seq, s.start, first);
-        lane.seg = Some(Open { demux, offset, variant: s.variant, disc: s.discontinuity_seq });
+        lane.seg = Some(Open { demux, offset, disc: s.discontinuity_seq });
         Ok(())
     }
 }
@@ -337,6 +451,7 @@ impl Demuxer for HlsDemuxer {
     }
 
     fn next_packet(&mut self) -> Result<Option<Packet>> {
+        self.switch_rendition()?;
         self.fill_all()?;
         let take_audio = match (&self.main.pending, self.audio.as_ref().and_then(|a| a.pending.as_ref())) {
             (None, None) => return Ok(None),
@@ -345,6 +460,9 @@ impl Demuxer for HlsDemuxer {
             (Some(m), Some(a)) => a.pts <= m.pts,
         };
         let out = if take_audio { self.audio.as_mut().unwrap().pending.take() } else { self.main.pending.take() }.unwrap();
+        if !take_audio {
+            self.selection.returned = out.pts;
+        }
         let changed = self.reported.get(&out.id).is_none_or(|r| !same_format(r, &out.info));
         if changed {
             self.reported.insert(out.id, out.info.clone());
@@ -373,6 +491,7 @@ impl Demuxer for HlsDemuxer {
             lane.ts_ref = None;
         }
         self.main.wait_key = has_video;
+        self.selection.returned = target;
         self.fill_all()?;
         Ok(self.main.pending.as_ref().or(self.audio.as_ref().and_then(|a| a.pending.as_ref())).map_or(target, |p| p.pts))
     }
@@ -401,13 +520,4 @@ fn decodable(registry: &Registry, codecs: &[String]) -> bool {
         };
         registry.can_decode(&StreamInfo::new(0, kind, codec))
     })
-}
-
-/// The audio rendition of `group` to play: the default one with its own playlist, else the
-/// first with one. `None` when the variant's audio is muxed into its own segments.
-fn pick_rendition<'a>(renditions: &'a [Rendition], group: Option<&str>) -> Option<&'a Rendition> {
-    let group = group?;
-    let mut in_group = renditions.iter().filter(|r| r.group == group && r.uri.is_some());
-    let all: Vec<&Rendition> = in_group.by_ref().collect();
-    all.iter().find(|r| r.default).or(all.first()).copied()
 }

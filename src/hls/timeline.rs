@@ -52,6 +52,11 @@ impl Timeline {
         offset
     }
 
+    /// Drops `role`'s offsets (another rendition takes its place).
+    pub fn forget(&mut self, role: Role) {
+        self.offsets.retain(|(r, _), _| *r != role);
+    }
+
     /// `raw` on the timeline (never before 0).
     pub fn map(offset: i128, raw: Duration) -> Duration {
         let t = raw.as_nanos() as i128 + offset;

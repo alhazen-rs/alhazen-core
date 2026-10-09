@@ -51,6 +51,8 @@ pub enum PlayerEvent {
     Warning(String),
     Error(Arc<Error>),
     Ended,
+    /// HLS: playback moved to this variant (an index into `Player::variants()`).
+    VariantChanged(usize),
 }
 
 /// Diagnostics for a playing `Player`.
@@ -414,6 +416,7 @@ impl Player {
             let control = demuxer.control();
             let seekable = !demuxer.is_live();
             let mut player = Self::open_demuxer_inner(Box::new(demuxer), seekable, registry, config)?;
+            control.set_events(player.shared.events.clone());
             player.hls = Some(control);
             Ok(player)
         }
@@ -554,6 +557,41 @@ impl Player {
             player.play();
         }
         Ok(player)
+    }
+
+    /// HLS: the variants (qualities) of the stream; empty for other media.
+    #[cfg(feature = "hls")]
+    pub fn variants(&self) -> Vec<crate::hls::VariantInfo> {
+        self.hls.as_ref().map(|h| h.variants()).unwrap_or_default()
+    }
+
+    /// HLS: the variant playing now (an index into `variants()`).
+    #[cfg(feature = "hls")]
+    pub fn current_variant(&self) -> Option<usize> {
+        self.hls.as_ref().map(|h| h.current_variant())
+    }
+
+    /// HLS: plays this variant from the next segment on (`Auto`: adaptive bitrate, the default).
+    /// Ignored for other media.
+    #[cfg(feature = "hls")]
+    pub fn set_variant(&self, v: crate::hls::Variant) {
+        if let Some(h) = &self.hls {
+            h.set_variant(v);
+        }
+    }
+
+    /// HLS: the alternative audio tracks of the variant playing (empty when its audio is muxed in).
+    #[cfg(feature = "hls")]
+    pub fn audio_renditions(&self) -> Vec<crate::hls::AudioRendition> {
+        self.hls.as_ref().map(|h| h.audio_renditions()).unwrap_or_default()
+    }
+
+    /// HLS: switches to another of `audio_renditions()`.
+    #[cfg(feature = "hls")]
+    pub fn set_audio_rendition(&self, index: usize) {
+        if let Some(h) = &self.hls {
+            h.set_audio_rendition(index);
+        }
     }
 
     pub fn play(&self) {
