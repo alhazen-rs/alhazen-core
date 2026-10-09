@@ -1,4 +1,6 @@
-//! Buffered positional reads over a `MediaSource` (64 KiB read-ahead; seeks only outside it).
+//! Buffered positional reads over a `MediaSource`: 64 KiB read-ahead, continuing forward reads
+//! without seeking (a seek back over HTTP is a new connection, and impossible without Range
+//! support).
 
 use std::io::{Read, SeekFrom};
 
@@ -12,11 +14,15 @@ pub(crate) struct ReadWindow {
     buf: Vec<u8>,
     /// File offset of `buf[0]`.
     start: u64,
+    /// The source's position when known: `start + buf.len()` after a read.
+    src_pos: Option<u64>,
+    /// The last read reached the end of the source.
+    eof: bool,
 }
 
 impl ReadWindow {
     pub fn new(src: Box<dyn MediaSource>) -> Self {
-        Self { src, buf: Vec::new(), start: 0 }
+        Self { src, buf: Vec::new(), start: 0, src_pos: None, eof: false }
     }
 
     pub fn len(&self) -> Option<u64> {
@@ -33,21 +39,34 @@ impl ReadWindow {
 
     /// Up to `len` bytes at `pos`; fewer only at the end of the file.
     pub fn at(&mut self, pos: u64, len: usize) -> Result<&[u8]> {
-        let inside = pos >= self.start && pos + len as u64 <= self.start + self.buf.len() as u64;
-        if !inside {
+        let end = self.start + self.buf.len() as u64;
+        let inside = pos >= self.start && pos + len as u64 <= end;
+        let continues = pos >= self.start && pos <= end && self.src_pos == Some(end);
+        if !inside && !(continues && self.eof) {
+            if continues {
+                // Keep what is still wanted and read on from where the source is.
+                self.buf.drain(..(pos - self.start) as usize);
+            } else {
+                if self.src_pos != Some(pos) {
+                    self.src.seek(SeekFrom::Start(pos))?;
+                }
+                self.buf.clear();
+            }
+            self.start = pos;
             let want = len.max(READ_AHEAD);
-            self.src.seek(SeekFrom::Start(pos))?;
-            self.buf.resize(want, 0);
-            let mut filled = 0;
+            let mut filled = self.buf.len();
+            self.buf.resize(want.max(filled), 0);
+            self.eof = false;
             while filled < want {
                 let n = self.src.read(&mut self.buf[filled..])?;
                 if n == 0 {
+                    self.eof = true;
                     break;
                 }
                 filled += n;
             }
             self.buf.truncate(filled);
-            self.start = pos;
+            self.src_pos = Some(self.start + filled as u64);
         }
         let off = (pos - self.start) as usize;
         let end = (off + len).min(self.buf.len());

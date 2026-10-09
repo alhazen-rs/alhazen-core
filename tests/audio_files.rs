@@ -528,3 +528,125 @@ fn every_reader_survives_edge_seeks() {
         assert_eq!(d.next_packet().unwrap().expect("audio after seeking to 0").pts, Duration::ZERO, "{name}");
     }
 }
+
+/// A file seen as a network source (not local), counting seeks backwards from the read position:
+/// each one is a new connection over HTTP, and impossible on a server without Range support.
+struct NetworkLike {
+    file: alhazen_core::source::FileSource,
+    pos: u64,
+    backward: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Bytes read so far.
+    read: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl std::io::Read for NetworkLike {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.file.read(buf)?;
+        self.pos += n as u64;
+        self.read.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for NetworkLike {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        let new = self.file.seek(to)?;
+        if new < self.pos {
+            self.backward.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.pos = new;
+        Ok(new)
+    }
+}
+
+impl alhazen_core::source::MediaSource for NetworkLike {
+    fn byte_len(&self) -> Option<u64> {
+        self.file.byte_len()
+    }
+    fn is_seekable(&self) -> bool {
+        true
+    }
+    fn is_live(&self) -> bool {
+        false
+    }
+    fn description(&self) -> String {
+        "network-like".into()
+    }
+}
+
+#[test]
+fn reading_a_file_through_does_not_seek_backwards() {
+    use std::io::Seek;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for (name, codec) in [
+        ("stream.mp3", &["-c:a", "libmp3lame", "-b:a", "128k"][..]),
+        ("stream.flac", &["-c:a", "flac"][..]),
+        ("stream.ogg", &["-c:a", "libvorbis"][..]),
+        ("stream.aac", &["-c:a", "aac", "-f", "adts"][..]),
+        ("stream.wav", &["-c:a", "pcm_s24le"][..]),
+    ] {
+        let Some(path) = generated(name, codec) else { return };
+        let backward = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut src: Box<dyn alhazen_core::source::MediaSource> =
+            Box::new(NetworkLike {
+            file: alhazen_core::source::FileSource::open(&path).unwrap(),
+            pos: 0,
+            backward: backward.clone(),
+            read: Default::default(),
+        });
+        let format = alhazen_core::demux::probe(src.as_mut()).unwrap().unwrap();
+        src.rewind().unwrap();
+        let mut d = Registry::empty_with_native().open_demuxer(&Source::parse(&path).unwrap(), format, src, None).unwrap();
+        let at_open = backward.load(Ordering::Relaxed);
+        let mut packets = 0;
+        while d.next_packet().unwrap().is_some() {
+            packets += 1;
+        }
+        assert!(packets > 100, "{name}: {packets} packets");
+        assert_eq!(backward.load(Ordering::Relaxed) - at_open, 0, "{name}: backward seeks while reading through");
+    }
+}
+
+#[test]
+fn broken_matroska_tags_do_not_stop_playback() {
+    let mut bytes = std::fs::read(fixture("mka_tagged.mka")).unwrap();
+    // Inside the Tags element (its last occurrence; the first is SeekHead's reference to it),
+    // make the first Tag's id invalid.
+    let tags = bytes.windows(4).rposition(|w| w == [0x12, 0x54, 0xC3, 0x67]).unwrap();
+    let tag = tags + bytes[tags..].windows(2).position(|w| w == [0x73, 0x73]).unwrap();
+    bytes[tag..tag + 2].fill(0);
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("broken_tags.mka");
+    std::fs::write(&path, bytes).unwrap();
+    let mut d = open_path(path.to_str().unwrap());
+    let s = audio(&*d);
+    assert!(decode(&mut *d, &s, |_| false).samples.len() > 10_000, "plays without its tags");
+}
+
+#[test]
+fn matroska_attachments_that_are_not_images_are_not_read() {
+    use std::sync::atomic::Ordering;
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let font = dir.join("big_font.ttf");
+    std::fs::write(&font, vec![0x5Au8; 5 << 20]).unwrap();
+    let path = dir.join("with_font.mka");
+    let made = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=f=440:r=48000:d=1", "-c:a", "libopus", "-attach"])
+        .arg(&font)
+        .args(["-metadata:s:t", "mimetype=font/ttf"])
+        .arg(&path)
+        .status();
+    if !made.is_ok_and(|s| s.success()) {
+        eprintln!("skipped: no ffmpeg");
+        return;
+    }
+    let read = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let src = Box::new(NetworkLike {
+        file: alhazen_core::source::FileSource::open(&path).unwrap(),
+        pos: 0,
+        backward: Default::default(),
+        read: read.clone(),
+    });
+    let d = alhazen_core::demux::MatroskaDemuxer::open(src).unwrap();
+    assert!(d.metadata().is_none_or(|m| m.cover.is_none()));
+    assert!(read.load(Ordering::Relaxed) < 1 << 20, "opening read {} bytes", read.load(Ordering::Relaxed));
+}

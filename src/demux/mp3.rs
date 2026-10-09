@@ -166,8 +166,9 @@ impl Demuxer for Mp3Demuxer {
                     let b = if i < 99 { toc.table[i + 1] as f64 } else { 256.0 };
                     toc.base + ((a + (b - a) * (pct - i as f64)) / 256.0 * toc.bytes as f64) as u64
                 }
-                (_, Some(total)) if total > 0 => {
-                    self.frames.first + (self.frames.end.saturating_sub(self.frames.first)) / total * frame
+                (_, Some(total)) if total > 0 && self.frames.end != u64::MAX => {
+                    let audio = (self.frames.end - self.frames.first) as f64;
+                    self.frames.first + (audio * frame.min(total) as f64 / total as f64) as u64
                 }
                 _ => self.frames.first + (target.as_secs_f64() * self.bytes_per_sec) as u64,
             };
@@ -198,6 +199,54 @@ mod tests {
         let v = vbr_info(&frame, &h).unwrap();
         assert_eq!((v.frames, v.bytes, v.delay, v.padding), (Some(300), Some(125_000), Some(576), 288));
         assert_eq!(v.toc.unwrap()[50], 128);
+    }
+
+    /// In-memory bytes seen as a network source of unknown length.
+    struct Unsized(std::io::Cursor<Vec<u8>>);
+
+    impl std::io::Read for Unsized {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl std::io::Seek for Unsized {
+        fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(to)
+        }
+    }
+
+    impl MediaSource for Unsized {
+        fn byte_len(&self) -> Option<u64> {
+            None
+        }
+        fn is_seekable(&self) -> bool {
+            true
+        }
+        fn is_live(&self) -> bool {
+            false
+        }
+        fn description(&self) -> String {
+            "unsized".into()
+        }
+    }
+
+    #[test]
+    fn seeking_past_the_end_of_a_stream_of_unknown_length() {
+        // An Info frame with a frame count but no seek table, then the audio of a CBR file.
+        let file = std::fs::read("tests/fixtures/mp3_no_xing.mp3").unwrap();
+        let first = super::super::tags::id3::id3v2_len(&file).unwrap_or(0) as usize;
+        let h = MpegHeader::parse(&file[first..]).unwrap();
+        let mut info = file[first..first + 4].to_vec();
+        info.resize(4 + h.side_info_len(), 0);
+        info.extend(b"Info");
+        info.extend(1u32.to_be_bytes()); // frames only
+        info.extend(1000u32.to_be_bytes());
+        info.resize(h.frame_len, 0);
+        let bytes = [&info[..], &file[first..]].concat();
+        let mut d = Mp3Demuxer::open(Box::new(Unsized(std::io::Cursor::new(bytes)))).unwrap();
+        d.seek(Duration::from_secs(999)).unwrap();
+        while d.next_packet().unwrap().is_some() {}
     }
 
     #[test]

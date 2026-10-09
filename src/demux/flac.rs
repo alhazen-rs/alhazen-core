@@ -243,17 +243,21 @@ impl FlacDemuxer {
         let mut at = from;
         loop {
             let chunk = self.w.at(at, CHUNK)?.to_vec();
-            if chunk.len() < 16 {
-                return Ok(None);
-            }
-            for i in 0..chunk.len() - 16 {
+            // Each step overlaps the next by 16 bytes (a frame header can straddle them); the
+            // last, short chunk is scanned to its end.
+            let last = chunk.len() < CHUNK;
+            let scan = if last { chunk.len() } else { chunk.len() - 16 };
+            for i in 0..scan {
                 if chunk[i] == 0xFF
                     && let Some(f) = flac_frame_header(&chunk[i..], &self.info)
                 {
                     return Ok(Some((at + i as u64, f.sample)));
                 }
             }
-            at += (chunk.len() - 16) as u64;
+            if last {
+                return Ok(None);
+            }
+            at += scan as u64;
         }
     }
 
@@ -380,6 +384,26 @@ mod tests {
             assert_eq!(a.seek(t).unwrap(), b.seek(t).unwrap(), "{t:?}");
             assert_eq!(a.next_packet().unwrap().unwrap().pts, b.next_packet().unwrap().unwrap().pts);
         }
+    }
+
+    #[test]
+    fn junk_after_the_metadata_ends_the_stream_without_hanging() {
+        // fLaC + STREAMINFO (last block; 44.1 kHz stereo 16-bit) + 64 zero bytes: no frame anywhere.
+        let mut bytes = b"fLaC\x80\x00\x00\x22".to_vec();
+        let mut info = [0u8; 34];
+        info[..4].copy_from_slice(&[0x10, 0x00, 0x10, 0x00]);
+        info[10..14].copy_from_slice(&[0x0A, 0xC4, 0x42, 0xF0]);
+        bytes.extend(info);
+        bytes.extend([0u8; 64]);
+        let path = std::env::temp_dir().join(format!("flac_junk_{}.flac", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut d = FlacDemuxer::open(Box::new(FileSource::open(&path).unwrap())).unwrap();
+            let _ = tx.send(d.next_packet().map(|p| p.is_none()));
+        });
+        let ended = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("next_packet hung");
+        assert!(ended.unwrap(), "no packet from junk");
     }
 
     #[test]

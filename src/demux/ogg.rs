@@ -44,15 +44,13 @@ fn ogg_crc(b: &[u8]) -> u32 {
 
 /// The page at `at`, when a valid one (capture pattern, version 0, CRC) starts there.
 fn read_page(w: &mut ReadWindow, at: u64) -> Result<Option<Page>> {
-    let head = w.at(at, 27)?.to_vec();
+    // Header and lacing table in one read (reading them separately would seek back to `at`).
+    let head = w.at(at, 27 + 255)?.to_vec();
     if head.len() < 27 || &head[..4] != b"OggS" || head[4] != 0 {
         return Ok(None);
     }
     let segments = head[26] as usize;
-    let lacing = w.at(at + 27, segments)?.to_vec();
-    if lacing.len() < segments {
-        return Ok(None);
-    }
+    let Some(lacing) = head.get(27..27 + segments) else { return Ok(None) };
     let total = 27 + segments + lacing.iter().map(|&l| l as usize).sum::<usize>();
     let mut bytes = w.at(at, total)?.to_vec();
     if bytes.len() < total {
@@ -64,7 +62,7 @@ fn read_page(w: &mut ReadWindow, at: u64) -> Result<Option<Page>> {
         return Ok(None);
     }
     let (mut packets, mut current, mut pos) = (Vec::new(), Vec::new(), 27 + segments);
-    for &l in &lacing {
+    for &l in lacing {
         current.extend_from_slice(&bytes[pos..pos + l as usize]);
         pos += l as usize;
         if l < 255 {
@@ -217,7 +215,13 @@ impl OggDemuxer {
             }
         }
         let end = w.len().unwrap_or(u64::MAX);
-        let last = if end != u64::MAX && w.is_seekable() { last_granule(&mut w, serial, end)? } else { None };
+        let last = if end != u64::MAX && w.is_seekable() {
+            let last = last_granule(&mut w, serial, end)?;
+            w.at(pos, 1)?; // back to the audio now, so reading it never seeks back
+            last
+        } else {
+            None
+        };
         let (mut meta, mut covers) = (Metadata::default(), CoverPick::default());
         let secs = |samples: u64, rate: u32| Duration::from_secs_f64(samples as f64 / rate as f64);
         let id = &headers[0];

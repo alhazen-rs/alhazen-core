@@ -83,12 +83,19 @@ impl MatroskaDemuxer {
                     seek.attachments = s.attachments.or(seek.attachments);
                 }
                 id::INFO => duration_ticks = d.parse_info(h, &mut segment_title)?,
+                // Tags are optional: a damaged element is skipped, never fatal.
                 id::TAGS => {
-                    d.parse_tags(h, &mut meta)?;
+                    if let Err(e) = d.parse_tags(h, &mut meta) {
+                        log::warn!("matroska: tags not read: {e}");
+                        d.r.seek_to(h.data_start + known(h)?)?;
+                    }
                     have_tags = true;
                 }
                 id::ATTACHMENTS => {
-                    d.parse_attachments(h, &mut covers)?;
+                    if let Err(e) = d.parse_attachments(h, &mut covers) {
+                        log::warn!("matroska: attachments not read: {e}");
+                        d.r.seek_to(h.data_start + known(h)?)?;
+                    }
                     have_attachments = true;
                 }
                 id::TRACKS => d.parse_tracks(h)?,
@@ -128,10 +135,14 @@ impl MatroskaDemuxer {
                 let Some(rel) = rel.filter(|_| !done) else { continue };
                 d.r.seek_to(d.segment_start + rel)?;
                 moved = true;
-                match d.r.read_header()? {
-                    Some(h) if h.id == want && want == id::TAGS => d.parse_tags(h, &mut meta)?,
-                    Some(h) if h.id == want => d.parse_attachments(h, &mut covers)?,
-                    _ => {}
+                let read = match d.r.read_header() {
+                    Ok(Some(h)) if h.id == want && want == id::TAGS => d.parse_tags(h, &mut meta),
+                    Ok(Some(h)) if h.id == want => d.parse_attachments(h, &mut covers),
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(e.into()),
+                };
+                if let Err(e) = read {
+                    log::warn!("matroska: tags or attachments not read: {e}");
                 }
             }
             if moved {
@@ -238,7 +249,14 @@ impl MatroskaDemuxer {
                 match c.id {
                     id::FILE_NAME if size <= 1024 => name = self.r.read_string(size)?,
                     id::FILE_MIME_TYPE if size <= 256 => mime = self.r.read_string(size)?,
-                    id::FILE_DATA if size as usize <= MAX_PICTURE => data = Some(self.r.read_bytes(size)?),
+                    // Only images: other attachments (often fonts, tens of MB) are skipped unread.
+                    // FileName and FileMediaType come before FileData.
+                    id::FILE_DATA
+                        if size as usize <= MAX_PICTURE
+                            && (mime.starts_with("image/") || name.to_ascii_lowercase().starts_with("cover")) =>
+                    {
+                        data = Some(self.r.read_bytes(size)?)
+                    }
                     _ => self.r.skip(size)?,
                 }
             }

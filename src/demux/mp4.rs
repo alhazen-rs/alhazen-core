@@ -250,7 +250,7 @@ fn udta_offset(moov: &[u8]) -> Option<u64> {
         if &moov[at + 4..at + 8] == b"udta" {
             return Some(at as u64);
         }
-        if size < 8 {
+        if size < 8 || size > moov.len() - at {
             return None;
         }
         at += size;
@@ -600,6 +600,17 @@ mod tests {
         let landed = d.seek(Duration::ZERO).unwrap();
         assert_eq!(landed, Duration::ZERO, "lands on the keyframe");
         assert_eq!(first_audio(&mut d), Duration::ZERO, "the first audio packet (the padding) survives the seek");
+    }
+
+    #[test]
+    fn a_huge_box_size_in_moov_is_not_followed() {
+        // A 64-bit size of u64::MAX on moov's first child: no overflow, no panic.
+        let moov = [&[0, 0, 0, 1][..], b"trak", &[0xFF; 8]].concat();
+        assert_eq!(udta_offset(&moov), None);
+        let mut ok = [&[0, 0, 0, 16][..], b"trak", &[0; 8]].concat();
+        ok.extend([0, 0, 0, 8]);
+        ok.extend(b"udta");
+        assert_eq!(udta_offset(&ok), Some(16));
     }
 
     fn open() -> Mp4Demuxer {
