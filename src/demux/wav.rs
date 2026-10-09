@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use super::mpeg_audio::read_id3v2_tags;
 use super::window::ReadWindow;
 use super::{Codec, Demuxer, Metadata, Packet, PcmFormat, StreamInfo, StreamKind, tags};
 use crate::source::MediaSource;
@@ -28,14 +29,16 @@ pub struct WavDemuxer {
 impl WavDemuxer {
     pub fn open(src: Box<dyn MediaSource>) -> Result<Self> {
         let mut w = ReadWindow::new(src);
-        let head = w.at(0, 12)?;
+        let mut meta = Metadata::default();
+        // Some tools put an ID3v2 tag in front of WAV files.
+        let start = read_id3v2_tags(&mut w, &mut meta)?;
+        let head = w.at(start, 12)?;
         if head.len() < 12 || &head[..4] != b"RIFF" || &head[8..12] != b"WAVE" {
             return Err(Error::UnsupportedContainer);
         }
         let file_end = w.len().unwrap_or(u64::MAX);
-        let mut meta = Metadata::default();
         let (mut fmt, mut data) = (None::<Vec<u8>>, None::<(u64, u64)>);
-        let mut pos = 12u64;
+        let mut pos = start + 12;
         while pos.saturating_add(8) <= file_end {
             let chunk = w.at(pos, 8)?.to_vec();
             if chunk.len() < 8 {

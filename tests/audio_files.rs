@@ -696,3 +696,20 @@ fn chained_ogg_open_does_not_scan_the_whole_file_back() {
     let s = audio(&*d);
     assert!(decode(&mut *d, &s, |_| false).samples.len() > 48_000, "the first stream plays");
 }
+
+#[test]
+fn flac_and_wav_after_an_id3_tag_are_detected_and_play() {
+    let mp3 = std::fs::read(fixture("mp3_tagged.mp3")).unwrap();
+    let tag_len = 10 + (mp3[6..10].iter().fold(0usize, |v, &b| v << 7 | b as usize));
+    for (name, format) in [("flac.flac", alhazen_core::demux::ContainerFormat::Flac), ("wav_s16.wav", alhazen_core::demux::ContainerFormat::Wav)] {
+        let bytes = [&mp3[..tag_len], &std::fs::read(fixture(name)).unwrap()[..]].concat();
+        let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("id3_{name}"));
+        std::fs::write(&path, bytes).unwrap();
+        let mut src = alhazen_core::source::FileSource::open(&path).unwrap();
+        assert_eq!(alhazen_core::demux::probe(&mut src).unwrap(), Some(format), "{name}");
+        let mut d = open_path(path.to_str().unwrap());
+        assert_eq!(d.metadata().and_then(|m| m.title.clone()).as_deref(), Some("Test Title"), "{name}: the ID3 tag is read");
+        let s = audio(&*d);
+        assert_eq!(decode(&mut *d, &s, |_| false).samples, decode_all(name).1.samples, "{name}");
+    }
+}

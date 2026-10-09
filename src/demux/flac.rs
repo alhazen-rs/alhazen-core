@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use super::metadata::{CoverPick, MAX_PICTURE};
+use super::mpeg_audio::read_id3v2_tags;
 use super::window::ReadWindow;
 use super::{Codec, Demuxer, Metadata, Packet, StreamInfo, StreamKind, tags};
 use crate::source::MediaSource;
@@ -151,12 +152,14 @@ pub struct FlacDemuxer {
 impl FlacDemuxer {
     pub fn open(src: Box<dyn MediaSource>) -> Result<Self> {
         let mut w = ReadWindow::new(src);
-        if w.at(0, 4)? != b"fLaC" {
+        let (mut meta, mut covers) = (Metadata::default(), CoverPick::default());
+        // Some tools put an ID3v2 tag in front of FLAC files.
+        let start = read_id3v2_tags(&mut w, &mut meta)?;
+        if w.at(start, 4)? != b"fLaC" {
             return Err(Error::UnsupportedContainer);
         }
-        let (mut meta, mut covers) = (Metadata::default(), CoverPick::default());
         let (mut info, mut raw_info, mut seektable) = (None, Vec::new(), Vec::new());
-        let mut pos = 4u64;
+        let mut pos = start + 4;
         loop {
             let h = w.at(pos, 4)?.to_vec();
             if h.len() < 4 {
