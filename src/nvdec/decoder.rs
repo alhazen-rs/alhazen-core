@@ -21,7 +21,6 @@ struct Setup {
     bit_depth: u32,
     /// Largest coded size the decoder accepts without being recreated.
     max: (u32, u32),
-    coded: (u32, u32),
     display: Rect16,
     target: (u32, u32),
     surfaces: u32,
@@ -332,7 +331,7 @@ impl Inner {
             && surfaces <= s.surfaces
         {
             self.reconfigure(coded, display, target, s.surfaces)?;
-            self.setup = Some(Setup { coded, display, target, matrix, full_range, ..s });
+            self.setup = Some(Setup { display, target, matrix, full_range, ..s });
             self.retarget = false;
             return Ok(s.surfaces as c_int);
         }
@@ -355,7 +354,7 @@ impl Inner {
         info.ulNumOutputSurfaces = 2;
         // SAFETY: valid create info; context current (inside a parse call).
         check(unsafe { (self.dev.api().cuvidCreateDecoder)(&mut self.decoder, &mut info) }, "create decoder")?;
-        self.setup = Some(Setup { codec: fmt.codec, bit_depth, max: coded, coded, display, target, surfaces, matrix, full_range });
+        self.setup = Some(Setup { codec: fmt.codec, bit_depth, max: coded, display, target, surfaces, matrix, full_range });
         self.retarget = false;
         Ok(surfaces as c_int)
     }
