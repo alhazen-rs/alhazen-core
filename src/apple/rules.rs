@@ -18,6 +18,19 @@ pub(crate) fn has_decoder(codec: HwCodec, _hardware_only: bool, hardware: impl F
     }
 }
 
+/// Whether the stream carries what Apple's decoders need before the first packet: the setup
+/// record for H.264, HEVC and AV1 (VP9's is built from its first keyframe), ALAC's cookie, and for
+/// AAC a USAC config (other AAC stays native). Streams without it are left to other backends.
+pub(crate) fn stream_ok(stream: &crate::demux::StreamInfo) -> bool {
+    use crate::demux::Codec;
+    let setup = stream.extradata.as_deref().filter(|d| !d.is_empty());
+    match stream.codec {
+        Codec::H264 | Codec::Hevc | Codec::Av1 | Codec::Alac => setup.is_some(),
+        Codec::Aac => setup.is_some_and(is_usac),
+        _ => true,
+    }
+}
+
 /// Whether an AudioSpecificConfig is USAC (xHE-AAC, audio object type 42), which the native AAC
 /// decoder does not handle.
 pub(crate) fn is_usac(asc: &[u8]) -> bool {
@@ -75,5 +88,25 @@ mod tests {
         assert!(!is_usac(&[0x2B, 0x11, 0x88, 0x00]), "HE-AAC (SBR)");
         assert!(!is_usac(&[]));
         assert!(!is_usac(&[0xF8]), "truncated escape");
+    }
+
+    #[test]
+    fn streams_without_what_the_decoder_needs_are_not_claimed() {
+        use crate::demux::{Codec, StreamInfo, StreamKind};
+        let with = |kind, codec, extradata: Option<Vec<u8>>| {
+            let mut s = StreamInfo::new(1, kind, codec);
+            s.extradata = extradata;
+            s
+        };
+        for c in [Codec::H264, Codec::Hevc, Codec::Av1] {
+            assert!(!stream_ok(&with(StreamKind::Video, c.clone(), None)), "{c:?} without its setup record");
+            assert!(stream_ok(&with(StreamKind::Video, c, Some(vec![1, 2, 3]))));
+        }
+        assert!(stream_ok(&with(StreamKind::Video, Codec::Vp9, None)), "vpcC comes from the first keyframe");
+        assert!(stream_ok(&with(StreamKind::Video, Codec::ProRes, None)));
+        assert!(!stream_ok(&with(StreamKind::Audio, Codec::Aac, Some(vec![0x12, 0x10]))), "plain AAC");
+        assert!(stream_ok(&with(StreamKind::Audio, Codec::Aac, Some(vec![0xF9, 0x40, 0, 0]))), "USAC");
+        assert!(!stream_ok(&with(StreamKind::Audio, Codec::Alac, None)), "ALAC needs its cookie");
+        assert!(stream_ok(&with(StreamKind::Audio, Codec::Ac3, None)));
     }
 }

@@ -70,15 +70,13 @@ impl Backend for AppleBackend {
         Err(Error::UnsupportedContainer)
     }
     fn supports_video(&self, stream: &StreamInfo) -> bool {
-        select::claims(stream, &Apple, self.prefer_hardware)
+        rules::stream_ok(stream) && select::claims(stream, &Apple, self.prefer_hardware)
     }
     fn open_video_decoder(&self, stream: &StreamInfo, _threads: usize) -> Result<Box<dyn VideoDecoder>> {
         Ok(Box::new(VtVideoDecoder::new(stream)?))
     }
     fn supports_audio(&self, stream: &StreamInfo) -> bool {
-        // AAC only when it is USAC; the native decoder takes the rest.
-        let usac_or_other = stream.codec != Codec::Aac || stream.extradata.as_deref().is_some_and(rules::is_usac);
-        usac_or_other && select::claims(stream, &Apple, self.prefer_hardware)
+        rules::stream_ok(stream) && select::claims(stream, &Apple, self.prefer_hardware)
     }
     fn open_audio_decoder(&self, stream: &StreamInfo) -> Result<Box<dyn AudioDecoder>> {
         Ok(Box::new(AtAudioDecoder::new(stream)?))

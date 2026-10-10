@@ -117,10 +117,15 @@ fn h264_and_hevc_decode_every_frame_correctly() {
 fn the_backend_takes_h264_and_hevc_and_leaves_vp8_and_aac() {
     let b = AppleBackend::new(true);
     assert_eq!(b.name(), "videotoolbox");
-    let v = |c| StreamInfo::new(1, StreamKind::Video, c);
+    let v = |c| {
+        let mut s = StreamInfo::new(1, StreamKind::Video, c);
+        s.extradata = Some(vec![1, 2, 3]);
+        s
+    };
     assert!(b.supports_video(&v(Codec::H264)));
     assert!(b.supports_video(&v(Codec::Hevc)));
     assert!(!b.supports_video(&v(Codec::Vp8)));
+    assert!(!b.supports_video(&StreamInfo::new(1, StreamKind::Video, Codec::H264)), "no setup record: not claimed");
     let mut aac = StreamInfo::new(2, StreamKind::Audio, Codec::Aac);
     aac.extradata = Some(vec![0x12, 0x10]);
     assert!(!b.supports_audio(&aac), "plain AAC stays native");
