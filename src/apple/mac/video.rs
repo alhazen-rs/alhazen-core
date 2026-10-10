@@ -92,9 +92,14 @@ pub struct VtVideoDecoder {
     stream: StreamInfo,
     session: Option<Session>,
     hint: Option<(u32, u32)>,
-    /// Decoded pictures, in presentation order (VideoToolbox's temporal processing delivers them
-    /// so; each batch is sorted too).
+    /// Decoded pictures sorted by pts. VideoToolbox emits them in decode order; `depth` of them
+    /// are held back so the rest come out in display order (all at the end of the stream).
     window: Vec<YuvFrame>,
+    /// Pictures that can follow a later-decoded one in display order: from the stream's SPS,
+    /// deepened if a picture ever arrives after a later one was released.
+    depth: usize,
+    /// The last released picture's pts.
+    last_out: Option<Duration>,
     eof: bool,
 }
 
@@ -107,7 +112,13 @@ impl VtVideoDecoder {
         if video_codec_type(&stream.codec).is_none() && stream.codec != Codec::ProRes {
             return Err(Error::Unsupported("codec for VideoToolbox"));
         }
-        Ok(Self { stream: stream.clone(), session: None, hint: None, window: Vec::new(), eof: false })
+        let depth = match stream.codec {
+            // No setup record to read it from: assume the worst a DPB allows.
+            Codec::H264 | Codec::Hevc => stream.extradata.as_deref().and_then(|c| crate::nal::reorder_depth(&stream.codec, c)).unwrap_or(16),
+            // AV1 and VP9 show frames in decode order (hidden frames are not output); ProRes is intra.
+            _ => 0,
+        } as usize;
+        Ok(Self { stream: stream.clone(), session: None, hint: None, window: Vec::new(), depth, last_out: None, eof: false })
     }
 
     fn display(&self) -> (u32, u32) {
@@ -214,9 +225,17 @@ impl VtVideoDecoder {
         if let Some(e) = s.sink.error.lock().unwrap().take() {
             return Err(Error::Decode(e));
         }
-        let mut frames = std::mem::take(&mut *s.sink.frames.lock().unwrap());
-        frames.sort_by_key(|f| f.pts);
-        self.window.extend(frames);
+        let frames = std::mem::take(&mut *s.sink.frames.lock().unwrap());
+        for f in frames {
+            if self.last_out.is_some_and(|last| f.pts <= last) {
+                // Too late: a later picture has gone out. Hold back one more from now on.
+                self.depth += 1;
+                log::warn!("VideoToolbox: picture at {:?} after {:?}; holding back {}", f.pts, self.last_out.unwrap(), self.depth);
+                continue;
+            }
+            let at = self.window.partition_point(|w| w.pts < f.pts);
+            self.window.insert(at, f);
+        }
         Ok(())
     }
 
@@ -267,15 +286,18 @@ impl VideoDecoder for VtVideoDecoder {
 
     fn receive_frame(&mut self) -> Result<Option<DecodedFrame>> {
         self.collect()?;
-        if self.window.is_empty() {
-            return Ok(None);
+        if self.window.len() > self.depth || (self.eof && !self.window.is_empty()) {
+            let f = self.window.remove(0);
+            self.last_out = Some(f.pts);
+            return Ok(Some(DecodedFrame::Yuv(f)));
         }
-        Ok(Some(DecodedFrame::Yuv(self.window.remove(0))))
+        Ok(None)
     }
 
     fn flush(&mut self) {
         self.session = None; // the next keyframe starts a new one
         self.window.clear();
+        self.last_out = None;
         self.eof = false;
     }
 

@@ -187,6 +187,8 @@ struct H264Sps {
     chroma_format_idc: u32,
     bit_depth_luma_minus8: u32,
     bit_depth_chroma_minus8: u32,
+    /// Pictures that can precede a picture in decode order and follow it in display order.
+    max_num_reorder_frames: u32,
 }
 
 fn parse_h264_sps(sps: &[u8]) -> Option<H264Sps> {
@@ -234,7 +236,7 @@ fn parse_h264_sps(sps: &[u8]) -> Option<H264Sps> {
         }
         _ => {}
     }
-    b.ue()?; // max_num_ref_frames
+    let max_num_ref_frames = b.ue()?;
     b.skip(1)?; // gaps_in_frame_num_value_allowed_flag
     let width_mbs = b.ue()? + 1;
     let height_units = b.ue()? + 1;
@@ -255,7 +257,87 @@ fn parse_h264_sps(sps: &[u8]) -> Option<H264Sps> {
         width = width.checked_sub(crop_x * (left + right))?;
         height = height.checked_sub(crop_y * (top + bottom))?;
     }
-    Some(H264Sps { width, height, chroma_format_idc: chroma, bit_depth_luma_minus8: depth_luma, bit_depth_chroma_minus8: depth_chroma })
+    // Without the VUI's bitstream restriction: none for Baseline (no B-frames), else at most the
+    // reference frames.
+    let fallback = if profile == 66 { 0 } else { max_num_ref_frames.min(16) };
+    let max_num_reorder_frames = if b.u(1) == Some(1) { h264_vui_reorder(&mut b).unwrap_or(fallback) } else { fallback };
+    Some(H264Sps {
+        width,
+        height,
+        chroma_format_idc: chroma,
+        bit_depth_luma_minus8: depth_luma,
+        bit_depth_chroma_minus8: depth_chroma,
+        max_num_reorder_frames,
+    })
+}
+
+/// `max_num_reorder_frames` from an H.264 VUI (`None` without its bitstream restriction).
+fn h264_vui_reorder(b: &mut Bits) -> Option<u32> {
+    if b.u(1)? == 1 && b.u(8)? == 255 {
+        b.skip(32)?; // aspect_ratio_idc Extended_SAR: sar_width, sar_height
+    }
+    if b.u(1)? == 1 {
+        b.skip(1)?; // overscan_appropriate_flag
+    }
+    if b.u(1)? == 1 {
+        b.skip(4)?; // video_format, video_full_range_flag
+        if b.u(1)? == 1 {
+            b.skip(24)?; // colour_primaries, transfer_characteristics, matrix_coefficients
+        }
+    }
+    if b.u(1)? == 1 {
+        b.ue()?; // chroma_sample_loc_type_top_field
+        b.ue()?; // chroma_sample_loc_type_bottom_field
+    }
+    if b.u(1)? == 1 {
+        b.skip(65)?; // num_units_in_tick, time_scale, fixed_frame_rate_flag
+    }
+    let mut hrd = false;
+    for _ in 0..2 {
+        // nal_hrd_parameters, then vcl_hrd_parameters
+        if b.u(1)? == 1 {
+            hrd = true;
+            let cpb_count = b.ue()? + 1;
+            b.skip(8)?; // bit_rate_scale, cpb_size_scale
+            for _ in 0..cpb_count {
+                b.ue()?;
+                b.ue()?;
+                b.skip(1)?;
+            }
+            b.skip(20)?; // four 5-bit delay/offset lengths
+        }
+    }
+    if hrd {
+        b.skip(1)?; // low_delay_hrd_flag
+    }
+    b.skip(1)?; // pic_struct_present_flag
+    if b.u(1)? == 0 {
+        return None; // no bitstream_restriction
+    }
+    b.skip(1)?; // motion_vectors_over_pic_boundaries_flag
+    for _ in 0..4 {
+        b.ue()?; // max_bytes_per_pic_denom, max_bits_per_mb_denom, log2_max_mv_length_{h,v}
+    }
+    b.ue()
+}
+
+/// How many pictures a decoder emitting in decode order must hold back to give display order:
+/// from the H.264 or HEVC sequence parameter set in the stream's setup record (avcC/hvcC).
+pub fn reorder_depth(codec: &crate::demux::Codec, config: &[u8]) -> Option<u32> {
+    use crate::demux::Codec;
+    match codec {
+        Codec::H264 => {
+            let (_, sets) = parse_avcc(config)?;
+            let sps = sets.iter().find(|n| n.first().is_some_and(|b| b & 0x1F == 7))?;
+            parse_h264_sps(sps).map(|s| s.max_num_reorder_frames)
+        }
+        Codec::Hevc => {
+            let (_, sets) = parse_hvcc(config)?;
+            let sps = sets.iter().find(|n| n.first().is_some_and(|b| (b >> 1) & 0x3F == 33))?;
+            parse_hevc_sps(sps).map(|s| s.max_num_reorder_pics)
+        }
+        _ => None,
+    }
 }
 
 /// Displayed picture size from an H.264 SPS NAL unit (with its header byte).
@@ -296,6 +378,8 @@ struct HevcSps {
     chroma_format_idc: u32,
     bit_depth_luma_minus8: u32,
     bit_depth_chroma_minus8: u32,
+    /// `sps_max_num_reorder_pics` of the highest sub-layer.
+    max_num_reorder_pics: u32,
 }
 
 fn parse_hevc_sps(sps: &[u8]) -> Option<HevcSps> {
@@ -337,6 +421,18 @@ fn parse_hevc_sps(sps: &[u8]) -> Option<HevcSps> {
     }
     let bit_depth_luma_minus8 = b.ue()?;
     let bit_depth_chroma_minus8 = b.ue()?;
+    let max_num_reorder_pics = (|| {
+        b.ue()?; // log2_max_pic_order_cnt_lsb_minus4
+        let all_layers = b.u(1)? == 1;
+        let mut reorder = 0;
+        for _ in if all_layers { 0 } else { max_sub_layers_minus1 }..=max_sub_layers_minus1 {
+            b.ue()?; // sps_max_dec_pic_buffering_minus1
+            reorder = b.ue()?;
+            b.ue()?; // sps_max_latency_increase_plus1
+        }
+        Some(reorder)
+    })()
+    .unwrap_or(16);
     Some(HevcSps {
         width,
         height,
@@ -346,6 +442,7 @@ fn parse_hevc_sps(sps: &[u8]) -> Option<HevcSps> {
         chroma_format_idc: chroma,
         bit_depth_luma_minus8,
         bit_depth_chroma_minus8,
+        max_num_reorder_pics,
     })
 }
 
@@ -388,6 +485,27 @@ pub fn hvcc_from(vps: &[u8], sps: &[u8], pps: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The video stream of a fixture and its setup record, through the player's demuxers.
+    #[cfg(feature = "native")]
+    fn video_config(name: &str) -> (crate::demux::Codec, Vec<u8>) {
+        let source = crate::Source::parse(&format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let mut src = source.open().unwrap();
+        let format = crate::demux::probe(src.as_mut()).unwrap().unwrap();
+        let d = crate::backend::Registry::empty_with_native().open_demuxer(&source, format, src, None).unwrap();
+        let s = d.streams().iter().find(|s| s.kind == crate::demux::StreamKind::Video).unwrap();
+        (s.codec.clone(), s.extradata.clone().unwrap())
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn reorder_depth_matches_ffprobes_has_b_frames() {
+        for (name, depth) in [("h264_aac.mp4", 0), ("h264_aac.ts", 2), ("hevc.mkv", 2), ("hevc_10bit.mp4", 2)] {
+            let (codec, config) = video_config(name);
+            assert_eq!(reorder_depth(&codec, &config), Some(depth), "{name}");
+        }
+        assert_eq!(reorder_depth(&crate::demux::Codec::H264, &[1, 2, 3]), None);
+    }
     use super::*;
 
     /// avcC with one SPS [0x67, 1, 2] and one PPS [0x68, 3], `length_size` byte prefixes.

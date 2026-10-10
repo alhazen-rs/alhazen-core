@@ -26,9 +26,10 @@ fn hardware(codec: HwCodec) -> bool {
             HwCodec::Hevc => video_codec_type(&Codec::Hevc).unwrap(),
             _ => return false,
         };
-        // SAFETY: plain queries; VP9's decoder is a supplemental one that must be registered.
+        // SAFETY: plain queries; VP9's and AV1's decoders are supplemental ones that must be
+        // registered first.
         unsafe {
-            if codec == HwCodec::Vp9 {
+            if matches!(codec, HwCodec::Vp9 | HwCodec::Av1) {
                 VTRegisterSupplementalVideoDecoderIfAvailable(codec_type);
             }
             VTIsHardwareDecodeSupported(codec_type)

@@ -232,10 +232,20 @@ fn alac_ac3_and_eac3_decode_like_ffmpeg() {
             eprintln!("no ffmpeg: comparison skipped");
             continue;
         };
-        let frames = |v: &[f32]| v.len() / channels as usize;
+        let ch = channels as usize;
+        let frames = |v: &[f32]| v.len() / ch;
         let diff = frames(&samples).abs_diff(frames(&reference));
         assert!(diff <= 1536, "{name}: {} frames vs ffmpeg's {}", frames(&samples), frames(&reference));
-        let db = snr(&reference, &samples);
+        // Alignment: where our sound sits against ffmpeg's (positive: ours is late).
+        let at = |off: i64| -> f64 {
+            let (r, o) = if off >= 0 { (&reference[..], &samples[off as usize * ch..]) } else { (&reference[(-off) as usize * ch..], &samples[..]) };
+            snr(r, o)
+        };
+        let best = (-2048..=2048).step_by(16).max_by(|&a, &b| at(a).total_cmp(&at(b))).unwrap();
+        let best = (best - 16..=best + 16).max_by(|&a, &b| at(a).total_cmp(&at(b))).unwrap();
+        eprintln!("{name}: {:.1} dB in place, {:.1} dB at offset {best} frames", at(0), at(best));
+        assert_eq!(best, 0, "{name}: ours is offset by {best} frames from ffmpeg's ({:.1} dB there)", at(best));
+        let db = at(0);
         assert!(db >= min_db, "{name}: {db:.1} dB against ffmpeg");
     }
 }
@@ -261,7 +271,8 @@ fn audio_flush_then_decode_again() {
         first_pts.get_or_insert(b.pts);
         frames += b.frames();
     }
-    assert_eq!(first_pts, Some(packets[10].pts), "timed from the packet after the flush");
+    // On the presentation timeline: the stream's codec delay (encoder padding) comes off.
+    assert_eq!(first_pts, Some(packets[10].pts.saturating_sub(s.codec_delay)), "timed from the packet after the flush");
     assert!(frames >= 4 * 1536, "{frames}");
 }
 
