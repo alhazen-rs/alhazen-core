@@ -83,7 +83,7 @@ libloading = { version = "0.9", optional = true }
 objc2-core-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CFBase", "CFString", "CFDictionary", "CFNumber", "CFData"] }
 objc2-core-media = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CMBase", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMTime", "objc2-core-video"] }
 objc2-core-video = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
-objc2-video-toolbox = { version = "0.3.2", optional = true, default-features = false, features = ["std", "VTDecompressionSession", "VTErrors", "objc2-core-media", "objc2-core-video"] }
+objc2-video-toolbox = { version = "0.3.2", optional = true, default-features = false, features = ["std", "VTDecompressionSession", "VTErrors", "VTUtilities", "objc2-core-media", "objc2-core-video"] }
 objc2-audio-toolbox = { version = "0.3.2", optional = true, default-features = false, features = ["std", "AudioConverter", "objc2-core-audio-types", "objc2-core-foundation"] }
 objc2-core-audio-types = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CoreAudioBaseTypes"] }
 

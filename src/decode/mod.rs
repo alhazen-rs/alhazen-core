@@ -28,9 +28,9 @@ mod vp8;
 #[cfg(feature = "native")]
 mod vp9;
 
-#[cfg(any(feature = "native", feature = "native-aac", feature = "native-mp3", feature = "ffmpeg-cli", all(windows, feature = "media-foundation")))]
+#[cfg(any(feature = "native", feature = "native-aac", feature = "native-mp3", feature = "ffmpeg-cli", all(windows, feature = "media-foundation"), all(target_os = "macos", feature = "videotoolbox")))]
 mod delay;
-#[cfg(any(feature = "native-aac", feature = "native-mp3", feature = "ffmpeg-cli", all(windows, feature = "media-foundation")))]
+#[cfg(any(feature = "native-aac", feature = "native-mp3", feature = "ffmpeg-cli", all(windows, feature = "media-foundation"), all(target_os = "macos", feature = "videotoolbox")))]
 pub(crate) use delay::DelayTrim;
 #[cfg(feature = "native")]
 pub(crate) use delay::clip_end;

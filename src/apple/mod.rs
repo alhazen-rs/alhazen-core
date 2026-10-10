@@ -9,3 +9,8 @@
 pub(crate) mod rules;
 pub(crate) mod format;
 pub(crate) mod planes;
+
+#[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+mod mac;
+#[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+pub use mac::{AppleBackend, AtAudioDecoder, VtVideoDecoder};
