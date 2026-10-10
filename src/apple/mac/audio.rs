@@ -46,7 +46,8 @@ pub struct AtAudioDecoder {
     stream: StreamInfo,
     converter: Option<Converter>,
     ready: VecDeque<Samples>,
-    /// Encoder start-up padding (edit lists) and end padding: AudioToolbox does not drop them.
+    /// Encoder start-up padding (edit lists, CodecDelay) and end padding, where AudioToolbox does
+    /// not drop them itself.
     trim: DelayTrim,
     /// Output buffer, reused.
     out: Vec<f32>,
@@ -61,7 +62,7 @@ impl AtAudioDecoder {
             stream: stream.clone(),
             converter: None,
             ready: VecDeque::new(),
-            trim: DelayTrim::new(stream.codec_delay).with_end(stream.end_trim),
+            trim: DelayTrim::new(absorbed_delay(stream)).with_end(stream.end_trim),
             out: Vec::new(),
         })
     }
@@ -210,6 +211,18 @@ unsafe extern "C-unwind" fn on_input(
             *descriptions = &mut input.description;
         }
         0
+    }
+}
+
+/// The part of the stream's codec delay we must trim ourselves. AudioToolbox's AC-3 and E-AC-3
+/// decoders hold back their 256-frame block overlap, which is exactly the encoder padding a
+/// CodecDelay declares: their output already starts on the presentation timeline (measured
+/// against ffmpeg, which drops the declared padding).
+fn absorbed_delay(stream: &StreamInfo) -> std::time::Duration {
+    use crate::demux::Codec;
+    match stream.codec {
+        Codec::Ac3 | Codec::Eac3 => std::time::Duration::ZERO,
+        _ => stream.codec_delay,
     }
 }
 
