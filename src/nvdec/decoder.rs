@@ -21,7 +21,6 @@ struct Setup {
     bit_depth: u32,
     /// Largest coded size the decoder accepts without being recreated.
     max: (u32, u32),
-    coded: (u32, u32),
     display: Rect16,
     target: (u32, u32),
     surfaces: u32,
@@ -160,6 +159,31 @@ impl NvdecVideoDecoder {
         check(r, "parse")
     }
 
+    /// A changed output size takes effect at a keyframe: the current parser finishes its
+    /// pictures, and a new one's sequence callback reconfigures the decoder for the new size.
+    /// (Reconfiguring the decoder between pictures, outside that callback, corrupts H.264 and
+    /// HEVC output: green frames while a window is resized.) Until then the pipeline's CPU
+    /// scaler sizes the frames.
+    fn retarget_at_keyframe(&mut self) -> Result<()> {
+        if self.parser.is_null() {
+            return Ok(());
+        }
+        let inner = self.inner();
+        if !inner.retarget {
+            return Ok(());
+        }
+        inner.retarget = false;
+        let Some(s) = inner.setup else { return Ok(()) };
+        if target_size(s.display_size(), inner.hint) == s.target {
+            return Ok(());
+        }
+        self.parse(&[], CUVID_PKT_ENDOFSTREAM, Duration::ZERO)?;
+        self.destroy_parser();
+        self.send_av1_config = self.av1_config.is_some();
+        self.since_keyframe = None;
+        Ok(())
+    }
+
     fn destroy_parser(&mut self) {
         if !self.parser.is_null() {
             let api = self.inner().dev.api();
@@ -177,8 +201,10 @@ impl VideoDecoder for NvdecVideoDecoder {
         }
         let dev = self.inner().dev;
         let _current = dev.push()?;
+        if packet.keyframe {
+            self.retarget_at_keyframe()?;
+        }
         self.ensure_parser()?;
-        self.inner().apply_retarget();
         let mut data = std::mem::take(&mut self.scratch);
         data.clear();
         if let Some(a) = &self.annexb {
@@ -305,7 +331,7 @@ impl Inner {
             && surfaces <= s.surfaces
         {
             self.reconfigure(coded, display, target, s.surfaces)?;
-            self.setup = Some(Setup { coded, display, target, matrix, full_range, ..s });
+            self.setup = Some(Setup { display, target, matrix, full_range, ..s });
             self.retarget = false;
             return Ok(s.surfaces as c_int);
         }
@@ -328,7 +354,7 @@ impl Inner {
         info.ulNumOutputSurfaces = 2;
         // SAFETY: valid create info; context current (inside a parse call).
         check(unsafe { (self.dev.api().cuvidCreateDecoder)(&mut self.decoder, &mut info) }, "create decoder")?;
-        self.setup = Some(Setup { codec: fmt.codec, bit_depth, max: coded, coded, display, target, surfaces, matrix, full_range });
+        self.setup = Some(Setup { codec: fmt.codec, bit_depth, max: coded, display, target, surfaces, matrix, full_range });
         self.retarget = false;
         Ok(surfaces as c_int)
     }
@@ -343,25 +369,6 @@ impl Inner {
         info.display_area = display;
         // SAFETY: a live decoder; context current.
         check(unsafe { (self.dev.api().cuvidReconfigureDecoder)(self.decoder, &mut info) }, "reconfigure decoder")
-    }
-
-    /// Applies a changed output hint before the next packet (context current): the hardware
-    /// scaler works when pictures are read out, so changing it mid-GOP is safe. If the driver
-    /// refuses, the old size stays; the pipeline's CPU scaler still produces the right size.
-    fn apply_retarget(&mut self) {
-        if !self.retarget || self.decoder.is_null() {
-            return;
-        }
-        self.retarget = false;
-        let Some(s) = self.setup else { return };
-        let target = target_size(s.display_size(), self.hint);
-        if target == s.target {
-            return;
-        }
-        match self.reconfigure(s.coded, s.display, target, s.surfaces) {
-            Ok(()) => self.setup = Some(Setup { target, ..s }),
-            Err(e) => log::debug!("NVDEC keeps {:?}: {e}", s.target),
-        }
     }
 
     fn on_decode(&mut self, pic: *mut CUVIDPICPARAMS) -> Result<()> {

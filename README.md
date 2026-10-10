@@ -40,6 +40,9 @@ if let Some(frame) = player.current_frame() { /* draw it */ }
   a separate program, so nothing is linked and ffmpeg's licence never touches your app.
 - **Files and the web:** local files, `file://`, and HTTP(S) streaming with `Range` seeking and
   automatic reconnects.
+- **HLS streaming, VOD and live:** `.m3u8` playlists with MPEG-TS, fragmented MP4 or packed-audio
+  segments, audio in a separate playlist (even on another host), adaptive bitrate with manual
+  override, and AES-128. Demuxed natively: no ffmpeg needed.
 - **A/V sync done right:** audio drives the clock; video follows, drops late frames and catches
   up after stalls. The encoder's start-up padding (MP4 edit lists, Matroska CodecDelay) is
   trimmed, so sound lines up with the picture, and MP3/Opus/Vorbis files play gapless (LAME
@@ -136,7 +139,8 @@ lines for the player entity and the element.
 | Local file | `movie.mkv`, `C:\Videos\a.mp4` | |
 | File URL | `file:///home/me/a.webm` | |
 | HTTP(S) | `https://host/a.webm` | Seeks with `Range` requests when the server allows it; reconnects with backoff. |
-| HLS / DASH | `https://host/a.m3u8` | Recognised, not playable yet (roadmap). |
+| HLS | `https://host/a.m3u8` | VOD and live (see [HLS](#hls)). |
+| DASH | `https://host/a.mpd` | Recognised, not playable yet (roadmap). |
 
 ### Containers
 
@@ -149,9 +153,35 @@ lines for the player entity and the element.
 | FLAC | `.flac` |
 | WAV | `.wav` (PCM, float, WAVE_FORMAT_EXTENSIBLE) |
 | Ogg (Vorbis, Opus, FLAC) | `.ogg`, `.opus`, `.oga` |
+| MPEG transport stream | `.ts`, `.m2ts` (H.264, HEVC, AAC, MP3, AC-3, E-AC-3) |
 
 Containers are recognised by their content, not their extension. Raw video streams (`.h264`,
 `.hevc`) need a container for now.
+
+### HLS
+
+`Source::parse("https://host/master.m3u8")` plays HTTP Live Streaming through the same `Player`:
+
+- **Playlists:** master playlists (variants, `EXT-X-MEDIA` audio renditions) and media playlists;
+  VOD seeks like a file; live streams start three target durations behind the edge, follow the
+  playlist, and end when it stops updating (live streams are not seekable).
+- **Segments:** MPEG-TS, fragmented MP4 / CMAF (`EXT-X-MAP`), and packed audio (ADTS/MP3 with an
+  ID3 timestamp), with byte ranges and discontinuities (a new resolution or codec mid-stream
+  reopens the decoder).
+- **Separate audio:** variants whose audio lives in its own playlist (`AUDIO="group"`), possibly
+  on another host, play in sync with the video; `Player::audio_renditions()` and
+  `set_audio_rendition(i)` switch between languages.
+- **Quality:** adaptive bitrate by default (throughput weighted by download time, buffer-aware,
+  one step up at a time, straight down when the link drops); `Player::variants()`,
+  `current_variant()` and `set_variant(Variant::Index(i))` / `set_variant(Variant::Auto)`;
+  `PlayerEvent::VariantChanged(i)` reports switches.
+- **Encryption:** `METHOD=AES-128`. DRM (`SAMPLE-AES`, FairPlay, Widevine, PlayReady) is refused
+  with `Error::Unsupported`.
+- **Robustness:** segment downloads retry with backoff; a missing segment fails VOD with an
+  error naming it and is skipped on live streams; dropping the player never waits on a stalled
+  download.
+
+Not yet: subtitles (WebVTT renditions), low-latency HLS, DASH.
 
 ### Tags and cover art
 
@@ -240,6 +270,7 @@ ffmpeg behind a Chocolatey/Scoop shim.
 |---|---|---|
 | `native` | ✅ | Pure-Rust decoders (AV1, VP9, VP8, ProRes, Opus, Vorbis, FLAC, PCM), the MP4/MOV demuxer and the audio-file readers (MP3, AAC/ADTS, FLAC, WAV, Ogg). |
 | `http` | ✅ | HTTP(S) sources (`ureq`, rustls). |
+| `hls` | ✅ | HTTP Live Streaming (needs `http` and `native`; adds the small RustCrypto `aes`/`cbc` crates). |
 | `audio-output` | ✅ | Sound through the default output device (`cpal`). Without it, audio is ignored and video runs on the system clock. |
 | `ffmpeg-cli` | ✅ | The runtime ffmpeg backend. Costs nothing when ffmpeg isn't installed. |
 | `media-foundation` | ✅ | Windows' decoders. Compiles to nothing on other platforms. |
@@ -278,6 +309,7 @@ point. Seeking passes through `Buffering`.
 | `Warning(String)` | Something non-fatal: an audio track without a decoder, no audio device, a backend fallback. |
 | `Error(e)` | Playback stopped with an error. |
 | `Ended` | The end was reached. |
+| `VariantChanged(i)` | HLS: playback moved to variant `i` (adaptive bitrate or `set_variant`). |
 
 ## Environment variables
 

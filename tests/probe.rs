@@ -39,6 +39,7 @@ fn every_audio_file_format_is_detected() {
         ("vorbis.ogg", Ogg),
         ("opus.opus", Ogg),
         ("flac.oga", Ogg),
+        ("h264_aac.ts", MpegTs),
     ] {
         assert_eq!(probe_file(&fixture(name)), Some(want), "{name}");
     }

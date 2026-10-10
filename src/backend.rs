@@ -125,6 +125,16 @@ impl Registry {
         Err(last_err.unwrap_or(Error::UnsupportedContainer))
     }
 
+    /// Whether some backend can decode `stream` (by its codec; the stream may not be open yet).
+    pub fn can_decode(&self, stream: &StreamInfo) -> bool {
+        use crate::demux::StreamKind;
+        self.backends.iter().any(|b| match stream.kind {
+            StreamKind::Video => b.supports_video(stream),
+            StreamKind::Audio => b.supports_audio(stream),
+            StreamKind::Other => false,
+        })
+    }
+
     /// Opens an audio decoder for `stream`, trying each capable backend in order.
     pub fn open_audio_decoder(&self, stream: &StreamInfo, order: Option<&[&'static str]>) -> Result<Box<dyn AudioDecoder>> {
         let mut tried = Vec::new();
@@ -200,6 +210,7 @@ impl Backend for NativeBackend {
             ContainerFormat::Mp3 => Box::new(crate::demux::Mp3Demuxer::open(src)?),
             ContainerFormat::Adts => Box::new(crate::demux::AdtsDemuxer::open(src)?),
             ContainerFormat::Ogg => Box::new(crate::demux::OggDemuxer::open(src)?),
+            ContainerFormat::MpegTs => Box::new(crate::demux::TsDemuxer::open(src)?),
         })
     }
     fn supports_video(&self, stream: &StreamInfo) -> bool {

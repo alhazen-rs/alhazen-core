@@ -229,51 +229,52 @@ fn output_hint_scales_on_the_gpu() {
 }
 
 #[test]
-fn output_hint_changes_apply_from_the_next_packet() {
+fn output_hint_changes_apply_at_the_next_keyframe_with_intact_pictures() {
     if !gpu() {
         return;
     }
-    // av1.webm has keyframes at 0 and 1 s (frame 30). The window shrinks mid-GOP at packet 10
-    // and grows back (e.g. fullscreen) mid-GOP at packet 40: neither waits for a keyframe.
-    let mut d = demuxer("av1.webm");
-    let s = video(d.as_ref());
-    let mut dec = NvdecVideoDecoder::new(&s).unwrap();
-    let mut frames = vec![];
-    let mut sent = 0;
-    while let Some(p) = d.next_packet().unwrap() {
-        if p.stream != s.id {
-            continue;
+    // Changing NVDEC's output size mid-GOP (cuvidReconfigureDecoder outside a sequence callback)
+    // corrupted H.264 pictures (all zeros: a green screen while resizing the window). Changes now
+    // wait for a keyframe; until then the pipeline's CPU scaler sizes the frames.
+    // (file, full width, keyframes, packet the window shrinks at, packet it grows back at)
+    for (name, full, keys, shrink, grow) in [("av1.webm", 320, [0, 30, 60], 10, 40), ("h264_aac.ts", 320, [0, 25, 50], 10, 40)] {
+        let mut d = demuxer(name);
+        let s = video(d.as_ref());
+        let mut dec = NvdecVideoDecoder::new(&s).unwrap();
+        let mut frames = vec![];
+        let mut sent = 0;
+        while let Some(p) = d.next_packet().unwrap() {
+            if p.stream != s.id {
+                continue;
+            }
+            if sent == shrink {
+                dec.set_output_hint(Some((160, 160)));
+            } else if sent == grow {
+                dec.set_output_hint(None);
+            }
+            dec.send_packet(&p).unwrap();
+            sent += 1;
+            while let Some(DecodedFrame::Yuv(f)) = dec.receive_frame().unwrap() {
+                frames.push(f);
+            }
         }
-        match sent {
-            10 => dec.set_output_hint(Some((160, 120))),
-            40 => dec.set_output_hint(None),
-            _ => {}
-        }
-        dec.send_packet(&p).unwrap();
-        sent += 1;
+        dec.send_eof();
         while let Some(DecodedFrame::Yuv(f)) = dec.receive_frame().unwrap() {
             frames.push(f);
         }
-    }
-    dec.send_eof();
-    while let Some(DecodedFrame::Yuv(f)) = dec.receive_frame().unwrap() {
-        frames.push(f);
-    }
-    assert_eq!(frames.len(), 60);
-    let widths: Vec<u32> = frames.iter().map(|f| f.width).collect();
-    eprintln!("{widths:?}");
-    // Pictures already decoded and waiting for display when the size changes come out at the
-    // new size, so allow two frames of slack around each change.
-    assert!(widths[..8].iter().all(|&w| w == 320), "full size before the shrink");
-    assert!(widths[12..38].iter().all(|&w| w == 160), "small soon after the shrink, mid-GOP");
-    assert!(widths[42..].iter().all(|&w| w == 320), "full size soon after growing, mid-GOP");
-    // Pictures around both switches are intact: compare with ffmpeg's decode scaled the same way.
-    for i in (8..13).chain(38..43) {
-        let f = &frames[i];
-        let Some(reference) = ffmpeg_frame("av1.webm", i, (f.width, f.height)) else { return };
-        let db = psnr(&f.planes.concat(), &reference);
-        eprintln!("frame {i} at {}x{}: {db:.1} dB", f.width, f.height);
-        assert!(db >= 25.0, "frame {i}: {db:.1} dB (corrupt?)");
+        let widths: Vec<u32> = frames.iter().map(|f| f.width).collect();
+        eprintln!("{name}: {widths:?}");
+        let next_key = |at: usize| keys.into_iter().find(|&k| k >= at).unwrap_or(frames.len());
+        let (small_from, full_from) = (next_key(shrink), next_key(grow));
+        for (i, &w) in widths.iter().enumerate() {
+            let expected = if i >= small_from && i < full_from { 160 } else { full };
+            assert_eq!(w, expected, "{name} frame {i}: {widths:?}");
+        }
+        for (i, f) in frames.iter().enumerate().step_by(3) {
+            let Some(reference) = ffmpeg_frame(name, i, (f.width, f.height)) else { return };
+            let db = psnr(&f.planes.concat(), &reference);
+            assert!(db >= 25.0, "{name} frame {i} at {}x{}: {db:.1} dB (corrupt?)", f.width, f.height);
+        }
     }
 }
 
@@ -456,3 +457,4 @@ fn timestamps_round_trip_exactly() {
         assert!(odd.is_empty(), "{name}: frame timestamps not from any packet: {odd:?}");
     }
 }
+

@@ -198,3 +198,20 @@ ffmpeg -v error -y -f lavfi -i "testsrc2=s=128x72:r=30:d=8" -f lavfi -i "sine=f=
 
 - `av1_8s_with_audio.webm`: long enough for a decoder that stalls once to stay behind the sound
   for longer than the fallback rule's 1.5 s (`tests/fallback.rs`).
+
+## HLS and MPEG-TS
+
+Made by [`hls/make_hls_fixtures.sh`](hls/make_hls_fixtures.sh) (ffmpeg with libx264, libx265;
+packed audio is assembled by the script itself, as ffmpeg's HLS muxer writes TS instead).
+
+- `h264_aac.ts`: H.264 320×180 + AAC mono, 1 s GOPs, 3 s (`.ts` files, `tests/ts.rs`).
+- `hls/ts/`: TS VOD, 1 s segments, 6 s; also served as a sliding live window by the tests.
+- `hls/fmp4/`: fragmented MP4 (CMAF) VOD, HEVC + AAC, `EXT-X-MAP`, 2 s segments.
+- `hls/packed/`: packed audio (ADTS with an ID3 `PRIV` transportStreamTimestamp from 10 s).
+- `hls/multi/`: master playlist, H.264 variants 640×360 and 320×180 without audio, AAC as a
+  separate rendition (`EXT-X-MEDIA`); the tests serve the rendition from a second server.
+- `hls/aes/`: AES-128 (`aes/key.bin`, fixed IV), 3 s.
+- `hls/disc/`: three segments of `ts/`, `#EXT-X-DISCONTINUITY`, then a 160×90 encode whose clock
+  starts over.
+- `hls/wrap/`: TS VOD whose 33-bit clock starts at 95441 s and wraps 2.7 s in.
+- `long_gop.ts`: 160×90 H.264 with 10 s GOPs, 12 s (seeking must not scan the whole file).

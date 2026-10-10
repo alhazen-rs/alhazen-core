@@ -102,6 +102,290 @@ fn parse_hvcc(c: &[u8]) -> Option<(usize, Vec<&[u8]>)> {
     Some((length_size, sets))
 }
 
+/// The NAL units of an Annex B byte stream (start codes removed, trailing zero bytes dropped).
+pub fn split_annex_b(data: &[u8]) -> Vec<&[u8]> {
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            starts.push(i + 3);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let mut nals = Vec::with_capacity(starts.len());
+    for (n, &start) in starts.iter().enumerate() {
+        let end = starts.get(n + 1).map_or(data.len(), |&next| next - 3);
+        let mut nal = &data[start..end];
+        while let [rest @ .., 0] = nal {
+            nal = rest;
+        }
+        if !nal.is_empty() {
+            nals.push(nal);
+        }
+    }
+    nals
+}
+
+/// Removes emulation-prevention bytes (`00 00 03` → `00 00`).
+fn rbsp(nal: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(nal.len());
+    let mut zeros = 0;
+    for &b in nal {
+        if zeros >= 2 && b == 3 {
+            zeros = 0;
+            continue;
+        }
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+        out.push(b);
+    }
+    out
+}
+
+/// MSB-first bit reader with Exp-Golomb codes.
+struct Bits<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl Bits<'_> {
+    fn u(&mut self, n: u32) -> Option<u32> {
+        (0..n).try_fold(0u32, |v, _| {
+            let bit = (self.data.get(self.pos / 8)? >> (7 - self.pos % 8)) & 1;
+            self.pos += 1;
+            Some(v << 1 | bit as u32)
+        })
+    }
+
+    fn skip(&mut self, n: usize) -> Option<()> {
+        self.pos += n;
+        (self.pos <= self.data.len() * 8).then_some(())
+    }
+
+    fn ue(&mut self) -> Option<u32> {
+        let mut zeros = 0;
+        while self.u(1)? == 0 {
+            zeros += 1;
+            if zeros > 31 {
+                return None;
+            }
+        }
+        Some(((1u64 << zeros) - 1 + self.u(zeros)? as u64) as u32)
+    }
+
+    fn se(&mut self) -> Option<i32> {
+        let k = self.ue()? as i64;
+        Some(if k % 2 == 1 { (k + 1) / 2 } else { -(k / 2) } as i32)
+    }
+}
+
+/// What an H.264 SPS says about the pictures.
+struct H264Sps {
+    width: u32,
+    height: u32,
+    chroma_format_idc: u32,
+    bit_depth_luma_minus8: u32,
+    bit_depth_chroma_minus8: u32,
+}
+
+fn parse_h264_sps(sps: &[u8]) -> Option<H264Sps> {
+    let data = rbsp(sps.get(1..)?);
+    let mut b = Bits { data: &data, pos: 0 };
+    let profile = b.u(8)?;
+    b.skip(16)?; // constraint flags, level
+    b.ue()?; // seq_parameter_set_id
+    let (mut chroma, mut separate, mut depth_luma, mut depth_chroma) = (1, 0, 0, 0);
+    if matches!(profile, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135) {
+        chroma = b.ue()?;
+        if chroma == 3 {
+            separate = b.u(1)?;
+        }
+        depth_luma = b.ue()?;
+        depth_chroma = b.ue()?;
+        b.skip(1)?; // qpprime_y_zero_transform_bypass_flag
+        if b.u(1)? == 1 {
+            for i in 0..if chroma == 3 { 12 } else { 8 } {
+                if b.u(1)? == 1 {
+                    let size = if i < 6 { 16 } else { 64 };
+                    let (mut last, mut next) = (8i32, 8i32);
+                    for _ in 0..size {
+                        if next != 0 {
+                            next = (last + b.se()? + 256) % 256;
+                        }
+                        last = if next == 0 { last } else { next };
+                    }
+                }
+            }
+        }
+    }
+    b.ue()?; // log2_max_frame_num_minus4
+    match b.ue()? {
+        0 => {
+            b.ue()?;
+        }
+        1 => {
+            b.skip(1)?;
+            b.se()?;
+            b.se()?;
+            for _ in 0..b.ue()? {
+                b.se()?;
+            }
+        }
+        _ => {}
+    }
+    b.ue()?; // max_num_ref_frames
+    b.skip(1)?; // gaps_in_frame_num_value_allowed_flag
+    let width_mbs = b.ue()? + 1;
+    let height_units = b.ue()? + 1;
+    let frame_mbs_only = b.u(1)?;
+    if frame_mbs_only == 0 {
+        b.skip(1)?; // mb_adaptive_frame_field_flag
+    }
+    b.skip(1)?; // direct_8x8_inference_flag
+    let mut width = width_mbs * 16;
+    let mut height = (2 - frame_mbs_only) * height_units * 16;
+    if b.u(1)? == 1 {
+        let (left, right, top, bottom) = (b.ue()?, b.ue()?, b.ue()?, b.ue()?);
+        let (crop_x, crop_y) = if separate == 1 || chroma == 0 {
+            (1, 2 - frame_mbs_only)
+        } else {
+            (if chroma == 3 { 1 } else { 2 }, if chroma == 1 { 2 } else { 1 } * (2 - frame_mbs_only))
+        };
+        width = width.checked_sub(crop_x * (left + right))?;
+        height = height.checked_sub(crop_y * (top + bottom))?;
+    }
+    Some(H264Sps { width, height, chroma_format_idc: chroma, bit_depth_luma_minus8: depth_luma, bit_depth_chroma_minus8: depth_chroma })
+}
+
+/// Displayed picture size from an H.264 SPS NAL unit (with its header byte).
+pub fn h264_sps_size(sps: &[u8]) -> Option<(u32, u32)> {
+    parse_h264_sps(sps).map(|s| (s.width, s.height))
+}
+
+/// `AVCDecoderConfigurationRecord` (4-byte NAL lengths) from one SPS and one PPS.
+pub fn avcc_from(sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    let mut rec = vec![1, sps.get(1).copied().unwrap_or(0), sps.get(2).copied().unwrap_or(0), sps.get(3).copied().unwrap_or(0), 0xFF, 0xE1];
+    rec.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+    rec.extend_from_slice(sps);
+    rec.push(1);
+    rec.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+    rec.extend_from_slice(pps);
+    // High profiles carry the chroma format and bit depths too (ISO 14496-15 5.3.3.1.2).
+    if matches!(sps.get(1), Some(100 | 110 | 122 | 244))
+        && let Some(s) = parse_h264_sps(sps)
+    {
+        rec.extend_from_slice(&[
+            0xFC | s.chroma_format_idc as u8,
+            0xF8 | s.bit_depth_luma_minus8 as u8,
+            0xF8 | s.bit_depth_chroma_minus8 as u8,
+            0,
+        ]);
+    }
+    rec
+}
+
+/// What an HEVC SPS says about the pictures, and its general profile/tier/level bytes.
+struct HevcSps {
+    width: u32,
+    height: u32,
+    max_sub_layers_minus1: u32,
+    temporal_id_nesting: u32,
+    /// `general_profile_space` … `general_level_idc`: 12 bytes, as hvcC stores them.
+    general_ptl: [u8; 12],
+    chroma_format_idc: u32,
+    bit_depth_luma_minus8: u32,
+    bit_depth_chroma_minus8: u32,
+}
+
+fn parse_hevc_sps(sps: &[u8]) -> Option<HevcSps> {
+    let data = rbsp(sps.get(2..)?);
+    let mut b = Bits { data: &data, pos: 0 };
+    b.skip(4)?; // sps_video_parameter_set_id
+    let max_sub_layers_minus1 = b.u(3)?;
+    let temporal_id_nesting = b.u(1)?;
+    let general_ptl: [u8; 12] = data.get(1..13)?.try_into().ok()?;
+    b.skip(96)?;
+    let mut sub_profile = [false; 8];
+    let mut sub_level = [false; 8];
+    for i in 0..max_sub_layers_minus1 as usize {
+        sub_profile[i] = b.u(1)? == 1;
+        sub_level[i] = b.u(1)? == 1;
+    }
+    if max_sub_layers_minus1 > 0 {
+        b.skip(2 * (8 - max_sub_layers_minus1 as usize))?;
+    }
+    for i in 0..max_sub_layers_minus1 as usize {
+        if sub_profile[i] {
+            b.skip(88)?;
+        }
+        if sub_level[i] {
+            b.skip(8)?;
+        }
+    }
+    b.ue()?; // sps_seq_parameter_set_id
+    let chroma = b.ue()?;
+    let separate = if chroma == 3 { b.u(1)? } else { 0 };
+    let mut width = b.ue()?;
+    let mut height = b.ue()?;
+    if b.u(1)? == 1 {
+        let (left, right, top, bottom) = (b.ue()?, b.ue()?, b.ue()?, b.ue()?);
+        let sub_w = if separate == 0 && matches!(chroma, 1 | 2) { 2 } else { 1 };
+        let sub_h = if separate == 0 && chroma == 1 { 2 } else { 1 };
+        width = width.checked_sub(sub_w * (left + right))?;
+        height = height.checked_sub(sub_h * (top + bottom))?;
+    }
+    let bit_depth_luma_minus8 = b.ue()?;
+    let bit_depth_chroma_minus8 = b.ue()?;
+    Some(HevcSps {
+        width,
+        height,
+        max_sub_layers_minus1,
+        temporal_id_nesting,
+        general_ptl,
+        chroma_format_idc: chroma,
+        bit_depth_luma_minus8,
+        bit_depth_chroma_minus8,
+    })
+}
+
+/// Displayed picture size from an HEVC SPS NAL unit (with its 2-byte header).
+pub fn hevc_sps_size(sps: &[u8]) -> Option<(u32, u32)> {
+    parse_hevc_sps(sps).map(|s| (s.width, s.height))
+}
+
+/// `HEVCDecoderConfigurationRecord` (4-byte NAL lengths) from one VPS, SPS and PPS.
+pub fn hvcc_from(vps: &[u8], sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    let info = parse_hevc_sps(sps);
+    let mut rec = vec![1];
+    match &info {
+        Some(s) => rec.extend_from_slice(&s.general_ptl),
+        None => rec.extend_from_slice(&[1, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+    }
+    let (chroma, luma, chroma_depth, layers, nesting) = info
+        .as_ref()
+        .map_or((1, 0, 0, 0, 1), |s| (s.chroma_format_idc, s.bit_depth_luma_minus8, s.bit_depth_chroma_minus8, s.max_sub_layers_minus1, s.temporal_id_nesting));
+    rec.extend_from_slice(&[
+        0xF0,
+        0x00, // min_spatial_segmentation_idc
+        0xFC, // parallelismType unknown
+        0xFC | chroma as u8,
+        0xF8 | luma as u8,
+        0xF8 | chroma_depth as u8,
+        0,
+        0, // avgFrameRate
+        (((layers + 1) as u8) << 3) | ((nesting as u8) << 2) | 3,
+        3,
+    ]);
+    for (nal_type, nal) in [(32u8, vps), (33, sps), (34, pps)] {
+        rec.push(0x80 | nal_type);
+        rec.extend_from_slice(&1u16.to_be_bytes());
+        rec.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+        rec.extend_from_slice(nal);
+    }
+    rec
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +423,58 @@ mod tests {
         assert!(AnnexB::from_config(ParamSetFormat::Avcc, &avcc(4)[..9]).is_none());
         assert!(AnnexB::from_config(ParamSetFormat::Avcc, &[0; 4]).is_none());
         assert!(AnnexB::from_config(ParamSetFormat::Hvcc, &[1; 10]).is_none());
+    }
+
+    /// x264 (High 4:4:4 Predictive, 320x240): SPS, PPS.
+    const H264_444: &[&[u8]] = &[&[0x67, 0xf4, 0x00, 0x0d, 0x91, 0x9b, 0x28, 0x28, 0x3f, 0x60, 0x22, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x03, 0x00, 0x64, 0x1e, 0x28, 0x53, 0x2c], &[0x68, 0xeb, 0xe3, 0xc4, 0x48, 0x44]];
+    /// x264 (High 4:2:0, 318x238: cropped from 320x240).
+    const H264_CROP: &[&[u8]] = &[&[0x67, 0x64, 0x00, 0x0d, 0xac, 0xd9, 0x41, 0x41, 0xfe, 0xab, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x03, 0x20, 0xf1, 0x42, 0x99, 0x60], &[0x68, 0xeb, 0xe3, 0xcb, 0x22, 0xc0]];
+    /// x265 (Main 4:4:4 / RExt, 352x288): VPS, SPS, PPS.
+    const HEVC: &[&[u8]] = &[&[0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x04, 0x08, 0x00, 0x00, 0x03, 0x00, 0x9e, 0x08, 0x00, 0x00, 0x03, 0x00, 0x00, 0x3c, 0x95, 0x98, 0x09], &[0x42, 0x01, 0x01, 0x04, 0x08, 0x00, 0x00, 0x03, 0x00, 0x9e, 0x08, 0x00, 0x00, 0x03, 0x00, 0x00, 0x3c, 0x90, 0x01, 0x61, 0x00, 0x90, 0xb2, 0xca, 0xcd, 0x24, 0x99, 0x5e, 0x02, 0xdc, 0x08, 0x08, 0x00, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x01, 0x90, 0x80], &[0x44, 0x01, 0xc1, 0x72, 0x86, 0x0c, 0x46, 0x24]];
+
+    fn annex_b(nals: &[&[u8]]) -> Vec<u8> {
+        nals.iter().flat_map(|n| [&[0, 0, 0, 1][..], n].concat()).collect()
+    }
+
+    #[test]
+    fn splits_three_and_four_byte_start_codes() {
+        let es = [0, 0, 0, 1, 0x67, 1, 0, 0, 1, 0x68, 2, 3, 0, 0, 1, 0x65, 4, 0];
+        assert_eq!(split_annex_b(&es), [&[0x67, 1][..], &[0x68, 2, 3], &[0x65, 4]], "trailing zero bytes are not data");
+        assert!(split_annex_b(&[]).is_empty());
+        assert_eq!(split_annex_b(&[9, 9, 0, 0, 1, 0x41]), [&[0x41][..]], "bytes before the first start code are dropped");
+    }
+
+    #[test]
+    fn avcc_round_trips_through_annex_b() {
+        for sets in [H264_444, H264_CROP] {
+            let rec = avcc_from(sets[0], sets[1]);
+            assert_eq!((rec[0], rec[1], rec[3]), (1, sets[0][1], sets[0][3]), "version, profile, level");
+            let conv = AnnexB::from_config(ParamSetFormat::Avcc, &rec).unwrap();
+            let mut out = Vec::new();
+            conv.convert(&[], true, &mut out).unwrap();
+            assert_eq!(out, annex_b(sets));
+            assert_eq!(conv.length_size, 4);
+        }
+    }
+
+    #[test]
+    fn h264_picture_size_with_and_without_cropping() {
+        assert_eq!(h264_sps_size(H264_444[0]), Some((320, 240)));
+        assert_eq!(h264_sps_size(H264_CROP[0]), Some((318, 238)));
+        assert_eq!(h264_sps_size(&[0x67, 0x64]), None, "truncated");
+    }
+
+    #[test]
+    fn hvcc_round_trips_and_carries_profile() {
+        let rec = hvcc_from(HEVC[0], HEVC[1], HEVC[2]);
+        assert_eq!(rec[0], 1);
+        assert_eq!(rec[1] & 0x1F, 4, "general_profile_idc copied from the SPS (RExt)");
+        assert_eq!(rec[12], 0x3c, "general_level_idc (level 2)");
+        assert_eq!(rec[16] & 3, 3, "chroma_format_idc 4:4:4");
+        let conv = AnnexB::from_config(ParamSetFormat::Hvcc, &rec).unwrap();
+        let mut out = Vec::new();
+        conv.convert(&[], true, &mut out).unwrap();
+        assert_eq!(out, annex_b(HEVC));
+        assert_eq!(hevc_sps_size(HEVC[1]), Some((352, 288)));
     }
 }

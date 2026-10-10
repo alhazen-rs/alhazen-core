@@ -14,6 +14,8 @@ mod mp4;
 pub(crate) mod mpeg_audio;
 #[cfg(feature = "native")]
 mod ogg;
+#[cfg(feature = "native")]
+mod ts;
 pub(crate) mod tags;
 #[cfg(feature = "native")]
 mod wav;
@@ -38,12 +40,16 @@ pub use mp4::Mp4Demuxer;
 #[cfg(feature = "native")]
 pub use ogg::OggDemuxer;
 #[cfg(feature = "native")]
+pub use ts::{TsDemuxer, VideoParams};
+#[cfg(feature = "hls")]
+pub(crate) use ts::is_ts as ts_is_ts;
+#[cfg(feature = "native")]
 pub use wav::WavDemuxer;
 
 use crate::Result;
 use crate::source::MediaSource;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StreamKind {
     Video,
     Audio,
@@ -230,6 +236,12 @@ pub trait Demuxer: Send {
     fn metadata(&self) -> Option<&Metadata> {
         None
     }
+    /// A stream whose format changed (an HLS variant switch or discontinuity: new codec, size or
+    /// setup data), checked after every packet. The packet just returned and the ones after it
+    /// are in the new format; the player reopens that stream's decoder.
+    fn take_stream_update(&mut self) -> Option<StreamInfo> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -246,6 +258,8 @@ pub enum ContainerFormat {
     Wav,
     /// Ogg (Vorbis, Opus or FLAC).
     Ogg,
+    /// MPEG transport stream (`.ts`, `.m2ts`).
+    MpegTs,
 }
 
 /// Bytes searched for MPEG/ADTS frames after any ID3v2 tags.
@@ -262,6 +276,10 @@ fn probe_content(src: &mut dyn MediaSource) -> Result<Option<ContainerFormat>> {
     let head = read_at(src, 0, 12)?;
     if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
         return Ok(Some(ContainerFormat::Matroska));
+    }
+    #[cfg(feature = "native")]
+    if ts::is_ts(&read_at(src, 0, 4 + 3 * 192)?) {
+        return Ok(Some(ContainerFormat::MpegTs));
     }
     // QuickTime files may start with `wide`/`mdat`/`free` before `moov`.
     if head.len() >= 8 && matches!(&head[4..8], b"ftyp" | b"moov" | b"styp" | b"wide" | b"mdat" | b"free") {
