@@ -16,20 +16,50 @@ use objc2_core_video::{
     CVPixelBufferUnlockBaseAddress, kCVPixelBufferHeightKey, kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey,
     kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
     kCVPixelFormatType_420YpCbCr10BiPlanarFullRange, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+    kCVPixelFormatType_422YpCbCr8BiPlanarFullRange, kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange,
+    kCVPixelFormatType_422YpCbCr10BiPlanarFullRange, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange,
+    kCVPixelFormatType_444YpCbCr8BiPlanarFullRange, kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange,
+    kCVPixelFormatType_444YpCbCr10BiPlanarFullRange, kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange,
 };
 use objc2_video_toolbox::{VTDecodeFrameFlags, VTDecodeInfoFlags, VTDecompressionOutputCallbackRecord, VTDecompressionSession};
 
 use super::cf;
 use crate::apple::format::{atom_name, prores_subtype, video_codec_type, vpcc_from_keyframe};
-use crate::apple::planes::biplanar_to_i420;
+use crate::apple::planes::biplanar_to_planar;
 use crate::decode::{ColorMatrix, DecodedFrame, PixelLayout, VideoDecoder, YuvFrame, chroma_size};
 use crate::demux::{Codec, Packet, StreamInfo};
 use crate::nvdec::size::target_size;
 use crate::{Error, Result};
 
-/// Pictures held back to be released in presentation order (VideoToolbox may emit them in decode
-/// order).
-const REORDER: usize = 4;
+/// The bi-planar output formats we ask for and read.
+struct OutputFormat {
+    code: u32,
+    layout: PixelLayout,
+    ten_bit: bool,
+    full_range: bool,
+}
+
+const FORMATS: [OutputFormat; 12] = {
+    const fn f(code: u32, layout: PixelLayout, ten_bit: bool, full_range: bool) -> OutputFormat {
+        OutputFormat { code, layout, ten_bit, full_range }
+    }
+    use PixelLayout::{I420, I422, I444};
+    [
+        f(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, I420, false, false),
+        f(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, I420, false, true),
+        f(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, I420, true, false),
+        f(kCVPixelFormatType_420YpCbCr10BiPlanarFullRange, I420, true, true),
+        f(kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange, I422, false, false),
+        f(kCVPixelFormatType_422YpCbCr8BiPlanarFullRange, I422, false, true),
+        f(kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange, I422, true, false),
+        f(kCVPixelFormatType_422YpCbCr10BiPlanarFullRange, I422, true, true),
+        f(kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange, I444, false, false),
+        f(kCVPixelFormatType_444YpCbCr8BiPlanarFullRange, I444, false, true),
+        f(kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange, I444, true, false),
+        f(kCVPixelFormatType_444YpCbCr10BiPlanarFullRange, I444, true, true),
+    ]
+};
+
 /// Timestamps are passed in nanoseconds.
 const TIMESCALE: i32 = 1_000_000_000;
 
@@ -62,7 +92,8 @@ pub struct VtVideoDecoder {
     stream: StreamInfo,
     session: Option<Session>,
     hint: Option<(u32, u32)>,
-    /// Decoded pictures sorted by pts, released once `REORDER` are waiting (all at the end).
+    /// Decoded pictures, in presentation order (VideoToolbox's temporal processing delivers them
+    /// so; each batch is sorted too).
     window: Vec<YuvFrame>,
     eof: bool,
 }
@@ -104,6 +135,23 @@ impl VtVideoDecoder {
             Codec::ProRes => 10,
             _ => crate::nvdec::profile::format(s).map_or(8, |f| f.bit_depth),
         };
+        // The source's chroma sampling, kept in the output (ProRes and 4:4:4 streams lose nothing).
+        let layout = match s.codec {
+            Codec::Vp9 => match record.as_ref().map_or(1, |r| (r[6] >> 1) & 7) {
+                2 => PixelLayout::I422,
+                3 => PixelLayout::I444,
+                _ => PixelLayout::I420,
+            },
+            Codec::ProRes => match keyframe.get(20).map(|b| b >> 6) {
+                Some(3) => PixelLayout::I444,
+                _ => PixelLayout::I422,
+            },
+            _ => match crate::nvdec::profile::format(s).map(|f| f.chroma) {
+                Some(crate::nvdec::profile::Chroma::Yuv422) => PixelLayout::I422,
+                Some(crate::nvdec::profile::Chroma::Yuv444) => PixelLayout::I444,
+                _ => PixelLayout::I420,
+            },
+        };
 
         // Format description: the codec record as a sample description extension atom.
         let mut extensions = None;
@@ -123,12 +171,11 @@ impl VtVideoDecoder {
 
         // Output: 4:2:0 bi-planar, 8 or 10 bits, the stream's range, scaled to the hint.
         let full_range = s.full_range == Some(true);
-        let pixel_format = match (bit_depth > 8, full_range) {
-            (false, false) => kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-            (false, true) => kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-            (true, false) => kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
-            (true, true) => kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
-        };
+        let pixel_format = FORMATS
+            .iter()
+            .find(|f| f.layout == layout && f.ten_bit == (bit_depth > 8) && f.full_range == full_range)
+            .map(|f| f.code)
+            .unwrap_or(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
         let target = target_size((w, h), self.hint);
         let format_number = cf::number(pixel_format as i64);
         let (tw, th) = (cf::number(target.0 as i64), cf::number(target.1 as i64));
@@ -157,7 +204,7 @@ impl VtVideoDecoder {
             let status = VTDecompressionSession::create(None, &format, None, Some(&attributes), &callback, NonNull::from(&mut vt));
             cf::created(status, vt, "VTDecompressionSessionCreate")?
         };
-        log::info!("VideoToolbox {} {w}x{h} ({bit_depth}-bit) → {}x{}", s.codec, target.0, target.1);
+        log::info!("VideoToolbox {} {w}x{h} ({bit_depth}-bit {layout:?}) → {}x{}", s.codec, target.0, target.1);
         Ok(Session { vt, format, sink, target })
     }
 
@@ -167,11 +214,9 @@ impl VtVideoDecoder {
         if let Some(e) = s.sink.error.lock().unwrap().take() {
             return Err(Error::Decode(e));
         }
-        let frames = std::mem::take(&mut *s.sink.frames.lock().unwrap());
-        for f in frames {
-            let at = self.window.partition_point(|w| w.pts < f.pts);
-            self.window.insert(at, f);
-        }
+        let mut frames = std::mem::take(&mut *s.sink.frames.lock().unwrap());
+        frames.sort_by_key(|f| f.pts);
+        self.window.extend(frames);
         Ok(())
     }
 
@@ -222,10 +267,10 @@ impl VideoDecoder for VtVideoDecoder {
 
     fn receive_frame(&mut self) -> Result<Option<DecodedFrame>> {
         self.collect()?;
-        if self.window.len() > REORDER || (self.eof && !self.window.is_empty()) {
-            return Ok(Some(DecodedFrame::Yuv(self.window.remove(0))));
+        if self.window.is_empty() {
+            return Ok(None);
         }
-        Ok(None)
+        Ok(Some(DecodedFrame::Yuv(self.window.remove(0))))
     }
 
     fn flush(&mut self) {
@@ -308,14 +353,11 @@ unsafe extern "C-unwind" fn on_output(
 /// # Safety
 /// `pb` must be a valid pixel buffer.
 unsafe fn copy_out(pb: &CVImageBuffer, pts: CMTime, sink: &Sink) -> std::result::Result<YuvFrame, String> {
-    let format = CVPixelBufferGetPixelFormatType(pb);
-    let (bytes_per_sample, full_range) = match format {
-        f if f == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange => (1, false),
-        f if f == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange => (1, true),
-        f if f == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange => (2, false),
-        f if f == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange => (2, true),
-        f => return Err(format!("VideoToolbox output format {:?} is not 4:2:0 bi-planar", f.to_be_bytes())),
+    let code = CVPixelBufferGetPixelFormatType(pb);
+    let Some(format) = FORMATS.iter().find(|f| f.code == code) else {
+        return Err(format!("VideoToolbox output format {:?} is not a bi-planar YCbCr one", code.to_be_bytes()));
     };
+    let (bytes_per_sample, full_range, layout) = (if format.ten_bit { 2 } else { 1 }, format.full_range, format.layout);
     // SAFETY: a valid pixel buffer, locked for reading while its planes are read.
     unsafe {
         if CVPixelBufferLockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) != 0 {
@@ -336,13 +378,13 @@ unsafe fn copy_out(pb: &CVImageBuffer, pts: CMTime, sink: &Sink) -> std::result:
                 std::slice::from_raw_parts(uv_base as *const u8, uv_stride * uv_rows),
             )
         };
-        Some(biplanar_to_i420(y, y_stride, uv, uv_stride, w as u32, h as u32, bytes_per_sample))
+        Some(biplanar_to_planar(y, y_stride, uv, uv_stride, w as u32, h as u32, bytes_per_sample, layout))
     };
     // SAFETY: unlocks the lock taken above.
     unsafe { CVPixelBufferUnlockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) };
     let planes = planes.ok_or("a VideoToolbox picture without planes")?;
     let (w, h) = (w as u32, h as u32);
-    let (cw, _) = chroma_size(PixelLayout::I420, w, h);
+    let (cw, _) = chroma_size(layout, w, h);
     let pts = if pts.timescale > 0 && pts.value >= 0 {
         Duration::from_nanos((pts.value as i128 * 1_000_000_000 / pts.timescale as i128) as u64)
     } else {
@@ -351,7 +393,7 @@ unsafe fn copy_out(pb: &CVImageBuffer, pts: CMTime, sink: &Sink) -> std::result:
     Ok(YuvFrame {
         width: w,
         height: h,
-        layout: PixelLayout::I420,
+        layout,
         planes,
         strides: [w as usize, cw as usize, cw as usize],
         matrix: sink.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(sink.display_height)),

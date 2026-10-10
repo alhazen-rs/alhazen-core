@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use alhazen_core::apple::{AppleBackend, AtAudioDecoder, VtVideoDecoder};
 use alhazen_core::audio::{AudioOutputConfig, NullOutput};
 use alhazen_core::backend::{Backend, Registry};
-use alhazen_core::decode::{AudioDecoder, DecodedFrame, VideoDecoder, YuvFrame};
+use alhazen_core::decode::{AudioDecoder, DecodedFrame, PixelLayout, VideoDecoder, YuvFrame};
 use alhazen_core::demux::{Codec, Demuxer, StreamInfo, StreamKind};
 use alhazen_core::{Player, PlayerConfig, PlayerState, Source};
 
@@ -50,11 +50,16 @@ fn decode_with(name: &str, hint: impl Fn(usize) -> Option<(u32, u32)>) -> (usize
     (packets, frames)
 }
 
-/// ffmpeg's frame `index` scaled to `size`, 8-bit planar 4:2:0, or `None` without ffmpeg.
-fn ffmpeg_frame(name: &str, index: usize, size: (u32, u32)) -> Option<Vec<u8>> {
+/// ffmpeg's frame `index` scaled to `size`, 8-bit planar in `layout`, or `None` without ffmpeg.
+fn ffmpeg_frame(name: &str, index: usize, size: (u32, u32), layout: PixelLayout) -> Option<Vec<u8>> {
     let filter = format!("select=eq(n\\,{index}),scale={}:{}", size.0, size.1);
+    let pix_fmt = match layout {
+        PixelLayout::I422 => "yuv422p",
+        PixelLayout::I444 => "yuv444p",
+        _ => "yuv420p",
+    };
     let out = Command::new("ffmpeg")
-        .args(["-v", "error", "-i", &fixture(name), "-vf", &filter, "-frames:v", "1", "-pix_fmt", "yuv420p", "-f", "rawvideo", "-"])
+        .args(["-v", "error", "-i", &fixture(name), "-vf", &filter, "-frames:v", "1", "-pix_fmt", pix_fmt, "-f", "rawvideo", "-"])
         .output()
         .ok()?;
     out.status.success().then_some(out.stdout)
@@ -68,7 +73,7 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
 
 fn check_pictures(name: &str, frames: &[YuvFrame]) {
     for (i, f) in frames.iter().enumerate().step_by(7) {
-        let Some(reference) = ffmpeg_frame(name, i, (f.width, f.height)) else {
+        let Some(reference) = ffmpeg_frame(name, i, (f.width, f.height), f.layout) else {
             eprintln!("no ffmpeg: picture comparison skipped");
             return;
         };
@@ -115,7 +120,16 @@ fn hardware_only_codecs_decode_when_claimed() {
         }
         let (packets, frames) = decode_with(name, |_| None);
         assert_eq!(frames.len(), packets, "{name}");
+        if s.codec == Codec::ProRes {
+            assert_eq!(frames[0].layout, PixelLayout::I422, "{name}: ProRes 4:2:2 keeps its chroma");
+        }
         check_pictures(name, &frames);
+    }
+    let s = video(demuxer("prores_4444.mov").as_ref());
+    if AppleBackend::new(true).supports_video(&s) {
+        let (_, frames) = decode_with("prores_4444.mov", |_| None);
+        assert_eq!(frames[0].layout, PixelLayout::I444);
+        check_pictures("prores_4444.mov", &frames);
     }
 }
 

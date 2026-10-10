@@ -18,7 +18,8 @@ fn native_first_frame(name: &str) -> YuvFrame {
     let source = Source::parse(&fixture(name)).unwrap();
     let mut src = source.open().unwrap();
     let format = alhazen_core::demux::probe(src.as_mut()).unwrap().unwrap();
-    let registry = Registry::with_defaults();
+    // The native decoders themselves: a platform backend (VideoToolbox) may take these otherwise.
+    let registry = Registry::empty_with_native();
     let mut demuxer = registry.open_demuxer(&source, format, src, None).unwrap();
     let stream = demuxer.streams().iter().find(|s| s.kind == StreamKind::Video).unwrap().clone();
     let mut dec = registry.open_video_decoder(&stream, 2, None).unwrap();

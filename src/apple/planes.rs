@@ -1,12 +1,24 @@
 //! VideoToolbox's bi-planar pictures (Y, then interleaved Cb/Cr; 8 or 16 bits per sample) as
-//! the planar 8-bit I420 our pipeline converts.
+//! the planar 8-bit frames our pipeline converts.
 
-/// Y, U and V planes, tightly packed (`w × h`, then two `ceil(w/2) × ceil(h/2)`), from a luma
-/// plane and an interleaved chroma plane with their row strides in bytes. With 2 bytes per sample
-/// (little-endian, value in the high bits), the high byte is kept.
-pub(crate) fn biplanar_to_i420(y: &[u8], y_stride: usize, uv: &[u8], uv_stride: usize, w: u32, h: u32, bytes_per_sample: usize) -> [Vec<u8>; 3] {
-    let (w, h) = (w as usize, h as usize);
-    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+use crate::decode::{PixelLayout, chroma_size};
+
+/// Y, U and V planes, tightly packed (`w × h`, then two chroma planes sized for `layout`), from a
+/// luma plane and an interleaved chroma plane with their row strides in bytes. With 2 bytes per
+/// sample (little-endian, value in the high bits), the high byte is kept.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn biplanar_to_planar(
+    y: &[u8],
+    y_stride: usize,
+    uv: &[u8],
+    uv_stride: usize,
+    w: u32,
+    h: u32,
+    bytes_per_sample: usize,
+    layout: PixelLayout,
+) -> [Vec<u8>; 3] {
+    let (cw, ch) = chroma_size(layout, w, h);
+    let (w, h, cw, ch) = (w as usize, h as usize, cw as usize, ch as usize);
     let bps = bytes_per_sample.max(1);
     let hi = bps - 1; // the byte to keep
     let mut py = Vec::with_capacity(w * h);
@@ -25,6 +37,12 @@ pub(crate) fn biplanar_to_i420(y: &[u8], y_stride: usize, uv: &[u8], uv_stride: 
         }
     }
     [py, pu, pv]
+}
+
+/// [`biplanar_to_planar`] for 4:2:0.
+#[cfg(test)]
+fn biplanar_to_i420(y: &[u8], y_stride: usize, uv: &[u8], uv_stride: usize, w: u32, h: u32, bytes_per_sample: usize) -> [Vec<u8>; 3] {
+    biplanar_to_planar(y, y_stride, uv, uv_stride, w, h, bytes_per_sample, PixelLayout::I420)
 }
 
 #[cfg(test)]
@@ -62,5 +80,17 @@ mod tests {
         assert_eq!(py, [0x80, 0x40]);
         assert_eq!(pu, [0x11]);
         assert_eq!(pv, [0x22]);
+    }
+
+    #[test]
+    fn four_two_two_and_four_four_four_keep_their_chroma() {
+        // 2x2 picture. 4:2:2: one Cb/Cr pair per row; 4:4:4: two per row.
+        let y = [1, 2, 3, 4];
+        let uv422 = [10, 20, 11, 21];
+        let [_, pu, pv] = biplanar_to_planar(&y, 2, &uv422, 2, 2, 2, 1, PixelLayout::I422);
+        assert_eq!((pu, pv), (vec![10, 11], vec![20, 21]));
+        let uv444 = [10, 20, 11, 21, 12, 22, 13, 23];
+        let [_, pu, pv] = biplanar_to_planar(&y, 2, &uv444, 4, 2, 2, 1, PixelLayout::I444);
+        assert_eq!((pu, pv), (vec![10, 11, 12, 13], vec![20, 21, 22, 23]));
     }
 }
