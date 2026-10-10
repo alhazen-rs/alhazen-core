@@ -6,11 +6,13 @@ use std::ptr::{self, NonNull};
 
 use objc2_audio_toolbox::{
     AudioConverterDispose, AudioConverterFillComplexBuffer, AudioConverterNew, AudioConverterRef, AudioConverterReset,
-    AudioConverterSetProperty, kAudioConverterDecompressionMagicCookie,
+    AudioConverterSetProperty, kAudioConverterDecompressionMagicCookie, kAudioConverterOutputChannelLayout,
 };
 use objc2_core_audio_types::{
-    AudioBuffer, AudioBufferList, AudioStreamBasicDescription, AudioStreamPacketDescription, kAudioFormatFlagIsFloat,
-    kAudioFormatFlagIsPacked, kAudioFormatLinearPCM,
+    AudioBuffer, AudioBufferList, AudioChannelLayout, AudioChannelLayoutTag, AudioStreamBasicDescription,
+    AudioStreamPacketDescription, kAudioChannelLayoutTag_WAVE_3_0, kAudioChannelLayoutTag_WAVE_4_0_B,
+    kAudioChannelLayoutTag_WAVE_5_0_B, kAudioChannelLayoutTag_WAVE_5_1_A, kAudioChannelLayoutTag_WAVE_6_1,
+    kAudioChannelLayoutTag_WAVE_7_1, kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked, kAudioFormatLinearPCM,
 };
 
 use crate::apple::format::{AudioFormat, audio_format};
@@ -44,7 +46,10 @@ impl Drop for Converter {
 
 pub struct AtAudioDecoder {
     stream: StreamInfo,
-    converter: Option<Converter>,
+    converter: Converter,
+    /// E-AC-3's frames per packet come from its first syncframe: checked once, the converter
+    /// rebuilt if it differs from the default.
+    first_checked: bool,
     ready: VecDeque<Samples>,
     /// Encoder start-up padding (edit lists, CodecDelay) and end padding, where AudioToolbox does
     /// not drop them itself.
@@ -57,66 +62,99 @@ pub struct AtAudioDecoder {
 unsafe impl Send for AtAudioDecoder {}
 
 impl AtAudioDecoder {
+    /// Fails when AudioToolbox refuses the stream, so the registry can try the next backend.
     pub fn new(stream: &StreamInfo) -> Result<Self> {
+        let format = audio_format(stream, &[]).ok_or(Error::Unsupported("codec for AudioToolbox"))?;
         Ok(Self {
             stream: stream.clone(),
-            converter: None,
+            converter: Converter::new(format)?,
+            first_checked: false,
             ready: VecDeque::new(),
             trim: DelayTrim::new(absorbed_delay(stream)).with_end(stream.end_trim),
             out: Vec::new(),
         })
     }
 
-    fn converter(&mut self, first_packet: &[u8]) -> Result<&mut Converter> {
-        if self.converter.is_none() {
-            let format = audio_format(&self.stream, first_packet).ok_or(Error::Unsupported("codec for AudioToolbox"))?;
-            let input = AudioStreamBasicDescription {
-                mSampleRate: format.rate as f64,
-                mFormatID: format.id,
-                mFormatFlags: format.format_flags,
-                mBytesPerPacket: 0,
-                mFramesPerPacket: format.frames_per_packet,
-                mBytesPerFrame: 0,
-                mChannelsPerFrame: format.channels,
-                mBitsPerChannel: 0,
-                mReserved: 0,
-            };
-            let output = AudioStreamBasicDescription {
-                mSampleRate: format.rate as f64,
-                mFormatID: kAudioFormatLinearPCM,
-                mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
-                mBytesPerPacket: 4 * format.channels,
-                mFramesPerPacket: 1,
-                mBytesPerFrame: 4 * format.channels,
-                mChannelsPerFrame: format.channels,
-                mBitsPerChannel: 32,
-                mReserved: 0,
-            };
-            let mut raw: AudioConverterRef = ptr::null_mut();
-            // SAFETY: valid descriptions; the out-pointer receives a converter we own.
-            let status = unsafe { AudioConverterNew(NonNull::from(&input), NonNull::from(&output), NonNull::from(&mut raw)) };
-            if status != 0 || raw.is_null() {
-                return Err(Error::Decode(format!("AudioConverterNew ({}): OSStatus {status}", fourcc(format.id))));
-            }
-            let converter = Converter { raw, format };
-            if let Some(cookie) = &converter.format.cookie {
-                // SAFETY: the cookie bytes outlive the call, which copies them.
-                let status = unsafe {
-                    AudioConverterSetProperty(
-                        raw,
-                        kAudioConverterDecompressionMagicCookie,
-                        cookie.len() as u32,
-                        NonNull::new_unchecked(cookie.as_ptr() as *mut c_void),
-                    )
-                };
-                if status != 0 {
-                    return Err(Error::Decode(format!("AudioToolbox refused the codec setup: OSStatus {status}")));
-                }
-            }
-            log::info!("AudioToolbox {} {} Hz, {} channels", fourcc(converter.format.id), converter.format.rate, converter.format.channels);
-            self.converter = Some(converter);
+    /// E-AC-3: rebuilds the converter if the first syncframe has fewer blocks than assumed.
+    fn check_first_packet(&mut self, packet: &[u8]) -> Result<()> {
+        if std::mem::replace(&mut self.first_checked, true) {
+            return Ok(());
         }
-        Ok(self.converter.as_mut().unwrap())
+        if let Some(format) = audio_format(&self.stream, packet)
+            && format.frames_per_packet != self.converter.format.frames_per_packet
+        {
+            self.converter = Converter::new(format)?;
+        }
+        Ok(())
+    }
+}
+
+impl Converter {
+    fn new(format: AudioFormat) -> Result<Converter> {
+        let input = AudioStreamBasicDescription {
+            mSampleRate: format.rate as f64,
+            mFormatID: format.id,
+            mFormatFlags: format.format_flags,
+            mBytesPerPacket: 0,
+            mFramesPerPacket: format.frames_per_packet,
+            mBytesPerFrame: 0,
+            mChannelsPerFrame: format.channels,
+            mBitsPerChannel: 0,
+            mReserved: 0,
+        };
+        let output = AudioStreamBasicDescription {
+            mSampleRate: format.rate as f64,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: 4 * format.channels,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 4 * format.channels,
+            mChannelsPerFrame: format.channels,
+            mBitsPerChannel: 32,
+            mReserved: 0,
+        };
+        let mut raw: AudioConverterRef = ptr::null_mut();
+        // SAFETY: valid descriptions; the out-pointer receives a converter we own.
+        let status = unsafe { AudioConverterNew(NonNull::from(&input), NonNull::from(&output), NonNull::from(&mut raw)) };
+        if status != 0 || raw.is_null() {
+            return Err(Error::Decode(format!("AudioConverterNew ({}): OSStatus {status}", fourcc(format.id))));
+        }
+        let converter = Converter { raw, format };
+        if let Some(cookie) = &converter.format.cookie {
+            // SAFETY: the cookie bytes outlive the call, which copies them.
+            let status = unsafe {
+                AudioConverterSetProperty(
+                    raw,
+                    kAudioConverterDecompressionMagicCookie,
+                    cookie.len() as u32,
+                    NonNull::new_unchecked(cookie.as_ptr() as *mut c_void),
+                )
+            };
+            if status != 0 {
+                return Err(Error::Decode(format!("AudioToolbox refused the codec setup: OSStatus {status}")));
+            }
+        }
+        // The pipeline mixes WAVE order (FL FR FC LFE BL BR SL SR); AudioToolbox's Dolby decoders
+        // otherwise hand out their own (L C R Ls Rs LFE): ask it to reorder.
+        if let Some(tag) = wave_layout(converter.format.channels) {
+            // SAFETY: a plain C struct; all-zero is a valid "no descriptions, no bitmap" layout.
+            let mut layout: AudioChannelLayout = unsafe { std::mem::zeroed() };
+            layout.mChannelLayoutTag = tag;
+            // SAFETY: the layout outlives the call, which copies it.
+            let status = unsafe {
+                AudioConverterSetProperty(
+                    raw,
+                    kAudioConverterOutputChannelLayout,
+                    size_of::<AudioChannelLayout>() as u32,
+                    NonNull::from(&layout).cast(),
+                )
+            };
+            if status != 0 {
+                return Err(Error::Decode(format!("AudioToolbox cannot output WAVE channel order: OSStatus {status}")));
+            }
+        }
+        log::info!("AudioToolbox {} {} Hz, {} channels", fourcc(converter.format.id), converter.format.rate, converter.format.channels);
+        Ok(converter)
     }
 }
 
@@ -126,7 +164,8 @@ impl AudioDecoder for AtAudioDecoder {
             return Ok(());
         }
         self.trim.on_packet(packet.pts);
-        let conv = self.converter(&packet.data)?;
+        self.check_first_packet(&packet.data)?;
+        let conv = &self.converter;
         let (raw, rate, channels) = (conv.raw, conv.format.rate, conv.format.channels);
         let capacity = conv.format.frames_per_packet.max(4096);
         let mut input = Input {
@@ -167,7 +206,13 @@ impl AudioDecoder for AtAudioDecoder {
                 NO_MORE_INPUT => return Ok(()),
                 0 if frames == 0 => return Ok(()),
                 0 => {}
-                s => return Err(Error::Decode(format!("AudioToolbox decode: OSStatus {s}"))),
+                s => {
+                    // The converter may still hold on to this packet (and its description):
+                    // reset it, so the next fill call cannot read them once they are gone.
+                    // SAFETY: a live converter.
+                    unsafe { AudioConverterReset(raw) };
+                    return Err(Error::Decode(format!("AudioToolbox decode: OSStatus {s}")));
+                }
             }
         }
     }
@@ -177,10 +222,8 @@ impl AudioDecoder for AtAudioDecoder {
     }
 
     fn flush(&mut self) {
-        if let Some(c) = &self.converter {
-            // SAFETY: a live converter.
-            unsafe { AudioConverterReset(c.raw) };
-        }
+        // SAFETY: a live converter.
+        unsafe { AudioConverterReset(self.converter.raw) };
         self.ready.clear();
         self.trim.reset();
     }
@@ -224,6 +267,19 @@ fn absorbed_delay(stream: &StreamInfo) -> std::time::Duration {
         Codec::Ac3 | Codec::Eac3 => std::time::Duration::ZERO,
         _ => stream.codec_delay,
     }
+}
+
+/// The WAVE-order layout the mixer expects for `channels` (none needed for mono and stereo).
+fn wave_layout(channels: u32) -> Option<AudioChannelLayoutTag> {
+    Some(match channels {
+        3 => kAudioChannelLayoutTag_WAVE_3_0,
+        4 => kAudioChannelLayoutTag_WAVE_4_0_B,
+        5 => kAudioChannelLayoutTag_WAVE_5_0_B,
+        6 => kAudioChannelLayoutTag_WAVE_5_1_A,
+        7 => kAudioChannelLayoutTag_WAVE_6_1,
+        8 => kAudioChannelLayoutTag_WAVE_7_1,
+        _ => return None,
+    })
 }
 
 fn fourcc(id: u32) -> String {
