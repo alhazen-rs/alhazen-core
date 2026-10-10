@@ -586,11 +586,16 @@ impl Player {
         self.hls.as_ref().map(|h| h.audio_renditions()).unwrap_or_default()
     }
 
-    /// HLS: switches to another of `audio_renditions()`.
+    /// HLS: switches to another of `audio_renditions()`. On VOD the new audio is heard at once
+    /// (playback restarts from the current position); live streams switch where the stream has
+    /// been read up to, a few seconds ahead.
     #[cfg(feature = "hls")]
     pub fn set_audio_rendition(&self, index: usize) {
         if let Some(h) = &self.hls {
             h.set_audio_rendition(index);
+            if self.seekable {
+                self.seek(self.position());
+            }
         }
     }
 
