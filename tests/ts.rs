@@ -74,6 +74,12 @@ fn ts_file_seeks_to_a_keyframe() {
 
 #[test]
 fn ts_file_plays_to_the_end() {
+    // H.264 needs a platform decoder or ffmpeg (no pure-Rust one): skip in builds without them.
+    let h264 = alhazen_core::demux::StreamInfo::new(0, StreamKind::Video, Codec::H264);
+    if !Registry::with_defaults().can_decode(&h264) {
+        eprintln!("skipped: no H.264 decoder in this build");
+        return;
+    }
     let config = PlayerConfig { audio_output: AudioOutputConfig::Disabled, decoder_threads: 2, ..Default::default() };
     let player = Player::open(Source::parse(&path("h264_aac.ts")).unwrap(), config).unwrap();
     assert_eq!(player.video_size(), Some((320, 180)));
