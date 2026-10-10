@@ -227,9 +227,7 @@ impl VtVideoDecoder {
         }
         let frames = std::mem::take(&mut *s.sink.frames.lock().unwrap());
         for f in frames {
-            if self.last_out.is_some_and(|last| f.pts <= last) {
-                // Too late: a later picture has gone out. Hold back one more from now on.
-                self.depth += 1;
+            if !crate::apple::reorder::admit(self.last_out, f.pts, &mut self.depth) {
                 log::warn!("VideoToolbox: picture at {:?} after {:?}; holding back {}", f.pts, self.last_out.unwrap(), self.depth);
                 continue;
             }
@@ -356,18 +354,28 @@ unsafe extern "C-unwind" fn on_output(
 ) {
     // SAFETY: `refcon` is the session's `Sink`, alive until the session is invalidated.
     let sink = unsafe { &*(refcon as *const Sink) };
-    if status != 0 {
-        *sink.error.lock().unwrap() = Some(format!("VideoToolbox decode: OSStatus {status}"));
-        return;
+    // A panic must not unwind through VideoToolbox's own frames: it becomes a decode error.
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if status != 0 {
+            return Err(format!("VideoToolbox decode: OSStatus {status}"));
+        }
+        if image.is_null() || flags.contains(VTDecodeInfoFlags::FrameDropped) {
+            return Ok(None);
+        }
+        // SAFETY: a valid pixel buffer for the duration of the callback.
+        unsafe { copy_out(&*image, pts, sink) }.map(Some)
+    }));
+    let result = caught.unwrap_or_else(|_| Err("VideoToolbox: panic while copying a picture".into()));
+    match result {
+        Ok(Some(f)) => lock(&sink.frames).push(f),
+        Ok(None) => {}
+        Err(e) => *lock(&sink.error) = Some(e),
     }
-    if image.is_null() || flags.contains(VTDecodeInfoFlags::FrameDropped) {
-        return;
-    }
-    // SAFETY: a valid pixel buffer for the duration of the callback.
-    match unsafe { copy_out(&*image, pts, sink) } {
-        Ok(f) => sink.frames.lock().unwrap().push(f),
-        Err(e) => *sink.error.lock().unwrap() = Some(e),
-    }
+}
+
+/// Locks even a poisoned mutex (a panic elsewhere must not turn into one here).
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// The picture in `pb` (4:2:0 bi-planar, 8 or 10 bits) as an I420 frame.

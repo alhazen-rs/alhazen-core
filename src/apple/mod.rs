@@ -9,6 +9,7 @@
 pub(crate) mod rules;
 pub(crate) mod format;
 pub(crate) mod planes;
+pub(crate) mod reorder;
 
 #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
 mod mac;
