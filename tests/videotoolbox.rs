@@ -5,7 +5,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use alhazen_core::apple::{AppleBackend, AtAudioDecoder, VtVideoDecoder};
-use alhazen_core::audio::AudioOutputConfig;
+use alhazen_core::audio::{AudioOutputConfig, NullOutput};
 use alhazen_core::backend::{Backend, Registry};
 use alhazen_core::decode::{AudioDecoder, DecodedFrame, VideoDecoder, YuvFrame};
 use alhazen_core::demux::{Codec, Demuxer, StreamInfo, StreamKind};
@@ -249,4 +249,29 @@ fn audio_flush_then_decode_again() {
     }
     assert_eq!(first_pts, Some(packets[10].pts), "timed from the packet after the flush");
     assert!(frames >= 4 * 1536, "{frames}");
+}
+
+#[test]
+fn h264_through_videotoolbox_stays_in_sync_with_the_sound() {
+    const RATE: u32 = 48_000;
+    let null = NullOutput::new(RATE, 2);
+    let config = PlayerConfig { decoder_threads: 2, audio_output: AudioOutputConfig::Null(null.clone()), ..Default::default() };
+    let player = Player::open(Source::parse(&fixture("h264_aac.mp4")).unwrap(), config).unwrap();
+    assert_eq!(player.stats().video_backend, Some("videotoolbox"));
+    player.play();
+    let (start, mut checked, mut worst) = (Instant::now(), 0, Duration::ZERO);
+    while player.state() != PlayerState::Ended {
+        assert!(start.elapsed() < Duration::from_secs(20), "{}", player.debug_snapshot());
+        null.pull((RATE / 100) as usize);
+        std::thread::sleep(Duration::from_millis(10));
+        if let Some(f) = player.current_frame() {
+            let pos = player.position();
+            if pos > Duration::from_millis(300) && pos < Duration::from_millis(900) {
+                worst = worst.max(pos.abs_diff(f.pts()));
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 20, "only {checked} sync checks");
+    assert!(worst <= Duration::from_millis(45), "A/V offset up to {worst:?}");
 }

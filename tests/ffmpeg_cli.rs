@@ -255,9 +255,16 @@ fn h264_aac_plays_to_the_end_in_sync() {
         return;
     }
     let null = NullOutput::new(RATE, 2);
-    let config = PlayerConfig { decoder_threads: 2, audio_output: AudioOutputConfig::Null(null.clone()), ..Default::default() };
+    // ffmpeg first: platform decoders (VideoToolbox, Media Foundation) would take H.264 otherwise.
+    let config = PlayerConfig {
+        decoder_threads: 2,
+        audio_output: AudioOutputConfig::Null(null.clone()),
+        backend_order: Some(vec!["ffmpeg-cli"]),
+        ..Default::default()
+    };
     let player = Player::open(Source::parse(&fixture_path("h264_aac.mp4")).unwrap(), config).unwrap();
-    assert!(player.has_video() && player.has_audio(), "H.264 goes to ffmpeg; AAC to native-aac or ffmpeg");
+    assert!(player.has_video() && player.has_audio(), "H.264 goes to ffmpeg; AAC to ffmpeg");
+    assert_eq!(player.stats().video_backend, Some("ffmpeg-cli"));
     player.play();
     let mut checked = 0;
     until("end of playback", 20, || {
