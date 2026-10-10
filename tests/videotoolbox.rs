@@ -28,6 +28,10 @@ fn video(d: &dyn Demuxer) -> StreamInfo {
 
 /// Every frame of `name` through VideoToolbox; `hint(packet index)` sets the output hint.
 fn decode_with(name: &str, hint: impl Fn(usize) -> Option<(u32, u32)>) -> (usize, Vec<YuvFrame>) {
+    try_decode(name, hint).unwrap_or_else(|e| panic!("{e}"))
+}
+
+fn try_decode(name: &str, hint: impl Fn(usize) -> Option<(u32, u32)>) -> Result<(usize, Vec<YuvFrame>), String> {
     let mut d = demuxer(name);
     let s = video(d.as_ref());
     let mut dec = VtVideoDecoder::new(&s).unwrap();
@@ -37,7 +41,7 @@ fn decode_with(name: &str, hint: impl Fn(usize) -> Option<(u32, u32)>) -> (usize
             continue;
         }
         dec.set_output_hint(hint(packets));
-        dec.send_packet(&p).unwrap_or_else(|e| panic!("{name} packet {packets}: {e}"));
+        dec.send_packet(&p).map_err(|e| format!("{name} packet {packets}: {e}"))?;
         packets += 1;
         while let Some(DecodedFrame::Yuv(f)) = dec.receive_frame().unwrap() {
             frames.push(f);
@@ -47,7 +51,22 @@ fn decode_with(name: &str, hint: impl Fn(usize) -> Option<(u32, u32)>) -> (usize
     while let Some(DecodedFrame::Yuv(f)) = dec.receive_frame().unwrap() {
         frames.push(f);
     }
-    (packets, frames)
+    Ok((packets, frames))
+}
+
+/// Plays `name` to the end (no sound output); returns the video backend used.
+fn play_to_end(name: &str) -> Option<&'static str> {
+    let config = PlayerConfig { audio_output: AudioOutputConfig::Disabled, decoder_threads: 2, ..Default::default() };
+    let player = Player::open(Source::parse(&fixture(name)).unwrap(), config).unwrap();
+    player.play();
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(60) && player.state() != PlayerState::Ended {
+        assert!(!matches!(player.state(), PlayerState::Error(_)), "{name}: {:?}", player.state());
+        player.current_frame();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(player.state(), PlayerState::Ended, "{name}");
+    player.stats().video_backend
 }
 
 /// ffmpeg's frame `index` scaled to `size`, 8-bit planar in `layout`, or `None` without ffmpeg.
@@ -118,7 +137,18 @@ fn hardware_only_codecs_decode_when_claimed() {
             eprintln!("{name}: no hardware decoder on this Mac (native keeps it)");
             continue;
         }
-        let (packets, frames) = decode_with(name, |_| None);
+        let (packets, frames) = match try_decode(name, |_| None) {
+            Ok(r) => r,
+            // Virtual Macs (the CI runners) may report hardware they cannot use: the player
+            // then hands the stream to the next backend.
+            Err(e) if e.contains("VTDecompressionSessionCreate") => {
+                let backend = play_to_end(name);
+                eprintln!("{name}: claimed, but {e}; the player fell back to {backend:?}");
+                assert_ne!(backend, Some("videotoolbox"), "{name}");
+                continue;
+            }
+            Err(e) => panic!("{e}"),
+        };
         assert_eq!(frames.len(), packets, "{name}");
         if s.codec == Codec::ProRes {
             assert_eq!(frames[0].layout, PixelLayout::I422, "{name}: ProRes 4:2:2 keeps its chroma");
@@ -241,8 +271,10 @@ fn alac_ac3_and_eac3_decode_like_ffmpeg() {
             let (r, o) = if off >= 0 { (&reference[..], &samples[off as usize * ch..]) } else { (&reference[(-off) as usize * ch..], &samples[..]) };
             snr(r, o)
         };
-        let best = (-2048..=2048).step_by(16).max_by(|&a, &b| at(a).total_cmp(&at(b))).unwrap();
-        let best = (best - 16..=best + 16).max_by(|&a, &b| at(a).total_cmp(&at(b))).unwrap();
+        // Ties (silence, lossless) go to the offset nearest 0.
+        let pick = |range: Vec<i64>| range.into_iter().max_by(|&a, &b| at(a).total_cmp(&at(b)).then(b.abs().cmp(&a.abs()))).unwrap();
+        let best = pick((-2048..=2048).step_by(16).collect());
+        let best = pick((best - 16..=best + 16).collect());
         eprintln!("{name}: {:.1} dB in place, {:.1} dB at offset {best} frames", at(0), at(best));
         assert_eq!(best, 0, "{name}: ours is offset by {best} frames from ffmpeg's ({:.1} dB there)", at(best));
         let db = at(0);
