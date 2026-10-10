@@ -33,6 +33,9 @@ if let Some(frame) = player.current_frame() { /* draw it */ }
 - **The OS's own decoders on Windows:** H.264, HEVC, VP9 and AV1 on the GPU, plus AAC, MP3,
   AC-3, E-AC-3 and ALAC, through Media Foundation. Nothing to install; Windows covers the
   codec licences.
+- **Apple's decoders on macOS:** H.264 and HEVC (8- and 10-bit) on the GPU through
+  VideoToolbox, plus AV1, VP9 and ProRes on Macs with hardware for them; ALAC, AC-3, E-AC-3 and
+  xHE-AAC through AudioToolbox. Nothing to install (Apple Silicon, macOS 12 or later).
 - **NVIDIA GPUs on Linux:** H.264, HEVC, VP8, VP9 and AV1 (8- and 10-bit) decode on the GPU
   through NVDEC, scaled to your display size on the GPU. Loaded from the driver at runtime:
   nothing to install or build.
@@ -200,35 +203,38 @@ if let Some(m) = player.metadata() {
 
 ### Video
 
-| Codec | Pure Rust (all platforms) | Windows (Media Foundation) | Linux, NVIDIA (NVDEC) | User's ffmpeg |
-|---|---|---|---|---|
-| AV1 | ✅ rav1d | ✅ GPU¹ | ✅ GPU¹ | ✅ |
-| VP9 | ✅ vp9-mt, multi-threaded | ✅ GPU¹ | ✅ GPU¹ | ✅ |
-| VP8 | ✅ oximedia-codec | | ✅ GPU¹ | ✅ |
-| Apple ProRes (422, 4444, interlaced) | ✅ oxideav-prores | | | ✅ |
-| H.264 / AVC | | ✅ GPU or software | ✅ GPU | ✅ |
-| H.265 / HEVC | | ✅ GPU² | ✅ GPU | ✅ |
-| MJPEG, MPEG-4 Part 2, others | | | | ✅ |
+| Codec | Pure Rust (all platforms) | Windows (Media Foundation) | macOS (VideoToolbox) | Linux, NVIDIA (NVDEC) | User's ffmpeg |
+|---|---|---|---|---|---|
+| AV1 | ✅ rav1d | ✅ GPU¹ | ✅ GPU¹ ³ | ✅ GPU¹ | ✅ |
+| VP9 | ✅ vp9-mt, multi-threaded | ✅ GPU¹ | ✅ GPU¹ ³ | ✅ GPU¹ | ✅ |
+| VP8 | ✅ oximedia-codec | | | ✅ GPU¹ | ✅ |
+| Apple ProRes (422, 4444, interlaced) | ✅ oxideav-prores | | ✅ GPU¹ ³ | | ✅ |
+| H.264 / AVC | | ✅ GPU or software | ✅ GPU | ✅ GPU | ✅ |
+| H.265 / HEVC | | ✅ GPU² | ✅ GPU | ✅ GPU | ✅ |
+| MJPEG, MPEG-4 Part 2, others | | | | | ✅ |
 
 ¹ Used when the GPU decodes it and `prefer_hardware` is on (the default); otherwise the pure-Rust
 decoder is used.
 ² Needs the HEVC Video Extensions from the Microsoft Store (preinstalled on many PCs).
+³ On Macs that decode it in hardware (AV1: M3 and newer; ProRes: M1 Pro/Max/Ultra and newer);
+elsewhere the pure-Rust decoder is used.
 
 8- and 10-bit video is supported. Frames are delivered as 8-bit BGRA, converted with the
 stream's BT.601/BT.709 matrix and range.
 
 ### Audio
 
-| Codec | Pure Rust (all platforms) | Windows (Media Foundation) | User's ffmpeg |
-|---|---|---|---|
-| Opus (incl. 5.1/7.1) | ✅ | | ✅ |
-| Vorbis | ✅ lewton | | ✅ |
-| FLAC | ✅ claxon | | ✅ |
-| PCM (8–32-bit int, 32/64-bit float) | ✅ | | ✅ |
-| AAC (LC, HE-AAC v1/v2) | ✅ rusty_aac | ✅ | ✅ |
-| MP3 | ✅ rusty_mp3 | ✅ | ✅ |
-| AC-3, E-AC-3 | | ✅ | ✅ |
-| ALAC | | ✅ | ✅ |
+| Codec | Pure Rust (all platforms) | Windows (Media Foundation) | macOS (AudioToolbox) | User's ffmpeg |
+|---|---|---|---|---|
+| Opus (incl. 5.1/7.1) | ✅ | | | ✅ |
+| Vorbis | ✅ lewton | | | ✅ |
+| FLAC | ✅ claxon | | | ✅ |
+| PCM (8–32-bit int, 32/64-bit float) | ✅ | | | ✅ |
+| AAC (LC, HE-AAC v1/v2) | ✅ rusty_aac | ✅ | | ✅ |
+| xHE-AAC (USAC) | | | ✅ | ✅ |
+| MP3 | ✅ rusty_mp3 | ✅ | | ✅ |
+| AC-3, E-AC-3 | | ✅ | ✅ | ✅ |
+| ALAC | | ✅ | ✅ | ✅ |
 
 Audio is resampled to the output device's rate and mixed to its channel layout.
 
@@ -243,12 +249,13 @@ Each stream is offered to the backends in priority order; the first that claims 
 | Backend | Platforms | Claims |
 |---|---|---|
 | `media-foundation` | Windows | H.264/HEVC/audio whenever Windows has a decoder. VP9/AV1 only with a GPU decoder (Windows' software ones are no faster than ours). |
+| `videotoolbox` | macOS | H.264/HEVC always; AV1/VP9/ProRes only with a hardware decoder. Audio only where the pure-Rust decoders have none (ALAC, AC-3, E-AC-3, xHE-AAC). |
 | `nvdec` | Linux, NVIDIA | Video the GPU decodes at the stream's size. VP8/VP9/AV1 only with `prefer_hardware` (otherwise after `native`). |
 | `native` | all | The pure-Rust decoders. |
 | `ffmpeg-cli` | all | Whatever the user's `ffmpeg -decoders` lists. GPU decoding with `-hwaccel auto`. |
 
 - `PlayerConfig::prefer_hardware = false` puts `native` before the GPU decoders
-  (`media-foundation`, `nvdec`) for VP8/VP9/AV1.
+  (`media-foundation`, `videotoolbox`, `nvdec`) for VP8/VP9/AV1/ProRes.
 - **A decoder that can't decode a stream** hands it to the next backend automatically, e.g. a
   GPU without 10-bit H.264 or 4:4:4 support. GPU decoders don't even take such streams when the
   file's setup data shows the variant up front.
@@ -274,6 +281,7 @@ ffmpeg behind a Chocolatey/Scoop shim.
 | `audio-output` | ✅ | Sound through the default output device (`cpal`). Without it, audio is ignored and video runs on the system clock. |
 | `ffmpeg-cli` | ✅ | The runtime ffmpeg backend. Costs nothing when ffmpeg isn't installed. |
 | `media-foundation` | ✅ | Windows' decoders. Compiles to nothing on other platforms. |
+| `videotoolbox` | ✅ | Apple's decoders on macOS (VideoToolbox, AudioToolbox). Compiles to nothing on other platforms. |
 | `nvdec` | ✅ | NVIDIA GPU decoding on Linux (NVDEC), loaded from the driver at runtime. Compiles to nothing on other platforms. |
 | `native-aac` | ✅ | AAC (LC, Main, LTP, HE-AAC v1/v2) through rusty_aac (pure Rust, Apache-2.0). |
 | `native-mp3` | ✅ | MP3 (MPEG-1/2/2.5 Layer III) through rusty_mp3 (pure Rust, Apache-2.0). |
