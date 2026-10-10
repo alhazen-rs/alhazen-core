@@ -260,7 +260,8 @@ fn snr(reference: &[f32], test: &[f32]) -> f64 {
 
 #[test]
 fn alac_ac3_and_eac3_decode_like_ffmpeg() {
-    for (name, min_db) in [("alac.m4a", 90.0), ("ac3.mkv", 30.0), ("eac3.mkv", 30.0)] {
+    // The 5.1 files carry a different tone on each channel: a wrong channel order cannot pass.
+    for (name, min_db) in [("alac.m4a", 90.0), ("ac3.mkv", 30.0), ("eac3.mkv", 30.0), ("ac3_51.mkv", 30.0), ("eac3_51.mkv", 30.0)] {
         let (rate, channels, samples) = decode_audio(name);
         assert!(rate > 0 && channels > 0 && !samples.is_empty(), "{name}");
         let Some(reference) = ffmpeg_audio(name, rate, channels) else {
@@ -341,4 +342,41 @@ fn h264_through_videotoolbox_stays_in_sync_with_the_sound() {
     // A sync error shows in most samples; a busy runner can delay a single frame.
     assert!(at(0.95) <= Duration::from_millis(45), "A/V offset: 95% within {:?}", at(0.95));
     assert!(at(1.0) <= Duration::from_millis(100), "A/V offset up to {:?}", at(1.0));
+}
+
+#[test]
+fn a_stream_audiotoolbox_refuses_fails_at_open_so_another_backend_takes_it() {
+    // The registry only falls back when opening fails; a converter built later would leave the
+    // stream silent instead of handing it to ffmpeg.
+    let mut s = StreamInfo::new(2, StreamKind::Audio, Codec::Ac3);
+    s.sample_rate = 48_000;
+    s.channels = 200;
+    assert!(AppleBackend::new(true).supports_audio(&s), "AC-3 is claimed by codec");
+    assert!(AtAudioDecoder::new(&s).is_err(), "AudioToolbox cannot decode 200-channel AC-3");
+}
+
+#[test]
+fn a_corrupt_packet_does_not_stop_the_decoder() {
+    let mut d = demuxer("ac3.mkv");
+    let s = d.streams().iter().find(|s| s.kind == StreamKind::Audio).unwrap().clone();
+    let packets: Vec<_> = std::iter::from_fn(|| d.next_packet().unwrap()).filter(|p| p.stream == s.id).collect();
+    let mut dec = AtAudioDecoder::new(&s).unwrap();
+    for p in &packets[..5] {
+        dec.send_packet(p).unwrap();
+    }
+    // Keep the sync word, scramble the rest: the converter may fail on it.
+    let mut bad = packets[5].clone();
+    for (i, b) in bad.data.iter_mut().enumerate().skip(8) {
+        *b ^= (i * 37) as u8;
+    }
+    let _ = dec.send_packet(&bad);
+    while dec.receive_samples().unwrap().is_some() {}
+    let mut frames = 0;
+    for p in &packets[6..16] {
+        dec.send_packet(p).unwrap_or_else(|e| panic!("after the corrupt packet: {e}"));
+        while let Some(b) = dec.receive_samples().unwrap() {
+            frames += b.frames();
+        }
+    }
+    assert!(frames >= 8 * 1536, "decoding goes on after a corrupt packet: {frames} frames");
 }
