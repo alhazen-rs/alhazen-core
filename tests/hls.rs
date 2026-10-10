@@ -311,7 +311,10 @@ fn switching_audio_rendition_keeps_playing() {
     let text = std::fs::read_to_string(root().join("multi/master.m3u8")).unwrap();
     let remote = audio.url("multi/audio/index.m3u8");
     let second = format!("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"group_aud\",NAME=\"Second\",LANGUAGE=\"fr\",URI=\"{remote}?second\"\n");
-    let text = text.replace("URI=\"audio/index.m3u8\"\n", &format!("URI=\"{remote}\"\n{second}"));
+    // (Not tied to line endings: Windows checkouts may turn the fixture's into CRLF.)
+    let text = text.replace("URI=\"audio/index.m3u8\"", &format!("URI=\"{remote}\""));
+    let at = text.find("#EXT-X-STREAM-INF").unwrap();
+    let text = format!("{}{second}{}", &text[..at], &text[at..]);
     video.set_body("multi/master.m3u8", text);
     let null = NullOutput::new(48_000, 2);
     let config = PlayerConfig { audio_output: AudioOutputConfig::Null(null.clone()), decoder_threads: 2, ..Default::default() };
@@ -323,7 +326,9 @@ fn switching_audio_rendition_keeps_playing() {
     let (mut pulled, mut switched) = (0usize, false);
     while start.elapsed() < Duration::from_secs(30) && !matches!(player.state(), PlayerState::Ended | PlayerState::Error(_)) {
         player.current_frame(); // a UI drawing
-        if !switched && start.elapsed() > Duration::from_secs(2) {
+        // Late in the stream: everything is downloaded and read by then, so the switch must not
+        // wait for the reading position.
+        if !switched && start.elapsed() > Duration::from_millis(4500) {
             player.set_audio_rendition(1);
             switched = true;
         }
