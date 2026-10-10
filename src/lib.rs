@@ -1,6 +1,7 @@
 //! Video decoding pipeline with pluggable backends. No UI dependency.
 
 pub mod audio;
+pub(crate) mod apple;
 pub mod backend;
 pub mod clock;
 pub mod convert;

@@ -11,6 +11,7 @@ pub enum HwCodec {
     Vp8,
     Vp9,
     Av1,
+    ProRes,
     Aac,
     Mp3,
     Ac3,
@@ -26,6 +27,7 @@ impl HwCodec {
             (StreamKind::Video, Codec::Vp8) => HwCodec::Vp8,
             (StreamKind::Video, Codec::Vp9) => HwCodec::Vp9,
             (StreamKind::Video, Codec::Av1) => HwCodec::Av1,
+            (StreamKind::Video, Codec::ProRes) => HwCodec::ProRes,
             (StreamKind::Audio, Codec::Aac) => HwCodec::Aac,
             (StreamKind::Audio, Codec::Mp3) => HwCodec::Mp3,
             (StreamKind::Audio, Codec::Ac3) => HwCodec::Ac3,
@@ -37,7 +39,7 @@ impl HwCodec {
 
     /// Codecs our pure-Rust decoders also handle: only worth a hardware decoder.
     fn native_alternative(self) -> bool {
-        matches!(self, HwCodec::Vp8 | HwCodec::Vp9 | HwCodec::Av1)
+        matches!(self, HwCodec::Vp8 | HwCodec::Vp9 | HwCodec::Av1 | HwCodec::ProRes)
     }
 }
 

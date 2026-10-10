@@ -15,7 +15,7 @@ categories = ["multimedia::video", "multimedia::audio", "multimedia"]
 include = ["src/**", "examples/**", "LICENSE", "NOTICE", "README.md"]
 
 [features]
-default = ["native", "http", "hls", "audio-output", "ffmpeg-cli", "media-foundation", "nvdec", "native-aac", "native-mp3"]
+default = ["native", "http", "hls", "audio-output", "ffmpeg-cli", "media-foundation", "nvdec", "videotoolbox", "native-aac", "native-mp3"]
 # Pure-Rust, permissively licensed decoders: AV1 (rav1d), VP9 (vp9-mt), VP8 (oximedia-codec),
 # ProRes (oxideav-prores), Opus, Vorbis, FLAC (claxon); MP4/MOV demuxing.
 native = ["dep:rav1d", "dep:vp9-mt", "dep:oximedia-codec", "dep:oxideav-prores", "dep:re_mp4", "dep:opus-pure", "dep:lewton", "dep:claxon"]
@@ -36,6 +36,10 @@ media-foundation = ["dep:windows"]
 # NVIDIA's GPU decoders on Linux (NVDEC): H.264, HEVC, VP8, VP9, AV1. Loaded at runtime from the
 # driver (nothing linked, no build requirements); nothing on other platforms.
 nvdec = ["dep:libloading"]
+# Apple's decoders on macOS (Apple Silicon): VideoToolbox for H.264 and HEVC (plus AV1, VP9 and
+# ProRes where the Mac has hardware for them), AudioToolbox for ALAC, AC-3, E-AC-3 and xHE-AAC.
+# Nothing on other platforms.
+videotoolbox = ["dep:objc2-core-foundation", "dep:objc2-core-media", "dep:objc2-core-video", "dep:objc2-video-toolbox", "dep:objc2-audio-toolbox", "dep:objc2-core-audio-types"]
 # Sound output through cpal. On Linux this needs ALSA development files (libasound2-dev).
 audio-output = ["dep:cpal"]
 
@@ -74,6 +78,14 @@ rav1d = { version = "1.1.0", optional = true, default-features = false, features
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libloading = { version = "0.9", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CFBase", "CFString", "CFDictionary", "CFNumber", "CFData"] }
+objc2-core-media = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CMBase", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMTime", "objc2-core-video"] }
+objc2-core-video = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
+objc2-video-toolbox = { version = "0.3.2", optional = true, default-features = false, features = ["std", "VTDecompressionSession", "VTErrors", "objc2-core-media", "objc2-core-video"] }
+objc2-audio-toolbox = { version = "0.3.2", optional = true, default-features = false, features = ["std", "AudioConverter", "objc2-core-audio-types", "objc2-core-foundation"] }
+objc2-core-audio-types = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CoreAudioBaseTypes"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", optional = true, features = [
