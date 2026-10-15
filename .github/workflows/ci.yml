@@ -45,10 +45,28 @@ jobs:
           key: aac-vectors-${{ hashFiles('scripts/fetch_aac_vectors.py') }}
       - run: python3 scripts/fetch_aac_vectors.py target/aac-vectors
       # --no-fail-fast: one failing test binary must not hide the others' results.
-      - run: cargo test --locked --no-fail-fast
+      # A watchdog stops hung test binaries after 30 minutes so the step ends on its own (GitHub
+      # discards the log of a step it times out); the output also goes up as an artifact.
+      - name: cargo test
+        shell: bash
         timeout-minutes: 40
         env:
           AAC_VECTORS_DIR: target/aac-vectors
+        run: |
+          cargo test --locked --no-fail-fast > test-output.log 2>&1 &
+          tests=$!
+          ( sleep 1800; echo "::error::tests still running after 30 minutes: stopping the test binaries"; pkill -f 'target/debug/deps/' ) &
+          watchdog=$!
+          status=0
+          wait $tests || status=$?
+          kill $watchdog 2>/dev/null || true
+          cat test-output.log
+          exit $status
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-output-${{ runner.os }}
+          path: test-output.log
       # vp9-mt through the engine: libvpx MD5s at 1/2/4/8/16 threads, optimized.
       - run: cargo test --test vp9_conformance --release --locked
         env:
