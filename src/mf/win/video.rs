@@ -8,7 +8,10 @@ use windows::core::{GUID, Interface};
 
 use crate::hw::select::HwCodec;
 use super::mft::{self, Output, err};
+use super::processor::Processor;
 use super::{codecs, device, runtime};
+use crate::color::{ColorInfo, StreamColor};
+use crate::scale::fit_within;
 use crate::decode::{ColorMatrix, DecodedFrame, PixelLayout, VideoDecoder, YuvFrame, chroma_size};
 use crate::demux::{Packet, StreamInfo};
 use crate::nal::{AnnexB, ParamSetFormat};
@@ -39,10 +42,53 @@ pub struct MfVideoDecoder {
     allow_gpu: bool,
     annexb: Option<AnnexB>,
     state: Option<State>,
-    ready: VecDeque<YuvFrame>,
+    ready: VecDeque<DecodedFrame>,
     scratch: Vec<u8>,
-    /// Keep P010's 10-bit samples (`YuvPlanes::U16`) instead of shifting them to 8 bits.
+    conversion: Conversion,
+}
+
+/// How output pictures are handed out: as YUV (10-bit when `ten_bit`), or converted to BGRA by
+/// the D3D11 video processor when decoding on the GPU and `gpu_bgra` is asked for.
+struct Conversion {
     ten_bit: bool,
+    gpu_bgra: bool,
+    hint: Option<(u32, u32)>,
+    processor: Option<Processor>,
+    /// The video processor failed: YUV for the CPU path from now on.
+    failed: bool,
+    stream: StreamColor,
+}
+
+impl Conversion {
+    fn frame(&mut self, sample: &IMFSample, out: &OutFormat, on_gpu: bool) -> Result<DecodedFrame> {
+        if self.gpu_bgra && on_gpu && !self.failed {
+            match self.convert(sample, out) {
+                Ok(frame) => return Ok(frame),
+                Err(e) => {
+                    log::warn!("Media Foundation: converting on the GPU failed ({e}); converting on the CPU from now on");
+                    self.failed = true;
+                    self.processor = None;
+                }
+            }
+        }
+        read_frame(sample, out, self.ten_bit).map(DecodedFrame::Yuv)
+    }
+
+    fn convert(&mut self, sample: &IMFSample, out: &OutFormat) -> Result<DecodedFrame> {
+        let gpu = device::gpu().ok_or(Error::Unsupported("D3D11 video device"))?;
+        let src = out.visible;
+        let dst = self.hint.and_then(|h| fit_within(src.0, src.1, h)).unwrap_or(src);
+        if !self.processor.as_ref().is_some_and(|p| p.fits(src, dst)) {
+            self.processor = Some(Processor::new(&gpu.device, src, dst)?);
+        }
+        let mut color = ColorInfo::sdr(out.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(src.1)), out.full_range);
+        color.apply_stream(&self.stream);
+        let mut bgra = Vec::new();
+        self.processor.as_mut().expect("created above").convert(sample, &color, &mut bgra)?;
+        // SAFETY: COM call on a live sample.
+        let pts = mft::from_mf_time(unsafe { sample.GetSampleTime() }.unwrap_or(0));
+        Ok(DecodedFrame::Bgra { width: dst.0, height: dst.1, bgra, transfer: color.transfer, pts })
+    }
 }
 
 // SAFETY: the transform is created lazily on the first packet, on the decode thread that owns
@@ -60,12 +106,21 @@ impl MfVideoDecoder {
             }
             _ => None,
         };
-        Ok(Self { codec, stream: stream.clone(), allow_gpu, annexb, state: None, ready: VecDeque::new(), scratch: Vec::new(), ten_bit: false })
+        let conversion =
+            Conversion { ten_bit: false, gpu_bgra: false, hint: None, processor: None, failed: false, stream: StreamColor::of(stream) };
+        Ok(Self { codec, stream: stream.clone(), allow_gpu, annexb, state: None, ready: VecDeque::new(), scratch: Vec::new(), conversion })
     }
 
     /// Keeps 10-bit samples of 10-bit streams (`YuvPlanes::U16`).
     pub fn with_ten_bit(mut self, ten_bit: bool) -> Self {
-        self.ten_bit = ten_bit;
+        self.conversion.ten_bit = ten_bit;
+        self
+    }
+
+    /// Converts GPU-decoded pictures to BGRA with the D3D11 video processor (scaled to the
+    /// output hint, tone mapped by the driver for HDR).
+    pub fn with_gpu_bgra(mut self, gpu_bgra: bool) -> Self {
+        self.conversion.gpu_bgra = gpu_bgra;
         self
     }
 
@@ -114,7 +169,7 @@ impl MfVideoDecoder {
             let state = self.state.as_mut().unwrap();
             match mft::process_output(&state.mft)? {
                 Output::Sample(s) => {
-                    let f = read_frame(&s, &state.out, self.ten_bit)?;
+                    let f = self.conversion.frame(&s, &state.out, state.gpu)?;
                     self.ready.push_back(f);
                 }
                 Output::NeedMoreInput => return Ok(()),
@@ -160,7 +215,7 @@ impl VideoDecoder for MfVideoDecoder {
             loop {
                 match mft::process_output(&state.mft)? {
                     Output::Sample(s) => {
-                        self.ready.push_back(read_frame(&s, &state.out, self.ten_bit)?);
+                        self.ready.push_back(self.conversion.frame(&s, &state.out, state.gpu)?);
                         break;
                     }
                     Output::NeedMoreInput => break,
@@ -168,7 +223,15 @@ impl VideoDecoder for MfVideoDecoder {
                 }
             }
         }
-        Ok(self.ready.pop_front().map(DecodedFrame::Yuv))
+        Ok(self.ready.pop_front())
+    }
+
+    fn set_output_hint(&mut self, max: Option<(u32, u32)>) {
+        self.conversion.hint = max;
+    }
+
+    fn gpu_fallback(&self) -> bool {
+        self.conversion.gpu_bgra && self.conversion.failed
     }
 
     fn send_eof(&mut self) {
