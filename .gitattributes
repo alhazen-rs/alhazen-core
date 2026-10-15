@@ -1,0 +1,3 @@
+# The CUDA kernel source is hashed into the committed PTX: keep its bytes identical on every
+# platform (Windows checkouts would otherwise turn LF into CRLF).
+src/nvdec/kernels/* text eol=lf
