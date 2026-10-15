@@ -1,5 +1,7 @@
 //! Colour description of decoded pictures: matrix, range, primaries, transfer, HDR metadata.
 
+pub mod tonemap;
+
 use crate::demux::StreamInfo;
 use crate::nal::VuiColor;
 
