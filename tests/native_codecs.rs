@@ -120,3 +120,14 @@ fn prores_4444_partial_macroblock_row_matches_ffmpeg() {
 fn prores_4444_interlaced_partial_macroblock_row_matches_ffmpeg() {
     check("prores_4444_h120_interlaced.mov", PixelLayout::I444, "yuv444p", 35.0);
 }
+
+#[test]
+fn hdr_frames_carry_their_colour_description() {
+    use alhazen_core::{Primaries, Transfer};
+    let f = native_first_frame("hdr_pq_av1.mkv");
+    assert_eq!((f.color.transfer, f.color.primaries), (Transfer::Pq, Primaries::Bt2020));
+    let hdr = f.color.hdr.expect("mastering metadata reaches the frame");
+    assert_eq!(hdr.max_cll, Some(1000));
+    let sdr = native_first_frame("vp9.mp4");
+    assert_eq!(sdr.color.transfer, Transfer::Sdr);
+}

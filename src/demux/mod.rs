@@ -192,6 +192,12 @@ pub struct StreamInfo {
     pub color_matrix: Option<u8>,
     /// Video only: whether samples use the full range (container-signalled), when present.
     pub full_range: Option<bool>,
+    /// Video only: colour primaries (H.273 ColourPrimaries: 1 BT.709, 9 BT.2020), when signalled.
+    pub primaries: Option<u8>,
+    /// Video only: transfer function (H.273 TransferCharacteristics: 16 PQ, 18 HLG), when signalled.
+    pub transfer: Option<u8>,
+    /// Video only: HDR10 mastering display and content light levels, when signalled.
+    pub hdr: Option<crate::color::HdrMetadata>,
 }
 
 impl StreamInfo {
@@ -213,6 +219,9 @@ impl StreamInfo {
             end_trim: None,
             color_matrix: None,
             full_range: None,
+            primaries: None,
+            transfer: None,
+            hdr: None,
         }
     }
 }

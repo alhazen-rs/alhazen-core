@@ -189,6 +189,7 @@ struct H264Sps {
     bit_depth_chroma_minus8: u32,
     /// Pictures that can precede a picture in decode order and follow it in display order.
     max_num_reorder_frames: u32,
+    color: Option<VuiColor>,
 }
 
 fn parse_h264_sps(sps: &[u8]) -> Option<H264Sps> {
@@ -260,7 +261,8 @@ fn parse_h264_sps(sps: &[u8]) -> Option<H264Sps> {
     // Without the VUI's bitstream restriction: none for Baseline (no B-frames), else at most the
     // reference frames.
     let fallback = if profile == 66 { 0 } else { max_num_ref_frames.min(16) };
-    let max_num_reorder_frames = if b.u(1) == Some(1) { h264_vui_reorder(&mut b).unwrap_or(fallback) } else { fallback };
+    let (color, reorder) = if b.u(1) == Some(1) { h264_vui(&mut b) } else { (None, None) };
+    let max_num_reorder_frames = reorder.unwrap_or(fallback);
     Some(H264Sps {
         width,
         height,
@@ -268,23 +270,42 @@ fn parse_h264_sps(sps: &[u8]) -> Option<H264Sps> {
         bit_depth_luma_minus8: depth_luma,
         bit_depth_chroma_minus8: depth_chroma,
         max_num_reorder_frames,
+        color,
     })
 }
 
-/// `max_num_reorder_frames` from an H.264 VUI (`None` without its bitstream restriction).
-fn h264_vui_reorder(b: &mut Bits) -> Option<u32> {
+/// The colour description and `max_num_reorder_frames` (`None` without its bitstream
+/// restriction) from an H.264 VUI.
+fn h264_vui(b: &mut Bits) -> (Option<VuiColor>, Option<u32>) {
+    match vui_signal(b) {
+        Some(color) => (color, h264_vui_reorder(b)),
+        None => (None, None),
+    }
+}
+
+/// The start of an H.264 or HEVC VUI, up to and including the video signal type: the colour
+/// description, if present. `None` if the data runs out.
+fn vui_signal(b: &mut Bits) -> Option<Option<VuiColor>> {
     if b.u(1)? == 1 && b.u(8)? == 255 {
         b.skip(32)?; // aspect_ratio_idc Extended_SAR: sar_width, sar_height
     }
     if b.u(1)? == 1 {
         b.skip(1)?; // overscan_appropriate_flag
     }
-    if b.u(1)? == 1 {
-        b.skip(4)?; // video_format, video_full_range_flag
-        if b.u(1)? == 1 {
-            b.skip(24)?; // colour_primaries, transfer_characteristics, matrix_coefficients
-        }
+    if b.u(1)? == 0 {
+        return Some(None); // no video_signal_type
     }
+    b.skip(3)?; // video_format
+    let full_range = b.u(1)? == 1;
+    if b.u(1)? == 0 {
+        return Some(None); // no colour_description
+    }
+    let (primaries, transfer, matrix) = (b.u(8)? as u8, b.u(8)? as u8, b.u(8)? as u8);
+    Some(Some(VuiColor { primaries, transfer, matrix, full_range }))
+}
+
+/// `max_num_reorder_frames` from the rest of an H.264 VUI, after the video signal type.
+fn h264_vui_reorder(b: &mut Bits) -> Option<u32> {
     if b.u(1)? == 1 {
         b.ue()?; // chroma_sample_loc_type_top_field
         b.ue()?; // chroma_sample_loc_type_bottom_field
@@ -340,6 +361,34 @@ pub fn reorder_depth(codec: &crate::demux::Codec, config: &[u8]) -> Option<u32> 
     }
 }
 
+/// The colour description in a sequence parameter set's VUI (ITU-T H.273 codes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VuiColor {
+    pub primaries: u8,
+    pub transfer: u8,
+    pub matrix: u8,
+    pub full_range: bool,
+}
+
+/// The colour description from the H.264 or HEVC SPS in a setup record (avcC/hvcC), when the
+/// VUI has one.
+pub fn vui_color(codec: &crate::demux::Codec, config: &[u8]) -> Option<VuiColor> {
+    use crate::demux::Codec;
+    match codec {
+        Codec::H264 => {
+            let (_, sets) = parse_avcc(config)?;
+            let sps = sets.iter().find(|n| n.first().is_some_and(|b| b & 0x1F == 7))?;
+            parse_h264_sps(sps)?.color
+        }
+        Codec::Hevc => {
+            let (_, sets) = parse_hvcc(config)?;
+            let sps = sets.iter().find(|n| n.first().is_some_and(|b| (b >> 1) & 0x3F == 33))?;
+            parse_hevc_sps(sps)?.color
+        }
+        _ => None,
+    }
+}
+
 /// Displayed picture size from an H.264 SPS NAL unit (with its header byte).
 pub fn h264_sps_size(sps: &[u8]) -> Option<(u32, u32)> {
     parse_h264_sps(sps).map(|s| (s.width, s.height))
@@ -380,6 +429,7 @@ struct HevcSps {
     bit_depth_chroma_minus8: u32,
     /// `sps_max_num_reorder_pics` of the highest sub-layer.
     max_num_reorder_pics: u32,
+    color: Option<VuiColor>,
 }
 
 fn parse_hevc_sps(sps: &[u8]) -> Option<HevcSps> {
@@ -421,8 +471,8 @@ fn parse_hevc_sps(sps: &[u8]) -> Option<HevcSps> {
     }
     let bit_depth_luma_minus8 = b.ue()?;
     let bit_depth_chroma_minus8 = b.ue()?;
-    let max_num_reorder_pics = (|| {
-        b.ue()?; // log2_max_pic_order_cnt_lsb_minus4
+    let ordering = (|| {
+        let log2_max_poc_lsb = b.ue()? + 4;
         let all_layers = b.u(1)? == 1;
         let mut reorder = 0;
         for _ in if all_layers { 0 } else { max_sub_layers_minus1 }..=max_sub_layers_minus1 {
@@ -430,9 +480,10 @@ fn parse_hevc_sps(sps: &[u8]) -> Option<HevcSps> {
             reorder = b.ue()?;
             b.ue()?; // sps_max_latency_increase_plus1
         }
-        Some(reorder)
-    })()
-    .unwrap_or(16);
+        Some((reorder, log2_max_poc_lsb))
+    })();
+    let max_num_reorder_pics = ordering.map_or(16, |(r, _)| r);
+    let color = ordering.and_then(|(_, log2_max_poc_lsb)| hevc_vui_color(&mut b, log2_max_poc_lsb));
     Some(HevcSps {
         width,
         height,
@@ -443,7 +494,80 @@ fn parse_hevc_sps(sps: &[u8]) -> Option<HevcSps> {
         bit_depth_luma_minus8,
         bit_depth_chroma_minus8,
         max_num_reorder_pics,
+        color,
     })
+}
+
+/// The rest of an HEVC SPS after the sub-layer ordering info, up to the VUI's colour description.
+fn hevc_vui_color(b: &mut Bits, log2_max_poc_lsb: u32) -> Option<VuiColor> {
+    for _ in 0..6 {
+        b.ue()?; // coding/transform block sizes, transform hierarchy depths
+    }
+    if b.u(1)? == 1 && b.u(1)? == 1 {
+        // scaling_list_enabled_flag, sps_scaling_list_data_present_flag: scaling_list_data()
+        for size_id in 0..4u32 {
+            for _ in (0..6).step_by(if size_id == 3 { 3 } else { 1 }) {
+                if b.u(1)? == 0 {
+                    b.ue()?; // scaling_list_pred_matrix_id_delta
+                } else {
+                    if size_id > 1 {
+                        b.se()?; // scaling_list_dc_coef_minus8
+                    }
+                    for _ in 0..64.min(1 << (4 + (size_id << 1))) {
+                        b.se()?;
+                    }
+                }
+            }
+        }
+    }
+    b.skip(2)?; // amp_enabled_flag, sample_adaptive_offset_enabled_flag
+    if b.u(1)? == 1 {
+        // pcm_enabled_flag
+        b.skip(8)?;
+        b.ue()?;
+        b.ue()?;
+        b.skip(1)?;
+    }
+    let sets = b.ue()?;
+    if sets > 64 {
+        return None;
+    }
+    let mut delta_pocs: Vec<u32> = Vec::with_capacity(sets as usize);
+    for i in 0..sets as usize {
+        // st_ref_pic_set(i); in an SPS, prediction is always from the set before.
+        if i != 0 && b.u(1)? == 1 {
+            b.skip(1)?; // delta_rps_sign
+            b.ue()?; // abs_delta_rps_minus1
+            let mut count = 0;
+            for _ in 0..=delta_pocs[i - 1] {
+                if b.u(1)? == 1 || b.u(1)? == 1 {
+                    count += 1; // used_by_curr_pic_flag, else use_delta_flag
+                }
+            }
+            delta_pocs.push(count);
+        } else {
+            let (negative, positive) = (b.ue()?, b.ue()?);
+            if negative > 16 || positive > 16 {
+                return None;
+            }
+            for _ in 0..negative + positive {
+                b.ue()?;
+                b.skip(1)?;
+            }
+            delta_pocs.push(negative + positive);
+        }
+    }
+    if b.u(1)? == 1 {
+        // long_term_ref_pics_present_flag
+        for _ in 0..b.ue()? {
+            b.skip(log2_max_poc_lsb as usize + 1)?;
+        }
+    }
+    b.skip(2)?; // sps_temporal_mvp_enabled_flag, strong_intra_smoothing_enabled_flag
+    if b.u(1)? == 0 {
+        return None; // no VUI
+    }
+    vui_signal(b)?
 }
 
 /// Displayed picture size from an HEVC SPS NAL unit (with its 2-byte header).
@@ -594,5 +718,27 @@ mod tests {
         conv.convert(&[], true, &mut out).unwrap();
         assert_eq!(out, annex_b(HEVC));
         assert_eq!(hevc_sps_size(HEVC[1]), Some((352, 288)));
+    }
+}
+
+#[cfg(test)]
+mod vui_tests {
+    use super::*;
+    use crate::demux::{Codec, Demuxer};
+
+    #[test]
+    fn hevc_vui_colour_description() {
+        let src = Box::new(crate::source::FileSource::open("tests/fixtures/hdr_pq_nometa.mkv").unwrap());
+        let d = crate::demux::MatroskaDemuxer::open(src).unwrap();
+        let c = vui_color(&Codec::Hevc, d.streams()[0].extradata.as_deref().unwrap()).expect("VUI colour");
+        assert_eq!((c.primaries, c.transfer, c.matrix, c.full_range), (9, 16, 9, false));
+    }
+
+    #[test]
+    fn sps_without_colour_description_gives_none() {
+        let src = Box::new(crate::source::FileSource::open("tests/fixtures/hevc.mkv").unwrap());
+        let d = crate::demux::MatroskaDemuxer::open(src).unwrap();
+        let v = d.streams().iter().find(|s| s.codec == Codec::Hevc).unwrap();
+        assert_eq!(vui_color(&Codec::Hevc, v.extradata.as_deref().unwrap()), None);
     }
 }

@@ -26,6 +26,16 @@ pub mod id {
     pub const COLOUR: u32 = 0x55B0;
     pub const MATRIX_COEFFICIENTS: u32 = 0x55B1;
     pub const RANGE: u32 = 0x55B9;
+    pub const TRANSFER_CHARACTERISTICS: u32 = 0x55BA;
+    pub const PRIMARIES: u32 = 0x55BB;
+    pub const MAX_CLL: u32 = 0x55BC;
+    pub const MAX_FALL: u32 = 0x55BD;
+    pub const MASTERING_METADATA: u32 = 0x55D0;
+    /// PrimaryRChromaticityX … WhitePointChromaticityY: 0x55D1–0x55D8 (R x, R y, G x, G y, B x, B y, W x, W y).
+    pub const PRIMARY_R_X: u32 = 0x55D1;
+    pub const WHITE_POINT_Y: u32 = 0x55D8;
+    pub const LUMINANCE_MAX: u32 = 0x55D9;
+    pub const LUMINANCE_MIN: u32 = 0x55DA;
     pub const AUDIO: u32 = 0xE1;
     pub const SAMPLING_FREQUENCY: u32 = 0xB5;
     pub const CHANNELS: u32 = 0x9F;

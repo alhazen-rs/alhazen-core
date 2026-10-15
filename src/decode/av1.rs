@@ -154,6 +154,31 @@ unsafe fn copy_picture(pic: &Dav1dPicture) -> YuvFrame {
         _ => ColorMatrix::guess_for_height(h),
     };
     let full_range = seq.is_some_and(|s| s.color_range != 0);
+    let mut color = crate::color::ColorInfo::sdr(matrix, full_range);
+    // AV1 uses the H.273 code points for primaries and transfer.
+    if let Some(p) = seq.and_then(|s| u8::try_from(s.pri).ok()).and_then(crate::color::Primaries::from_h273) {
+        color.primaries = p;
+    }
+    if let Some(t) = seq.and_then(|s| u8::try_from(s.trc).ok()).and_then(crate::color::Transfer::from_h273) {
+        color.transfer = t;
+    }
+    // SAFETY: when set, these point at the picture's metadata, alive as long as the picture.
+    let (light, mastering) = unsafe { (pic.content_light.map(|p| p.as_ref()), pic.mastering_display.map(|p| p.as_ref())) };
+    if light.is_some() || mastering.is_some() {
+        let mut hdr = crate::color::HdrMetadata::default();
+        if let Some(l) = light {
+            (hdr.max_cll, hdr.max_fall) = (Some(l.max_content_light_level), Some(l.max_frame_average_light_level));
+        }
+        if let Some(m) = mastering {
+            // Chromaticities in 0.16 fixed point (R, G, B); luminance 24.8 (max) and 18.14 (min).
+            let xy = |v: [u16; 2]| (v[0] as f32 / 65536.0, v[1] as f32 / 65536.0);
+            hdr.display_primaries = Some([xy(m.primaries[0]), xy(m.primaries[1]), xy(m.primaries[2])]);
+            hdr.white_point = Some(xy(m.white_point));
+            hdr.max_luminance = Some(m.max_luminance as f32 / 256.0);
+            hdr.min_luminance = Some(m.min_luminance as f32 / 16384.0);
+        }
+        color.hdr = Some(hdr);
+    }
     let (cw, ch) = chroma_size(layout, w, h);
     let dims = [(w, h), (cw, ch), (cw, ch)];
     let mut planes: [Vec<u8>; 3] = Default::default();
@@ -185,7 +210,7 @@ unsafe fn copy_picture(pic: &Dav1dPicture) -> YuvFrame {
         planes: crate::decode::YuvPlanes::U8(planes),
         strides: [w as usize, cw as usize, cw as usize],
         bit_depth: 8,
-        color: crate::color::ColorInfo::sdr(matrix, full_range),
+        color,
         pts: Duration::from_nanos(pic.m.timestamp.max(0) as u64),
     }
 }

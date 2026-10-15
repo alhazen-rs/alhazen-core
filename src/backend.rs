@@ -184,11 +184,42 @@ impl Registry {
         for b in candidates.filter(|b| b.supports_video(stream)) {
             tried.push(b.name());
             match b.open_video_decoder(stream, threads, prefs) {
-                Ok(d) => return Ok((b.name(), d)),
+                Ok(d) => {
+                    let color = crate::color::StreamColor::of(stream);
+                    return Ok((b.name(), Box::new(StreamColored { inner: d, color })));
+                }
                 Err(e) => log::warn!("backend {} failed to open {} decoder: {e}", b.name(), stream.codec),
             }
         }
         Err(Error::UnsupportedCodec { codec: stream.codec.to_string(), tried_backends: tried })
+    }
+}
+
+/// Puts what the stream signals about colour (container tags, SPS VUI) on every picture.
+struct StreamColored {
+    inner: Box<dyn VideoDecoder>,
+    color: crate::color::StreamColor,
+}
+
+impl VideoDecoder for StreamColored {
+    fn send_packet(&mut self, packet: &crate::demux::Packet) -> Result<()> {
+        self.inner.send_packet(packet)
+    }
+    fn receive_frame(&mut self) -> Result<Option<crate::decode::DecodedFrame>> {
+        let mut frame = self.inner.receive_frame()?;
+        if let Some(crate::decode::DecodedFrame::Yuv(f)) = &mut frame {
+            f.color.apply_stream(&self.color);
+        }
+        Ok(frame)
+    }
+    fn flush(&mut self) {
+        self.inner.flush();
+    }
+    fn send_eof(&mut self) {
+        self.inner.send_eof();
+    }
+    fn set_output_hint(&mut self, max: Option<(u32, u32)>) {
+        self.inner.set_output_hint(max);
     }
 }
 

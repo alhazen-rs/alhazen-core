@@ -31,9 +31,10 @@ pub(crate) fn planes_first(formats: &[FrameFormat]) -> bool {
         .is_some_and(|f| matches!(f, FrameFormat::Yuv | FrameFormat::Yuv10))
 }
 
-/// Whether the stream is PQ/HLG.
-fn hdr_source(_stream: &StreamInfo) -> bool {
-    false
+/// Whether the stream is PQ/HLG, by its container tags or its SPS VUI.
+fn hdr_source(stream: &StreamInfo) -> bool {
+    let vui = stream.extradata.as_deref().and_then(|c| crate::nal::vui_color(&stream.codec, c));
+    crate::color::ColorInfo::resolve(stream, vui, stream.height).transfer.is_hdr()
 }
 
 #[cfg(test)]
@@ -65,5 +66,12 @@ mod tests {
         let p = OutputPrefs::for_stream(&[FrameFormat::Native, FrameFormat::Bgra], &video());
         assert_eq!(p.native, cfg!(target_os = "macos"));
         assert!(p.gpu_bgra);
+    }
+
+    #[test]
+    fn hdr_source_forces_ten_bit() {
+        let mut s = video();
+        s.transfer = Some(16);
+        assert!(OutputPrefs::for_stream(&[FrameFormat::Bgra], &s).ten_bit);
     }
 }
