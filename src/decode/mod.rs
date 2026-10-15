@@ -129,14 +129,23 @@ pub fn chroma_size(layout: PixelLayout, width: u32, height: u32) -> (u32, u32) {
 #[derive(Clone, Debug)]
 pub enum DecodedFrame {
     Yuv(YuvFrame),
-    // Phase 4: Platform(PlatformSurface), e.g. a CVPixelBuffer from VideoToolbox.
+    /// Already converted on the GPU: tightly packed SDR BGRA (tone mapped when the source is HDR),
+    /// at the size asked for with `set_output_hint`. `transfer` is the source's.
+    Bgra { width: u32, height: u32, bgra: Vec<u8>, transfer: crate::color::Transfer, pts: Duration },
 }
 
 impl DecodedFrame {
     pub fn pts(&self) -> Duration {
         match self {
             DecodedFrame::Yuv(f) => f.pts,
+            DecodedFrame::Bgra { pts, .. } => *pts,
         }
+    }
+}
+
+impl From<YuvFrame> for DecodedFrame {
+    fn from(f: YuvFrame) -> DecodedFrame {
+        DecodedFrame::Yuv(f)
     }
 }
 
@@ -153,4 +162,9 @@ pub trait VideoDecoder: Send {
     /// that can scale cheaply (NVDEC's hardware scaler) produce frames no larger. Frames may
     /// still come out larger; the pipeline scales those down. Called before every packet.
     fn set_output_hint(&mut self, _max: Option<(u32, u32)>) {}
+    /// Converting on the GPU was asked for (`OutputPrefs::gpu_bgra`) and has failed: the decoder
+    /// now hands out YUV for the CPU path.
+    fn gpu_fallback(&self) -> bool {
+        false
+    }
 }

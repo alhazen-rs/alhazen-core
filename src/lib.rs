@@ -19,7 +19,7 @@ pub mod mf;
 pub mod nal;
 pub mod nvdec;
 pub mod output;
-mod scale;
+pub mod scale;
 pub mod source;
 
 pub use demux::{Metadata, Picture};

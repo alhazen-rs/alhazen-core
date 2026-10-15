@@ -221,6 +221,9 @@ impl VideoDecoder for StreamColored {
     fn set_output_hint(&mut self, max: Option<(u32, u32)>) {
         self.inner.set_output_hint(max);
     }
+    fn gpu_fallback(&self) -> bool {
+        self.inner.gpu_fallback()
+    }
 }
 
 /// Pure-Rust backend: Matroska/WebM + MP4/MOV demuxing; AV1 (rav1d), VP9 (vp9-mt),

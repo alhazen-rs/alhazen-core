@@ -34,7 +34,7 @@ fn flash(name: &str) -> Duration {
     let mut dec = Registry::empty_with_native().open_video_decoder(&v, 2, Default::default(), None).unwrap();
     let mut bright = None;
     let mut take = |f: DecodedFrame| {
-        let DecodedFrame::Yuv(f) = f;
+        let DecodedFrame::Yuv(f) = f else { panic!("expected YUV") };
         let mean = f.u8_planes().unwrap()[0].iter().map(|&y| y as u64).sum::<u64>() / f.u8_planes().unwrap()[0].len() as u64;
         if mean > 128 && bright.is_none_or(|b| f.pts < b) {
             bright = Some(f.pts);

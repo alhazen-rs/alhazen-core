@@ -127,7 +127,10 @@ fn ffmpeg_first_frame(b: &FfmpegCliBackend, name: &str) -> Option<alhazen_core::
         }
     }
     dec.send_eof();
-    dec.receive_frame().unwrap().map(|DecodedFrame::Yuv(f)| f)
+    dec.receive_frame().unwrap().map(|d| match d {
+        DecodedFrame::Yuv(f) => f,
+        other => panic!("expected YUV, got {other:?}"),
+    })
 }
 
 /// Colour matrix and range come from the stream (via ffmpeg's output), not a guess by height.

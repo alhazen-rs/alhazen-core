@@ -17,7 +17,7 @@ use super::{Command, PlayerEvent, Shared};
 use crate::audio::OutputShared;
 use crate::convert::{frame_to_bgra, to_8bit};
 use crate::frame::FrameFormat;
-use crate::decode::{AudioDecoder, DecodedFrame, VideoDecoder, YuvFrame};
+use crate::decode::{AudioDecoder, DecodedFrame, VideoDecoder};
 use crate::demux::{Demuxer, Packet, StreamInfo};
 use crate::frame::VideoFrame;
 use crate::{Error, Result};
@@ -294,7 +294,7 @@ struct DecodeLoop {
     generation: u64,
     /// Accurate-seek target: frames up to here are held back, only the last one is shown.
     target: Option<Duration>,
-    held: Option<YuvFrame>,
+    held: Option<DecodedFrame>,
     errors: u32,
     waiting_for_keyframe: bool,
     /// Set until the one allowed switch to another backend has happened.
@@ -413,7 +413,7 @@ impl DecodeLoop {
             let received = self.decoder.receive_frame();
             self.busy += start.elapsed();
             match received {
-                Ok(Some(DecodedFrame::Yuv(f))) => {
+                Ok(Some(f)) => {
                     self.errors = 0;
                     self.decoded_any = true;
                     if !self.on_frame(shared, f) {
@@ -426,9 +426,9 @@ impl DecodeLoop {
         }
     }
 
-    fn on_frame(&mut self, shared: &Shared, f: YuvFrame) -> bool {
+    fn on_frame(&mut self, shared: &Shared, f: DecodedFrame) -> bool {
         if let Some(target) = self.target {
-            if f.pts <= target {
+            if f.pts() <= target {
                 self.held = Some(f);
                 return true;
             }
@@ -556,23 +556,32 @@ impl DecodeLoop {
     }
 
     /// Converts and queues a frame. Returns `false` only on shutdown.
-    fn present(&mut self, shared: &Shared, f: YuvFrame) -> bool {
+    fn present(&mut self, shared: &Shared, f: impl Into<DecodedFrame>) -> bool {
+        let f = f.into();
         // Catch-up: while behind the clock, don't spend time converting frames that are already
         // late, so the decoder can get ahead again; still show one every MIN_SHOW_INTERVAL.
         let first = shared.ready_generation.load(Ordering::SeqCst) != self.generation;
         if !first
-            && shared.clock.now().saturating_sub(f.pts) > SKIP_LATE
-            && self.last_shown.is_some_and(|p| f.pts.saturating_sub(p) < MIN_SHOW_INTERVAL)
+            && shared.clock.now().saturating_sub(f.pts()) > SKIP_LATE
+            && self.last_shown.is_some_and(|p| f.pts().saturating_sub(p) < MIN_SHOW_INTERVAL)
             && shared.state() == PlayerState::Playing
         {
             let cost = std::mem::take(&mut self.busy);
-            self.check_speed(shared, cost, f.pts);
+            self.check_speed(shared, cost, f.pts());
             shared.queue.note_skipped();
             return true;
         }
         let start = Instant::now();
         let scaler = &mut self.scaler;
         let max = shared.max_output_size();
+        let f = match f {
+            DecodedFrame::Bgra { width, height, bgra, transfer, pts } => {
+                *shared.hdr.lock().unwrap() = transfer;
+                shared.set_conversion("gpu");
+                return self.queue(shared, VideoFrame::Bgra { width, height, bgra: bgra.into(), pts }, start);
+            }
+            DecodedFrame::Yuv(f) => f,
+        };
         *shared.hdr.lock().unwrap() = f.color.transfer;
         let frame = if crate::output::planes_first(&shared.frame_formats) {
             // 10-bit samples only for apps that asked for them.
@@ -592,7 +601,12 @@ impl DecodeLoop {
             };
             VideoFrame::Bgra { width, height, bgra: bgra.into(), pts: f.pts }
         };
-        shared.set_conversion("cpu");
+        shared.set_conversion(if self.decoder.gpu_fallback() { "cpu (fallback)" } else { "cpu" });
+        self.queue(shared, frame, start)
+    }
+
+    /// Queues a ready frame (and starts the clock on the first one). `false` only on shutdown.
+    fn queue(&mut self, shared: &Shared, frame: VideoFrame, start: Instant) -> bool {
         let cost = std::mem::take(&mut self.busy) + start.elapsed();
         self.check_speed(shared, cost, frame.pts());
         let first = shared.ready_generation.load(Ordering::SeqCst) != self.generation;
@@ -628,7 +642,7 @@ mod tests {
     use super::*;
     use crate::player::PlayerState;
     use crate::clock::{Clock, MockClock};
-    use crate::decode::{ColorMatrix, PixelLayout, VideoDecoder};
+    use crate::decode::{ColorMatrix, PixelLayout, VideoDecoder, YuvFrame};
     use crate::frame::FrameQueue;
 
     struct NoDecoder;
