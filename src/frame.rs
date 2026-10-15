@@ -41,10 +41,26 @@ impl VideoFrame {
 /// A 4K BGRA picture is 33 MB: allocating one per frame costs thousands of page faults each
 /// time, while refilling memory already mapped is a plain copy.
 #[derive(Default)]
+#[cfg_attr(
+    not(any(
+        all(target_os = "linux", feature = "nvdec"),
+        all(windows, feature = "media-foundation"),
+        all(target_os = "macos", feature = "videotoolbox")
+    )),
+    allow(dead_code)
+)]
 pub(crate) struct FramePool {
     buffers: VecDeque<Arc<[u8]>>,
 }
 
+#[cfg_attr(
+    not(any(
+        all(target_os = "linux", feature = "nvdec"),
+        all(windows, feature = "media-foundation"),
+        all(target_os = "macos", feature = "videotoolbox")
+    )),
+    allow(dead_code)
+)]
 impl FramePool {
     /// Buffers kept for reuse (the frame queue and the renderer hold a few at a time).
     const KEEP: usize = 8;

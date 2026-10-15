@@ -25,7 +25,7 @@ fn cpu_time() -> Duration {
     tv(ru.ru_utime) + tv(ru.ru_stime)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "media-foundation"))]
 fn cpu_time() -> Duration {
     use windows::Win32::Foundation::FILETIME;
     use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
@@ -34,6 +34,12 @@ fn cpu_time() -> Duration {
     let _ = unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) };
     let ticks = |t: FILETIME| ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64;
     Duration::from_nanos((ticks(k) + ticks(u)) * 100)
+}
+
+/// Without a way to read it here, CPU time reads as zero.
+#[cfg(not(any(unix, all(windows, feature = "media-foundation"))))]
+fn cpu_time() -> Duration {
+    Duration::ZERO
 }
 
 fn main() {
