@@ -502,3 +502,11 @@ fn hdr_bgra_is_tone_mapped_whichever_path_was_chosen() {
     eprintln!("HDR through {conversion}: {db:.1} dB against the CPU tone mapper");
     assert!(db >= 30.0, "{db:.1} dB");
 }
+
+#[test]
+fn the_matrix_comes_from_the_bitstream_when_the_container_has_none() {
+    // hdr_pq_nometa.mkv: BT.2020 only in the HEVC VUI, no container colour tags.
+    let (_, frames) = decode_with("hdr_pq_nometa.mkv", |_| None);
+    let f = frames.first().expect("a frame");
+    assert_eq!(f.color.matrix, alhazen_core::decode::ColorMatrix::Bt2020);
+}
