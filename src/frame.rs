@@ -13,6 +13,9 @@ pub enum VideoFrame {
     Bgra { width: u32, height: u32, bgra: Arc<[u8]>, pts: Duration },
     /// Planar YUV: 8-bit, or 10-bit when `FrameFormat::Yuv10` was asked for.
     Yuv(Arc<YuvFrame>),
+    /// macOS: VideoToolbox's pixel buffer, for drawing without a copy (`FrameFormat::Native`).
+    #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+    Native(crate::apple::NativeFrame),
 }
 
 impl VideoFrame {
@@ -20,12 +23,16 @@ impl VideoFrame {
         match self {
             VideoFrame::Bgra { pts, .. } => *pts,
             VideoFrame::Yuv(f) => f.pts,
+            #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+            VideoFrame::Native(f) => f.pts,
         }
     }
     pub fn size(&self) -> (u32, u32) {
         match self {
             VideoFrame::Bgra { width, height, .. } => (*width, *height),
             VideoFrame::Yuv(f) => (f.width, f.height),
+            #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+            VideoFrame::Native(f) => (f.width, f.height),
         }
     }
 }

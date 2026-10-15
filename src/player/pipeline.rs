@@ -580,6 +580,17 @@ impl DecodeLoop {
                 shared.set_conversion("gpu");
                 return self.queue(shared, VideoFrame::Bgra { width, height, bgra: bgra.into(), pts }, start);
             }
+            #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+            DecodedFrame::Native(n) if shared.frame_formats.contains(&FrameFormat::Native) => {
+                *shared.hdr.lock().unwrap() = n.color.transfer;
+                shared.set_conversion("zero-copy");
+                return self.queue(shared, VideoFrame::Native(n), start);
+            }
+            #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+            DecodedFrame::Native(n) => match n.to_yuv() {
+                Ok(f) => f,
+                Err(e) => return self.on_decode_error(shared, e),
+            },
             DecodedFrame::Yuv(f) => f,
         };
         *shared.hdr.lock().unwrap() = f.color.transfer;

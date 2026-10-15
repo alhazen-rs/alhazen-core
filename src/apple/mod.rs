@@ -14,4 +14,4 @@ pub(crate) mod reorder;
 #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
 mod mac;
 #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
-pub use mac::{AppleBackend, AtAudioDecoder, VtVideoDecoder};
+pub use mac::{AppleBackend, AtAudioDecoder, NativeFrame, VtVideoDecoder};

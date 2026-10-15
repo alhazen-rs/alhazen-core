@@ -416,3 +416,89 @@ fn ten_bit_hevc_keeps_its_samples() {
     let reference: Vec<u16> = out.stdout.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
     assert!(p.iter().flatten().copied().eq(reference), "10-bit samples differ from ffmpeg's");
 }
+
+// Frame formats: zero-copy `Native` frames for SDR, tone-mapped BGRA for HDR.
+
+fn open_with_formats(name: &str, formats: Vec<alhazen_core::FrameFormat>) -> Player {
+    let config = PlayerConfig {
+        clock: Some(std::sync::Arc::new(alhazen_core::clock::MockClock::new())),
+        audio_output: AudioOutputConfig::Disabled,
+        decoder_threads: 2,
+        frame_formats: formats,
+        ..Default::default()
+    };
+    Player::open(Source::parse(&fixture(name)).unwrap(), config).unwrap()
+}
+
+fn wait_first_frame(player: &Player) -> alhazen_core::VideoFrame {
+    let start = Instant::now();
+    loop {
+        if let Some(f) = player.current_frame() {
+            return f;
+        }
+        assert!(!matches!(player.state(), PlayerState::Error(_)), "{:?}", player.state());
+        assert!(start.elapsed() < Duration::from_secs(10), "no frame");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn sdr_frames_arrive_native_and_match_ffmpeg() {
+    use alhazen_core::{FrameFormat, VideoFrame};
+    let player = open_with_formats("h264_aac.mp4", vec![FrameFormat::Native, FrameFormat::Bgra]);
+    let f = wait_first_frame(&player);
+    let VideoFrame::Native(n) = &f else { panic!("expected a Native frame, got {f:?}") };
+    assert_eq!(player.stats().conversion, "zero-copy");
+    assert_eq!((n.width, n.height), (320, 240));
+    let yuv = n.to_yuv().expect("a readable pixel buffer");
+    let Some(reference) = ffmpeg_frame("h264_aac.mp4", 0, (yuv.width, yuv.height), yuv.layout) else {
+        return eprintln!("no ffmpeg: picture comparison skipped");
+    };
+    let db = psnr(&yuv.u8_planes().unwrap().concat(), &reference);
+    assert!(db >= 40.0, "{db:.1} dB");
+}
+
+#[test]
+fn hdr_never_arrives_native() {
+    use alhazen_core::{FrameFormat, VideoFrame};
+    let player = open_with_formats("hdr_pq.mkv", vec![FrameFormat::Native, FrameFormat::Bgra]);
+    let f = wait_first_frame(&player);
+    assert!(matches!(f, VideoFrame::Bgra { .. }), "{f:?}");
+    assert_eq!(player.stats().hdr, alhazen_core::Transfer::Pq);
+}
+
+/// Our CPU tone mapping of `name`'s first frame (VideoToolbox decode, 10-bit), as BGRA.
+fn cpu_tone_mapped_first_frame(name: &str) -> Vec<u8> {
+    let mut d = demuxer(name);
+    let s = video(d.as_ref());
+    let mut dec = VtVideoDecoder::new(&s, alhazen_core::OutputPrefs { ten_bit: true, ..Default::default() }).unwrap();
+    let mut frame = None;
+    while frame.is_none() {
+        let Some(p) = d.next_packet().unwrap() else {
+            dec.send_eof();
+            frame = dec.receive_frame().unwrap();
+            break;
+        };
+        if p.stream == s.id {
+            dec.send_packet(&p).unwrap();
+            frame = dec.receive_frame().unwrap();
+        }
+    }
+    let Some(DecodedFrame::Yuv(mut y)) = frame else { panic!("{name}: no frame") };
+    y.color.apply_stream(&alhazen_core::color::StreamColor::of(&s));
+    let mut out = Vec::new();
+    alhazen_core::convert::frame_to_bgra(&y, &mut out).unwrap();
+    out
+}
+
+#[test]
+fn hdr_bgra_is_tone_mapped_whichever_path_was_chosen() {
+    use alhazen_core::{FrameFormat, VideoFrame};
+    let player = open_with_formats("hdr_pq.mkv", vec![FrameFormat::Native, FrameFormat::Bgra]);
+    let VideoFrame::Bgra { bgra, .. } = wait_first_frame(&player) else { panic!("expected BGRA") };
+    let conversion = player.stats().conversion;
+    assert!(conversion == "gpu" || conversion == "cpu (fallback)", "{conversion}");
+    let db = psnr(&bgra, &cpu_tone_mapped_first_frame("hdr_pq.mkv"));
+    eprintln!("HDR through {conversion}: {db:.1} dB against the CPU tone mapper");
+    assert!(db >= 30.0, "{db:.1} dB");
+}

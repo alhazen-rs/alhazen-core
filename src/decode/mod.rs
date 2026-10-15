@@ -132,6 +132,9 @@ pub enum DecodedFrame {
     /// Already converted on the GPU: tightly packed SDR BGRA (tone mapped when the source is HDR),
     /// at the size asked for with `set_output_hint`. `transfer` is the source's.
     Bgra { width: u32, height: u32, bgra: Vec<u8>, transfer: crate::color::Transfer, pts: Duration },
+    /// macOS: VideoToolbox's own pixel buffer, kept for zero-copy drawing (SDR only).
+    #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+    Native(crate::apple::NativeFrame),
 }
 
 impl DecodedFrame {
@@ -139,6 +142,8 @@ impl DecodedFrame {
         match self {
             DecodedFrame::Yuv(f) => f.pts,
             DecodedFrame::Bgra { pts, .. } => *pts,
+            #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+            DecodedFrame::Native(f) => f.pts,
         }
     }
 }

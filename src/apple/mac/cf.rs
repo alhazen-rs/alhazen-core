@@ -2,7 +2,7 @@
 
 use std::ptr::NonNull;
 
-use objc2_core_foundation::{CFData, CFDictionary, CFNumber, CFRetained, CFString, CFType};
+use objc2_core_foundation::{CFBoolean, CFData, CFDictionary, CFNumber, CFRetained, CFString, CFType};
 
 use crate::{Error, Result};
 
@@ -17,6 +17,11 @@ pub fn dictionary(entries: &[(&CFString, &CFType)]) -> CFRetained<CFDictionary> 
 
 pub fn number(v: i64) -> CFRetained<CFNumber> {
     CFNumber::new_i64(v)
+}
+
+/// `kCFBooleanTrue` or `kCFBooleanFalse` (static: not retained).
+pub fn boolean(v: bool) -> &'static CFBoolean {
+    CFBoolean::new(v)
 }
 
 pub fn data(bytes: &[u8]) -> CFRetained<CFData> {
