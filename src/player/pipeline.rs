@@ -15,7 +15,7 @@ use crate::backend::Registry;
 use crate::output::OutputPrefs;
 use super::{Command, PlayerEvent, Shared};
 use crate::audio::OutputShared;
-use crate::convert::{to_8bit, yuv_to_bgra};
+use crate::convert::{frame_to_bgra, to_8bit};
 use crate::frame::FrameFormat;
 use crate::decode::{AudioDecoder, DecodedFrame, VideoDecoder, YuvFrame};
 use crate::demux::{Demuxer, Packet, StreamInfo};
@@ -573,18 +573,18 @@ impl DecodeLoop {
         let start = Instant::now();
         let scaler = &mut self.scaler;
         let max = shared.max_output_size();
+        *shared.hdr.lock().unwrap() = f.color.transfer;
         let frame = if crate::output::planes_first(&shared.frame_formats) {
             // 10-bit samples only for apps that asked for them.
             let f = if f.bit_depth > 8 && !shared.frame_formats.contains(&FrameFormat::Yuv10) { to_8bit(&f) } else { f };
             let scaled = self.pool.install(|| max.and_then(|max| scaler.downscale(&f, max)));
             VideoFrame::Yuv(Arc::new(scaled.unwrap_or(f)))
         } else {
-            let f = if f.bit_depth > 8 { to_8bit(&f) } else { f };
             let mut bgra = Vec::new();
             let converted = self.pool.install(|| {
                 let scaled = max.and_then(|max| scaler.downscale(&f, max));
                 let f = scaled.as_ref().unwrap_or(&f);
-                yuv_to_bgra(f, &mut bgra).map(|()| (f.width, f.height))
+                frame_to_bgra(f, &mut bgra).map(|()| (f.width, f.height))
             });
             let (width, height) = match converted {
                 Ok(size) => size,

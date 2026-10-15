@@ -46,6 +46,18 @@ pub fn yuv_to_bgra(frame: &YuvFrame, out: &mut Vec<u8>) -> Result<()> {
     result.map_err(|e| Error::Decode(format!("YUV->BGRA: {e:?}")))
 }
 
+/// Any frame to SDR BGRA: PQ/HLG frames are tone mapped (`color::hdr_convert`), SDR frames
+/// converted as they are (10-bit ones shifted to 8 bits first).
+pub fn frame_to_bgra(frame: &YuvFrame, out: &mut Vec<u8>) -> Result<()> {
+    if frame.color.transfer.is_hdr() {
+        return crate::color::hdr_convert::hdr_to_bgra(frame, out);
+    }
+    match frame.planes {
+        YuvPlanes::U8(_) => yuv_to_bgra(frame, out),
+        YuvPlanes::U16(_) => yuv_to_bgra(&to_8bit(frame), out),
+    }
+}
+
 /// The frame with 8-bit samples: 16-bit planes are shifted down by `bit_depth - 8`; 8-bit
 /// frames come back as a copy.
 pub fn to_8bit(frame: &YuvFrame) -> YuvFrame {

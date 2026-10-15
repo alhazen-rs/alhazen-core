@@ -1,5 +1,6 @@
 //! Colour description of decoded pictures: matrix, range, primaries, transfer, HDR metadata.
 
+pub mod hdr_convert;
 pub mod tonemap;
 
 use crate::demux::StreamInfo;
@@ -49,7 +50,7 @@ impl Primaries {
 }
 
 /// Transfer function: SDR gamma, PQ (SMPTE ST 2084) or HLG (ARIB STD-B67).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum Transfer {
     #[default]
     Sdr,
