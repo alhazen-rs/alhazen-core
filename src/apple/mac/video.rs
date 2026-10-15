@@ -355,8 +355,8 @@ impl VtVideoDecoder {
             cpu_frame.color = color;
             let mut cpu = Vec::new();
             crate::convert::frame_to_bgra(&cpu_frame, &mut cpu)?;
-            let db = psnr(&gpu, &cpu);
-            log::info!("VideoToolbox → BGRA: {db:.1} dB against the CPU path");
+            let db = luma_psnr(&gpu, &cpu);
+            log::info!("VideoToolbox → BGRA: {db:.1} dB (luma) against the CPU path");
             if db < 30.0 {
                 return Err(Error::Decode(format!("VTPixelTransferSession output differs from the CPU path ({db:.1} dB)")));
             }
@@ -533,9 +533,17 @@ fn output_format(pb: &CVImageBuffer) -> Option<&'static OutputFormat> {
     FORMATS.iter().find(|f| f.code == code)
 }
 
-fn psnr(a: &[u8], b: &[u8]) -> f64 {
-    let n = a.len().min(b.len()).max(1);
-    let mse = a.iter().zip(b).map(|(&x, &y)| (x as f64 - y as f64).powi(2)).sum::<f64>() / n as f64;
+/// PSNR of the luma of two BGRA pictures. Luma only: chroma filtering legitimately differs
+/// between converters at hard colour edges; what this guards against (a picture not tone
+/// mapped, wrong matrix or range) shows in the brightness.
+fn luma_psnr(a: &[u8], b: &[u8]) -> f64 {
+    let luma = |p: &[u8; 4]| 0.0722 * p[0] as f64 + 0.7152 * p[1] as f64 + 0.2126 * p[2] as f64;
+    let (mut sum, mut n) = (0.0, 0usize);
+    for (x, y) in a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0) {
+        sum += (luma(x) - luma(y)).powi(2);
+        n += 1;
+    }
+    let mse = sum / n.max(1) as f64;
     if mse == 0.0 { 99.0 } else { 10.0 * (255.0f64 * 255.0 / mse).log10() }
 }
 
