@@ -129,15 +129,14 @@ pub struct VtVideoDecoder {
     ten_bit: bool,
     /// Hand out SDR pictures as zero-copy `Native` frames (`OutputPrefs::native`).
     native: bool,
-    /// Convert HDR pictures to SDR BGRA with `PixelTransfer` (`OutputPrefs::gpu_bgra`).
-    hdr_bgra: bool,
+    /// Convert pictures (not handed out as `Native`) to SDR BGRA with `PixelTransfer`
+    /// (`OutputPrefs::gpu_bgra`): tone mapped when HDR.
+    gpu_bgra: bool,
     transfer: Option<PixelTransfer>,
     /// `PixelTransfer` failed, or did not tone map like our CPU path: YUV for the CPU path.
     gpu_failed: bool,
     /// The first converted HDR picture has been checked against the CPU tone mapping.
     checked: bool,
-    /// What the stream signals about colour (container, SPS VUI).
-    stream_color: StreamColor,
 }
 
 // SAFETY: the session is created and used only through `&mut self`, on the decode thread; the
@@ -155,8 +154,7 @@ impl VtVideoDecoder {
             // AV1 and VP9 show frames in decode order (hidden frames are not output); ProRes is intra.
             _ => 0,
         } as usize;
-        let stream_color = StreamColor::of(stream);
-        let hdr = stream_color.transfer.is_some_and(|t| t.is_hdr());
+        let hdr = StreamColor::of(stream).transfer.is_some_and(|t| t.is_hdr());
         Ok(Self {
             stream: stream.clone(),
             session: None,
@@ -167,11 +165,10 @@ impl VtVideoDecoder {
             eof: false,
             ten_bit: prefs.ten_bit,
             native: prefs.native && !hdr,
-            hdr_bgra: prefs.gpu_bgra && hdr,
+            gpu_bgra: prefs.gpu_bgra && !(prefs.native && !hdr),
             transfer: None,
             gpu_failed: false,
             checked: false,
-            stream_color,
         })
     }
 
@@ -266,7 +263,7 @@ impl VtVideoDecoder {
         let sink = Box::new(Sink {
             frames: Mutex::new(Vec::new()),
             error: Mutex::new(None),
-            matrix: s.color_matrix.and_then(ColorMatrix::from_h273),
+            matrix: Some(self.color(false).matrix),
             display_height: h,
             ten_bit: self.ten_bit,
             keep,
@@ -304,15 +301,15 @@ impl VtVideoDecoder {
     }
 
     fn keeps_pictures(&self) -> bool {
-        self.native || (self.hdr_bgra && !self.gpu_failed)
+        self.native || (self.gpu_bgra && !self.gpu_failed)
     }
 
     /// The colour of this stream's pictures, with the range of the pixel format decoded to.
+    /// Container tags first, then the SPS VUI, then a guess from the height.
     fn color(&self, full_range: bool) -> ColorInfo {
-        let matrix = self.stream.color_matrix.and_then(ColorMatrix::from_h273).unwrap_or_else(|| ColorMatrix::guess_for_height(self.stream.height));
-        let mut color = ColorInfo::sdr(matrix, full_range);
-        color.apply_stream(&self.stream_color);
-        color
+        let s = &self.stream;
+        let vui = s.extradata.as_deref().and_then(|c| crate::nal::vui_color(&s.codec, c));
+        ColorInfo { full_range, ..ColorInfo::resolve(s, vui, s.height) }
     }
 
     /// A released picture as the frame the pipeline gets.
@@ -330,7 +327,7 @@ impl VtVideoDecoder {
             match self.convert(&pixel_buffer, size, color, pts) {
                 Ok(frame) => return Ok(frame),
                 Err(e) => {
-                    log::warn!("VideoToolbox: converting HDR on the GPU failed ({e}); tone mapping on the CPU from now on");
+                    log::warn!("VideoToolbox: converting on the GPU failed ({e}); converting on the CPU from now on");
                     self.gpu_failed = true;
                     self.transfer = None;
                 }
@@ -342,9 +339,9 @@ impl VtVideoDecoder {
         Ok(DecodedFrame::Yuv(f))
     }
 
-    /// An HDR picture converted to SDR BGRA by `PixelTransfer`, at the size the hint allows. The
-    /// first one is compared with our CPU tone mapping: if VideoToolbox did not tone map it (a
-    /// dim picture), this fails and the stream continues on the CPU path.
+    /// A picture converted to SDR BGRA by `PixelTransfer`, at the size the hint allows. The first
+    /// one is compared with our CPU path (which tone maps HDR): if VideoToolbox's result differs
+    /// (e.g. it did not tone map: a dim picture), this fails and the stream continues on the CPU.
     fn convert(&mut self, pixel_buffer: &CVPixelBuffer, size: (u32, u32), color: ColorInfo, pts: Duration) -> Result<DecodedFrame> {
         if self.transfer.is_none() {
             self.transfer = Some(PixelTransfer::new()?);
@@ -359,9 +356,9 @@ impl VtVideoDecoder {
             let mut cpu = Vec::new();
             crate::convert::frame_to_bgra(&cpu_frame, &mut cpu)?;
             let db = psnr(&gpu, &cpu);
-            log::info!("VideoToolbox HDR → SDR: {db:.1} dB against the CPU tone mapping");
+            log::info!("VideoToolbox → BGRA: {db:.1} dB against the CPU path");
             if db < 30.0 {
-                return Err(Error::Decode(format!("VTPixelTransferSession does not tone map like the CPU path ({db:.1} dB)")));
+                return Err(Error::Decode(format!("VTPixelTransferSession output differs from the CPU path ({db:.1} dB)")));
             }
         }
         let dst = self.hint.and_then(|h| fit_within(size.0, size.1, h)).unwrap_or(size);
@@ -443,7 +440,7 @@ impl VideoDecoder for VtVideoDecoder {
     }
 
     fn gpu_fallback(&self) -> bool {
-        self.hdr_bgra && self.gpu_failed
+        self.gpu_bgra && self.gpu_failed
     }
 }
 
