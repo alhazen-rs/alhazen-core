@@ -352,8 +352,7 @@ impl VtVideoDecoder {
         let transfer = self.transfer.as_mut().expect("created above");
         if !self.checked {
             self.checked = true;
-            let mut gpu = Vec::new();
-            transfer.convert(pixel_buffer, size, &mut gpu)?;
+            let gpu = transfer.convert(pixel_buffer, size)?;
             // SAFETY: a live pixel buffer.
             let mut cpu_frame = unsafe { copy_picture(pixel_buffer, pts, Some(color.matrix), size.1, true) }.map_err(Error::Decode)?;
             cpu_frame.color = color;
@@ -366,8 +365,7 @@ impl VtVideoDecoder {
             }
         }
         let dst = self.hint.and_then(|h| fit_within(size.0, size.1, h)).unwrap_or(size);
-        let mut bgra = Vec::new();
-        transfer.convert(pixel_buffer, dst, &mut bgra)?;
+        let bgra = transfer.convert(pixel_buffer, dst)?;
         Ok(DecodedFrame::Bgra { width: dst.0, height: dst.1, bgra, transfer: color.transfer, pts })
     }
 

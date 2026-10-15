@@ -47,6 +47,7 @@ pub(crate) struct Processor {
     /// Test switch (debug builds): this blit fails (`ALHAZEN_TEST_BREAK_VPBLT`).
     break_at: Option<u32>,
     blits: u32,
+    pool: crate::frame::FramePool,
 }
 
 impl Processor {
@@ -114,6 +115,7 @@ impl Processor {
                 dst,
                 break_at,
                 blits: 0,
+                pool: Default::default(),
             })
         }
     }
@@ -122,8 +124,8 @@ impl Processor {
         self.src == src && self.dst == dst
     }
 
-    /// Converts `sample`'s picture (a D3D11 texture) to BGRA into `out`.
-    pub fn convert(&mut self, sample: &IMFSample, color: &ColorInfo, out: &mut Vec<u8>) -> Result<()> {
+    /// `sample`'s picture (a D3D11 texture) converted to BGRA.
+    pub fn convert(&mut self, sample: &IMFSample, color: &ColorInfo) -> Result<std::sync::Arc<[u8]>> {
         self.blits += 1;
         if self.break_at == Some(self.blits) {
             return Err(Error::Decode("video processor: broken on purpose (ALHAZEN_TEST_BREAK_VPBLT)".into()));
@@ -177,14 +179,15 @@ impl Processor {
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             self.context.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).map_err(err("map"))?;
             let row = self.dst.0 as usize * 4;
-            out.reserve(row * self.dst.1 as usize);
-            for y in 0..self.dst.1 as usize {
-                let line = std::slice::from_raw_parts((mapped.pData as *const u8).add(y * mapped.RowPitch as usize), row);
-                out.extend_from_slice(line);
-            }
+            let (base, pitch) = (mapped.pData as *const u8, mapped.RowPitch as usize);
+            let out = self.pool.fill(row * self.dst.1 as usize, |dst| {
+                for (y, line) in dst.chunks_exact_mut(row).enumerate() {
+                    line.copy_from_slice(std::slice::from_raw_parts(base.add(y * pitch), row));
+                }
+            });
             self.context.Unmap(&self.staging, 0);
+            Ok(out)
         }
-        Ok(())
     }
 }
 

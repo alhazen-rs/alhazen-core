@@ -23,6 +23,7 @@ pub(crate) struct PixelTransfer {
     session: CFRetained<VTPixelTransferSession>,
     /// The BGRA destination, reused while the size stays.
     destination: Option<(CFRetained<CVPixelBuffer>, (u32, u32))>,
+    pool: crate::frame::FramePool,
 }
 
 // SAFETY: used only through `&mut self`, on the decode thread.
@@ -52,11 +53,11 @@ impl PixelTransfer {
                 return Err(Error::Decode(format!("VTPixelTransferSession property: OSStatus {status}")));
             }
         }
-        Ok(PixelTransfer { session, destination: None })
+        Ok(PixelTransfer { session, destination: None, pool: Default::default() })
     }
 
     /// `source` converted to SDR BGRA at `size` (width, height), appended to `out`.
-    pub fn convert(&mut self, source: &CVPixelBuffer, size: (u32, u32), out: &mut Vec<u8>) -> Result<()> {
+    pub fn convert(&mut self, source: &CVPixelBuffer, size: (u32, u32)) -> Result<std::sync::Arc<[u8]>> {
         if !self.destination.as_ref().is_some_and(|(_, s)| *s == size) {
             let empty = cf::dictionary(&[]);
             // SAFETY: an immutable framework constant.
@@ -92,18 +93,18 @@ impl PixelTransfer {
             let base = CVPixelBufferGetBaseAddress(destination) as *const u8;
             let stride = CVPixelBufferGetBytesPerRow(destination);
             let row = size.0 as usize * 4;
-            if !base.is_null() {
-                out.reserve(row * size.1 as usize);
-                for y in 0..size.1 as usize {
-                    out.extend_from_slice(std::slice::from_raw_parts(base.add(y * stride), row));
-                }
-            }
-            CVPixelBufferUnlockBaseAddress(destination, CVPixelBufferLockFlags::ReadOnly);
             if base.is_null() {
+                CVPixelBufferUnlockBaseAddress(destination, CVPixelBufferLockFlags::ReadOnly);
                 return Err(Error::Decode("the converted picture has no memory".into()));
             }
+            let out = self.pool.fill(row * size.1 as usize, |dst| {
+                for (y, line) in dst.chunks_exact_mut(row).enumerate() {
+                    line.copy_from_slice(std::slice::from_raw_parts(base.add(y * stride), row));
+                }
+            });
+            CVPixelBufferUnlockBaseAddress(destination, CVPixelBufferLockFlags::ReadOnly);
+            Ok(out)
         }
-        Ok(())
     }
 }
 

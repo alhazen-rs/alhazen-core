@@ -83,8 +83,7 @@ impl Conversion {
         }
         let mut color = ColorInfo::sdr(out.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(src.1)), out.full_range);
         color.apply_stream(&self.stream);
-        let mut bgra = Vec::new();
-        self.processor.as_mut().expect("created above").convert(sample, &color, &mut bgra)?;
+        let bgra = self.processor.as_mut().expect("created above").convert(sample, &color)?;
         // SAFETY: COM call on a live sample.
         let pts = mft::from_mf_time(unsafe { sample.GetSampleTime() }.unwrap_or(0));
         Ok(DecodedFrame::Bgra { width: dst.0, height: dst.1, bgra, transfer: color.transfer, pts })

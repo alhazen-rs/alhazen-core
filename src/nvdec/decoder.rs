@@ -463,8 +463,7 @@ impl Inner {
         let dst = self.hint.and_then(|hint| fit_within(w, h, hint)).unwrap_or((w, h));
         // The chroma plane starts after the (even) luma rows, as in `copy_out`.
         let source = Source { ptr: dptr, pitch, size: (w, h), chroma_offset: pitch * ((h as usize + 1) & !1), ten_bit: s.bit_depth > 8 };
-        let mut bgra = Vec::new();
-        self.converter.as_mut().expect("loaded above").convert(&source, &color, dst, &mut bgra)?;
+        let bgra = self.converter.as_mut().expect("loaded above").convert(&source, &color, dst)?;
         Ok(DecodedFrame::Bgra { width: dst.0, height: dst.1, bgra, transfer: color.transfer, pts })
     }
 

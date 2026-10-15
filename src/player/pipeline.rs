@@ -578,7 +578,7 @@ impl DecodeLoop {
             DecodedFrame::Bgra { width, height, bgra, transfer, pts } => {
                 *shared.hdr.lock().unwrap() = transfer;
                 shared.set_conversion("gpu");
-                return self.queue(shared, VideoFrame::Bgra { width, height, bgra: bgra.into(), pts }, start);
+                return self.queue(shared, VideoFrame::Bgra { width, height, bgra, pts }, start);
             }
             #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
             DecodedFrame::Native(n) if shared.frame_formats.contains(&FrameFormat::Native) => {

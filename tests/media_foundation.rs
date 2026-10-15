@@ -314,7 +314,7 @@ fn processor_and_cpu(name: &str, hint: Option<(u32, u32)>) -> Option<(Vec<u8>, (
     };
     y.color.apply_stream(&alhazen_core::color::StreamColor::of(&s));
     match g {
-        Some(DecodedFrame::Bgra { width, height, bgra, .. }) => Some((bgra, (width, height), y)),
+        Some(DecodedFrame::Bgra { width, height, bgra, .. }) => Some((bgra.to_vec(), (width, height), y)),
         _ if gpu.gpu_fallback() || gpu.description().is_some_and(|(_, on_gpu)| !on_gpu) => {
             eprintln!("skipped {name}: no D3D11 video processor here");
             None

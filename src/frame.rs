@@ -37,6 +37,38 @@ impl VideoFrame {
     }
 }
 
+/// Buffers for pictures coming back from a GPU, reused once the renderer has let go of them.
+/// A 4K BGRA picture is 33 MB: allocating one per frame costs thousands of page faults each
+/// time, while refilling memory already mapped is a plain copy.
+#[derive(Default)]
+pub(crate) struct FramePool {
+    buffers: VecDeque<Arc<[u8]>>,
+}
+
+impl FramePool {
+    /// Buffers kept for reuse (the frame queue and the renderer hold a few at a time).
+    const KEEP: usize = 8;
+
+    /// A `len`-byte buffer written by `write`: a released one of that size when there is one.
+    pub fn fill(&mut self, len: usize, write: impl FnOnce(&mut [u8])) -> Arc<[u8]> {
+        if let Some(i) = self.buffers.iter().position(|b| b.len() == len && Arc::strong_count(b) == 1) {
+            let mut buffer = self.buffers.remove(i).expect("found above");
+            write(Arc::get_mut(&mut buffer).expect("only the pool holds it"));
+            self.buffers.push_back(buffer.clone());
+            return buffer;
+        }
+        let buffer = Arc::<[u8]>::new_zeroed_slice(len);
+        // SAFETY: zeroed bytes are valid `u8`s.
+        let mut buffer = unsafe { buffer.assume_init() };
+        write(Arc::get_mut(&mut buffer).expect("just allocated"));
+        if self.buffers.len() >= Self::KEEP {
+            self.buffers.pop_front();
+        }
+        self.buffers.push_back(buffer.clone());
+        buffer
+    }
+}
+
 /// A frame format the renderer can draw (`PlayerConfig::frame_formats`, most preferred first).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameFormat {
@@ -152,6 +184,46 @@ impl FrameQueue {
     pub fn close(&self) {
         self.inner.lock().unwrap().closed = true;
         self.space.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    fn fill(pool: &mut FramePool, len: usize, byte: u8) -> Arc<[u8]> {
+        pool.fill(len, |dst| dst.fill(byte))
+    }
+
+    #[test]
+    fn a_released_buffer_is_reused() {
+        let mut pool = FramePool::default();
+        let a = fill(&mut pool, 64, 1);
+        let at = a.as_ptr();
+        drop(a);
+        let b = fill(&mut pool, 64, 2);
+        assert_eq!(b.as_ptr(), at, "the released buffer is filled again");
+        assert!(b.iter().all(|&x| x == 2));
+    }
+
+    #[test]
+    fn a_buffer_still_held_is_never_overwritten() {
+        let mut pool = FramePool::default();
+        let held: Vec<_> = (0..10).map(|i| fill(&mut pool, 64, i)).collect();
+        for (i, h) in held.iter().enumerate() {
+            assert!(h.iter().all(|&x| x == i as u8), "buffer {i} was overwritten");
+        }
+    }
+
+    #[test]
+    fn only_buffers_of_the_same_size_are_reused() {
+        let mut pool = FramePool::default();
+        let a = fill(&mut pool, 64, 1);
+        let at = a.as_ptr();
+        drop(a);
+        let b = fill(&mut pool, 128, 2);
+        assert_eq!(b.len(), 128);
+        assert_ne!(b.as_ptr(), at);
     }
 }
 

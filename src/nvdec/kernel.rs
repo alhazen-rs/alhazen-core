@@ -67,6 +67,7 @@ mod gpu {
         function: CUfunction,
         device: (CUdeviceptr, usize),
         host: (*mut u8, usize),
+        pool: crate::frame::FramePool,
     }
 
     impl Converter {
@@ -86,11 +87,11 @@ mod gpu {
                 unsafe { (api.cuModuleUnload)(module) };
                 return Err(e);
             }
-            Ok(Converter { api, module, function, device: (0, 0), host: (std::ptr::null_mut(), 0) })
+            Ok(Converter { api, module, function, device: (0, 0), host: (std::ptr::null_mut(), 0), pool: Default::default() })
         }
 
-        /// Converts `src` to BGRA at `dst` (width, height) into `out`.
-        pub fn convert(&mut self, src: &Source, color: &ColorInfo, dst: (u32, u32), out: &mut Vec<u8>) -> Result<()> {
+        /// `src` converted to BGRA at `dst` (width, height).
+        pub fn convert(&mut self, src: &Source, color: &ColorInfo, dst: (u32, u32)) -> Result<std::sync::Arc<[u8]>> {
             let api = self.api;
             let len = dst.0 as usize * dst.1 as usize * 4;
             if self.device.1 < len {
@@ -133,8 +134,8 @@ mod gpu {
             // SAFETY: both buffers hold `len` bytes; the copy waits for the kernel (same stream).
             check(unsafe { (api.cuMemcpy2D)(&m) }, "copy the BGRA picture")?;
             // SAFETY: the pinned buffer holds the `len` bytes just copied.
-            out.extend_from_slice(unsafe { std::slice::from_raw_parts(self.host.0, len) });
-            Ok(())
+            let picture = unsafe { std::slice::from_raw_parts(self.host.0, len) };
+            Ok(self.pool.fill(len, |dst| dst.copy_from_slice(picture)))
         }
 
         fn free_device(&mut self) {
