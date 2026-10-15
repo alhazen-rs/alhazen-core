@@ -524,12 +524,39 @@ fn the_matrix_comes_from_the_bitstream_when_the_container_has_none() {
     assert_eq!(f.color.matrix, alhazen_core::decode::ColorMatrix::Bt2020);
 }
 
+/// Log records, kept so a failing test can show why (e.g. why a GPU path fell back).
+struct Captured(std::sync::Mutex<Vec<String>>);
+
+impl log::Log for Captured {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Info
+    }
+    fn log(&self, r: &log::Record) {
+        if self.enabled(r.metadata()) {
+            self.0.lock().unwrap().push(format!("{} {}: {}", r.level(), r.target(), r.args()));
+        }
+    }
+    fn flush(&self) {}
+}
+
+fn captured_log() -> &'static Captured {
+    static LOG: std::sync::OnceLock<&'static Captured> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| {
+        let logger: &'static Captured = Box::leak(Box::new(Captured(std::sync::Mutex::new(Vec::new()))));
+        let _ = log::set_logger(logger);
+        log::set_max_level(log::LevelFilter::Info);
+        logger
+    })
+}
+
 #[test]
 fn sdr_bgra_is_converted_on_the_gpu() {
     use alhazen_core::{FrameFormat, VideoFrame};
+    let log = captured_log();
     let player = open_with_formats("h264_aac.mp4", vec![FrameFormat::Bgra]);
     let VideoFrame::Bgra { bgra, width, height, .. } = wait_first_frame(&player) else { panic!("expected BGRA") };
-    assert_eq!(player.stats().conversion, "gpu");
+    let notes: Vec<String> = log.0.lock().unwrap().iter().filter(|l| l.contains("VideoToolbox") || l.contains("GPU")).cloned().collect();
+    assert_eq!(player.stats().conversion, "gpu", "log: {notes:#?}");
     let Ok(out) = Command::new("ffmpeg")
         .args(["-v", "error", "-i", &fixture("h264_aac.mp4"), "-frames:v", "1", "-s", &format!("{width}x{height}"), "-pix_fmt", "bgra", "-f", "rawvideo", "-"])
         .output()
