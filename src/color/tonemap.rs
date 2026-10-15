@@ -47,10 +47,12 @@ pub fn hlg_to_nits(rgb: [f64; 3], peak: f64) -> [f64; 3] {
 }
 
 /// The brightest level the stream was mastered for: mastering display maximum, else MaxCLL,
-/// else 1000 nits.
+/// else 1000 nits. Values not above SDR white are not HDR peaks (wrong units, bogus tags) and
+/// count as missing.
 pub fn source_peak(hdr: Option<&HdrMetadata>) -> f64 {
+    let plausible = |v: f64| v > SDR_WHITE_NITS;
     hdr.and_then(|h| {
-        h.max_luminance.map(f64::from).filter(|&v| v > 0.0).or(h.max_cll.filter(|&v| v > 0).map(f64::from))
+        h.max_luminance.map(f64::from).filter(|&v| plausible(v)).or(h.max_cll.map(f64::from).filter(|&v| plausible(v)))
     })
     .unwrap_or(DEFAULT_PEAK_NITS)
 }
@@ -62,6 +64,10 @@ pub fn eetf(nits: f64, source_peak: f64) -> f64 {
     let e1 = (pq_inverse_eotf(nits) / src_max).clamp(0.0, 1.0);
     let max_lum = pq_inverse_eotf(SDR_WHITE_NITS) / src_max;
     let ks = 1.5 * max_lum - 0.5;
+    if ks >= 1.0 {
+        // The peak is at SDR white: nothing to roll off, levels above it clip.
+        return nits.min(SDR_WHITE_NITS);
+    }
     let e2 = if e1 < ks {
         e1
     } else {
@@ -181,5 +187,17 @@ mod tests {
         let s = pq_inverse_eotf(1000.0);
         let out = tonemap_pixel([s; 3], Transfer::Pq, Primaries::Bt2020, source_peak(None));
         assert!(out.iter().all(|&c| c.is_finite() && close(c, 1.0, 2e-3)), "{out:?}");
+    }
+
+    #[test]
+    fn implausible_peaks_are_ignored_and_never_blacken_highlights() {
+        // MaxCLL 100 or a mastering maximum in the wrong units: not an HDR peak.
+        let bogus = HdrMetadata { max_luminance: Some(150.0), max_cll: Some(100), ..Default::default() };
+        assert_eq!(source_peak(Some(&bogus)), DEFAULT_PEAK_NITS);
+        // Even when called with such a peak, bright pixels clip to white, not black or NaN.
+        for nits in [203.0, 500.0, 4000.0] {
+            let out = eetf(nits, 150.0);
+            assert!(out.is_finite() && close(out, SDR_WHITE_NITS, 0.5), "{nits} nits → {out}");
+        }
     }
 }
