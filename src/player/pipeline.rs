@@ -15,7 +15,8 @@ use crate::backend::Registry;
 use crate::output::OutputPrefs;
 use super::{Command, PlayerEvent, Shared};
 use crate::audio::OutputShared;
-use crate::convert::yuv_to_bgra;
+use crate::convert::{to_8bit, yuv_to_bgra};
+use crate::frame::FrameFormat;
 use crate::decode::{AudioDecoder, DecodedFrame, VideoDecoder, YuvFrame};
 use crate::demux::{Demuxer, Packet, StreamInfo};
 use crate::frame::VideoFrame;
@@ -573,9 +574,12 @@ impl DecodeLoop {
         let scaler = &mut self.scaler;
         let max = shared.max_output_size();
         let frame = if crate::output::planes_first(&shared.frame_formats) {
+            // 10-bit samples only for apps that asked for them.
+            let f = if f.bit_depth > 8 && !shared.frame_formats.contains(&FrameFormat::Yuv10) { to_8bit(&f) } else { f };
             let scaled = self.pool.install(|| max.and_then(|max| scaler.downscale(&f, max)));
             VideoFrame::Yuv(Arc::new(scaled.unwrap_or(f)))
         } else {
+            let f = if f.bit_depth > 8 { to_8bit(&f) } else { f };
             let mut bgra = Vec::new();
             let converted = self.pool.install(|| {
                 let scaled = max.and_then(|max| scaler.downscale(&f, max));
@@ -860,6 +864,31 @@ mod tests {
             other => panic!("expected Yuv, got {other:?}"),
         }
         assert_eq!(shared.conversion(), "cpu");
+    }
+
+    fn frame10(pts: Duration) -> YuvFrame {
+        YuvFrame {
+            planes: crate::decode::YuvPlanes::U16([vec![512; 4], vec![512], vec![512]]),
+            bit_depth: 10,
+            ..frame(pts)
+        }
+    }
+
+    #[test]
+    fn u16_frame_delivered_as_yuv10_only_when_listed() {
+        use crate::frame::FrameFormat;
+        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+        let shared = shared_with(vec![FrameFormat::Yuv]);
+        let mut decode = DecodeLoop::new(Box::new(NoDecoder), pool.clone());
+        assert!(decode.present(&shared, frame10(Duration::ZERO)));
+        let Some(VideoFrame::Yuv(f)) = shared.queue.frame_for(Duration::ZERO) else { panic!("expected Yuv") };
+        assert_eq!(f.bit_depth, 8, "Yuv without Yuv10 gets 8-bit");
+        assert_eq!(f.u8_planes().unwrap()[0][0], 128);
+        let shared = shared_with(vec![FrameFormat::Yuv10]);
+        let mut decode = DecodeLoop::new(Box::new(NoDecoder), pool);
+        assert!(decode.present(&shared, frame10(Duration::ZERO)));
+        let Some(VideoFrame::Yuv(f)) = shared.queue.frame_for(Duration::ZERO) else { panic!("expected Yuv") };
+        assert_eq!((f.bit_depth, f.u16_planes().unwrap()[0][0]), (10, 512));
     }
 
     #[test]

@@ -477,3 +477,46 @@ fn native_media_never_runs_ffmpeg() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(ran.is_empty(), "ffmpeg was run: {ran}");
 }
+
+/// The first frame of `name` through ffmpeg-cli with `prefs`.
+fn ffmpeg_cli_first_frame(name: &str, prefs: alhazen_core::OutputPrefs) -> Option<alhazen_core::decode::YuvFrame> {
+    let b = backend()?;
+    let mut d = MatroskaDemuxer::open(Box::new(FileSource::open(fixture_path(name)).unwrap())).unwrap();
+    let stream = d.streams().iter().find(|s| s.kind == StreamKind::Video).unwrap().clone();
+    let mut dec = b.open_video_decoder(&stream, 1, prefs).unwrap();
+    while let Some(p) = d.next_packet().unwrap() {
+        if p.stream != stream.id {
+            continue;
+        }
+        dec.send_packet(&p).unwrap();
+        if let Some(DecodedFrame::Yuv(f)) = dec.receive_frame().unwrap() {
+            return Some(f);
+        }
+    }
+    dec.send_eof();
+    match dec.receive_frame().unwrap() {
+        Some(DecodedFrame::Yuv(f)) => Some(f),
+        _ => panic!("{name}: no frame"),
+    }
+}
+
+#[test]
+fn ten_bit_hevc_keeps_its_samples() {
+    let ten_bit = alhazen_core::OutputPrefs { ten_bit: true, ..Default::default() };
+    let Some(f) = ffmpeg_cli_first_frame("hdr_pq.mkv", ten_bit) else { return };
+    assert_eq!(f.bit_depth, 10);
+    let alhazen_core::decode::YuvPlanes::U16(p) = &f.planes else { panic!("expected 16-bit planes") };
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i", &fixture_path("hdr_pq.mkv"), "-frames:v", "1", "-pix_fmt", "yuv420p10le", "-f", "rawvideo", "-"])
+        .output()
+        .unwrap();
+    let reference: Vec<u16> = out.stdout.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
+    assert!(p.iter().flatten().copied().eq(reference), "10-bit samples differ from ffmpeg's");
+}
+
+#[test]
+fn ten_bit_request_on_8bit_hevc_stays_8bit() {
+    let ten_bit = alhazen_core::OutputPrefs { ten_bit: true, ..Default::default() };
+    let Some(f) = ffmpeg_cli_first_frame("hevc.mkv", ten_bit) else { return };
+    assert_eq!(f.bit_depth, 8);
+}

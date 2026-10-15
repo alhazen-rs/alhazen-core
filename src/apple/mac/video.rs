@@ -25,7 +25,7 @@ use objc2_video_toolbox::{VTDecodeFrameFlags, VTDecodeInfoFlags, VTDecompression
 
 use super::cf;
 use crate::apple::format::{atom_name, prores_subtype, video_codec_type, vpcc_from_keyframe};
-use crate::apple::planes::biplanar_to_planar;
+use crate::apple::planes::{biplanar_to_planar, biplanar_to_planar_u16};
 use crate::decode::{ColorMatrix, DecodedFrame, PixelLayout, VideoDecoder, YuvFrame, chroma_size};
 use crate::demux::{Codec, Packet, StreamInfo};
 use crate::nvdec::size::target_size;
@@ -69,6 +69,8 @@ struct Sink {
     error: Mutex<Option<String>>,
     matrix: Option<ColorMatrix>,
     display_height: u32,
+    /// Keep 10-bit samples (`YuvPlanes::U16`) instead of shifting them to 8 bits.
+    ten_bit: bool,
 }
 
 /// A live session; invalidated (and its callback context freed) when dropped.
@@ -101,6 +103,7 @@ pub struct VtVideoDecoder {
     /// The last released picture's pts.
     last_out: Option<Duration>,
     eof: bool,
+    ten_bit: bool,
 }
 
 // SAFETY: the session is created and used only through `&mut self`, on the decode thread; the
@@ -108,7 +111,7 @@ pub struct VtVideoDecoder {
 unsafe impl Send for VtVideoDecoder {}
 
 impl VtVideoDecoder {
-    pub fn new(stream: &StreamInfo) -> Result<Self> {
+    pub fn new(stream: &StreamInfo, prefs: crate::output::OutputPrefs) -> Result<Self> {
         if video_codec_type(&stream.codec).is_none() && stream.codec != Codec::ProRes {
             return Err(Error::Unsupported("codec for VideoToolbox"));
         }
@@ -118,7 +121,7 @@ impl VtVideoDecoder {
             // AV1 and VP9 show frames in decode order (hidden frames are not output); ProRes is intra.
             _ => 0,
         } as usize;
-        Ok(Self { stream: stream.clone(), session: None, hint: None, window: Vec::new(), depth, last_out: None, eof: false })
+        Ok(Self { stream: stream.clone(), session: None, hint: None, window: Vec::new(), depth, last_out: None, eof: false, ten_bit: prefs.ten_bit })
     }
 
     fn display(&self) -> (u32, u32) {
@@ -204,6 +207,7 @@ impl VtVideoDecoder {
             error: Mutex::new(None),
             matrix: s.color_matrix.and_then(ColorMatrix::from_h273),
             display_height: h,
+            ten_bit: self.ten_bit,
         });
         let callback = VTDecompressionOutputCallbackRecord {
             decompressionOutputCallback: Some(on_output),
@@ -408,7 +412,11 @@ unsafe fn copy_out(pb: &CVImageBuffer, pts: CMTime, sink: &Sink) -> std::result:
                 std::slice::from_raw_parts(uv_base as *const u8, uv_stride * uv_rows),
             )
         };
-        Some(biplanar_to_planar(y, y_stride, uv, uv_stride, w as u32, h as u32, bytes_per_sample, layout))
+        Some(if sink.ten_bit && format.ten_bit {
+            crate::decode::YuvPlanes::U16(biplanar_to_planar_u16(y, y_stride, uv, uv_stride, w as u32, h as u32, layout))
+        } else {
+            crate::decode::YuvPlanes::U8(biplanar_to_planar(y, y_stride, uv, uv_stride, w as u32, h as u32, bytes_per_sample, layout))
+        })
     };
     // SAFETY: unlocks the lock taken above.
     unsafe { CVPixelBufferUnlockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) };
@@ -424,9 +432,9 @@ unsafe fn copy_out(pb: &CVImageBuffer, pts: CMTime, sink: &Sink) -> std::result:
         width: w,
         height: h,
         layout,
-        planes: crate::decode::YuvPlanes::U8(planes),
+        bit_depth: if matches!(planes, crate::decode::YuvPlanes::U16(_)) { 10 } else { 8 },
+        planes,
         strides: [w as usize, cw as usize, cw as usize],
-        bit_depth: 8,
         color: crate::color::ColorInfo::sdr(sink.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(sink.display_height)), full_range),
         pts,
     })

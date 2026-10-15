@@ -70,7 +70,7 @@ impl Backend for Av1Backend {
     }
     fn open_video_decoder(&self, _: &StreamInfo, threads: usize, _prefs: alhazen_core::OutputPrefs) -> Result<Box<dyn VideoDecoder>> {
         self.opened.fetch_add(1, Ordering::SeqCst);
-        Ok(Box::new(Slowed { inner: Av1Decoder::new(threads)?, delay: self.delay, stall: self.lag, frames: 0 }))
+        Ok(Box::new(Slowed { inner: Av1Decoder::new(threads, false)?, delay: self.delay, stall: self.lag, frames: 0 }))
     }
 }
 

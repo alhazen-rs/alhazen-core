@@ -389,6 +389,33 @@ pub fn vui_color(codec: &crate::demux::Codec, config: &[u8]) -> Option<VuiColor>
     }
 }
 
+/// Luma bit depth from a stream's setup record: the SPS in avcC/hvcC, or AV1's av1C
+/// (`high_bitdepth`, `twelve_bit`). `None` when it cannot be read.
+pub fn bit_depth(codec: &crate::demux::Codec, config: &[u8]) -> Option<u32> {
+    use crate::demux::Codec;
+    match codec {
+        Codec::H264 => {
+            let (_, sets) = parse_avcc(config)?;
+            let sps = sets.iter().find(|n| n.first().is_some_and(|b| b & 0x1F == 7))?;
+            parse_h264_sps(sps).map(|s| s.bit_depth_luma_minus8 + 8)
+        }
+        Codec::Hevc => {
+            let (_, sets) = parse_hvcc(config)?;
+            let sps = sets.iter().find(|n| n.first().is_some_and(|b| (b >> 1) & 0x3F == 33))?;
+            parse_hevc_sps(sps).map(|s| s.bit_depth_luma_minus8 + 8)
+        }
+        Codec::Av1 => {
+            let flags = *config.get(2)?;
+            Some(match (flags & 0x40 != 0, flags & 0x20 != 0) {
+                (false, _) => 8,
+                (true, false) => 10,
+                (true, true) => 12,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Displayed picture size from an H.264 SPS NAL unit (with its header byte).
 pub fn h264_sps_size(sps: &[u8]) -> Option<(u32, u32)> {
     parse_h264_sps(sps).map(|s| (s.width, s.height))

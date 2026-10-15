@@ -34,7 +34,7 @@ fn decode_with(name: &str, hint: impl Fn(usize) -> Option<(u32, u32)>) -> (usize
 fn try_decode(name: &str, hint: impl Fn(usize) -> Option<(u32, u32)>) -> Result<(usize, Vec<YuvFrame>), String> {
     let mut d = demuxer(name);
     let s = video(d.as_ref());
-    let mut dec = VtVideoDecoder::new(&s).unwrap();
+    let mut dec = VtVideoDecoder::new(&s, Default::default()).unwrap();
     let (mut packets, mut frames) = (0, vec![]);
     while let Some(p) = d.next_packet().unwrap() {
         if p.stream != s.id {
@@ -184,7 +184,7 @@ fn output_size_changes_at_keyframes_with_intact_pictures() {
 fn flush_then_decode_again_from_a_keyframe() {
     let mut d = demuxer("h264_aac.mp4");
     let s = video(d.as_ref());
-    let mut dec = VtVideoDecoder::new(&s).unwrap();
+    let mut dec = VtVideoDecoder::new(&s, Default::default()).unwrap();
     let packets: Vec<_> = std::iter::from_fn(|| d.next_packet().unwrap()).filter(|p| p.stream == s.id).collect();
     for p in &packets[..10] {
         dec.send_packet(p).unwrap();
@@ -379,4 +379,40 @@ fn a_corrupt_packet_does_not_stop_the_decoder() {
         }
     }
     assert!(frames >= 8 * 1536, "decoding goes on after a corrupt packet: {frames} frames");
+}
+
+#[test]
+fn ten_bit_hevc_keeps_its_samples() {
+    let mut d = demuxer("hdr_pq.mkv");
+    let s = video(d.as_ref());
+    let prefs = alhazen_core::OutputPrefs { ten_bit: true, ..Default::default() };
+    let mut dec = VtVideoDecoder::new(&s, prefs).unwrap();
+    let mut frame = None;
+    while let Some(p) = d.next_packet().unwrap() {
+        if p.stream != s.id {
+            continue;
+        }
+        dec.send_packet(&p).unwrap();
+        if let Some(DecodedFrame::Yuv(f)) = dec.receive_frame().unwrap() {
+            frame = Some(f);
+            break;
+        }
+    }
+    if frame.is_none() {
+        dec.send_eof();
+        if let Some(DecodedFrame::Yuv(f)) = dec.receive_frame().unwrap() {
+            frame = Some(f);
+        }
+    }
+    let f = frame.expect("a frame");
+    assert_eq!(f.bit_depth, 10);
+    let alhazen_core::decode::YuvPlanes::U16(p) = &f.planes else { panic!("expected 16-bit planes") };
+    let Ok(out) = Command::new("ffmpeg")
+        .args(["-v", "error", "-i", &fixture("hdr_pq.mkv"), "-frames:v", "1", "-pix_fmt", "yuv420p10le", "-f", "rawvideo", "-"])
+        .output()
+    else {
+        return eprintln!("no ffmpeg");
+    };
+    let reference: Vec<u16> = out.stdout.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
+    assert!(p.iter().flatten().copied().eq(reference), "10-bit samples differ from ffmpeg's");
 }

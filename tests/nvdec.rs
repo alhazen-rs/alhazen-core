@@ -38,7 +38,7 @@ fn gpu() -> bool {
 fn decode(name: &str, hint: Option<(u32, u32)>) -> Vec<YuvFrame> {
     let mut d = demuxer(name);
     let s = video(d.as_ref());
-    let mut dec = NvdecVideoDecoder::new(&s).unwrap();
+    let mut dec = NvdecVideoDecoder::new(&s, Default::default()).unwrap();
     let mut frames = vec![];
     while let Some(p) = d.next_packet().unwrap() {
         if p.stream != s.id {
@@ -144,7 +144,7 @@ fn dropping_mid_stream_then_decoding_again() {
     }
     let mut d = demuxer("hevc.mkv");
     let s = video(d.as_ref());
-    let mut dec = NvdecVideoDecoder::new(&s).unwrap();
+    let mut dec = NvdecVideoDecoder::new(&s, Default::default()).unwrap();
     for _ in 0..5 {
         let p = d.next_packet().unwrap().unwrap();
         dec.send_packet(&p).unwrap();
@@ -176,7 +176,7 @@ fn flush_then_restart_from_the_first_keyframe() {
     }
     let mut d = demuxer("h264_aac.mp4");
     let s = video(d.as_ref());
-    let mut dec = NvdecVideoDecoder::new(&s).unwrap();
+    let mut dec = NvdecVideoDecoder::new(&s, Default::default()).unwrap();
     let packets: Vec<_> = std::iter::from_fn(|| d.next_packet().unwrap()).filter(|p| p.stream == s.id).collect();
     for p in &packets[..10] {
         dec.send_packet(p).unwrap();
@@ -240,7 +240,7 @@ fn output_hint_changes_apply_at_the_next_keyframe_with_intact_pictures() {
     for (name, full, keys, shrink, grow) in [("av1.webm", 320, [0, 30, 60], 10, 40), ("h264_aac.ts", 320, [0, 25, 50], 10, 40)] {
         let mut d = demuxer(name);
         let s = video(d.as_ref());
-        let mut dec = NvdecVideoDecoder::new(&s).unwrap();
+        let mut dec = NvdecVideoDecoder::new(&s, Default::default()).unwrap();
         let mut frames = vec![];
         let mut sent = 0;
         while let Some(p) = d.next_packet().unwrap() {
@@ -414,7 +414,7 @@ fn recovers_after_a_part_the_gpu_cannot_decode() {
     }
     let mut d = demuxer("vp9_too_wide.webm");
     let s = video(d.as_ref());
-    let mut dec = NvdecVideoDecoder::new(&s).unwrap();
+    let mut dec = NvdecVideoDecoder::new(&s, Default::default()).unwrap();
     let (mut frames, mut errors, mut skip_to_keyframe) = (vec![], 0, false);
     while let Some(p) = d.next_packet().unwrap() {
         if p.stream != s.id || (skip_to_keyframe && !p.keyframe) {
@@ -458,3 +458,39 @@ fn timestamps_round_trip_exactly() {
     }
 }
 
+
+/// ffmpeg's first frame as 16-bit little-endian planar 4:2:0, or `None` without ffmpeg.
+fn ffmpeg_10bit(name: &str) -> Option<Vec<u16>> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i", &fixture(name), "-frames:v", "1", "-pix_fmt", "yuv420p10le", "-f", "rawvideo", "-"])
+        .output()
+        .ok()?;
+    out.status.success().then(|| out.stdout.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect())
+}
+
+#[test]
+fn hevc_10bit_planes_match_ffmpeg_exactly() {
+    if !gpu() {
+        return;
+    }
+    let mut d = demuxer("hdr_pq.mkv");
+    let s = video(d.as_ref());
+    let prefs = alhazen_core::OutputPrefs { ten_bit: true, ..Default::default() };
+    let mut dec = NvdecVideoDecoder::new(&s, prefs).unwrap();
+    let frame = loop {
+        let p = d.next_packet().unwrap().expect("a frame before the end");
+        if p.stream != s.id {
+            continue;
+        }
+        dec.send_packet(&p).unwrap();
+        if let Some(DecodedFrame::Yuv(f)) = dec.receive_frame().unwrap() {
+            break f;
+        }
+    };
+    assert_eq!(frame.bit_depth, 10);
+    let alhazen_core::decode::YuvPlanes::U16(p) = &frame.planes else { panic!("expected 16-bit planes") };
+    let Some(reference) = ffmpeg_10bit("hdr_pq.mkv") else { return eprintln!("no ffmpeg") };
+    let packed: Vec<u16> = p.iter().flatten().copied().collect();
+    assert_eq!(packed.len(), reference.len());
+    assert!(packed == reference, "NVDEC 10-bit samples differ from ffmpeg's");
+}

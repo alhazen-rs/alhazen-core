@@ -2,7 +2,7 @@
 
 use yuv::{YuvGrayImage, YuvPlanarImage, YuvRange, YuvStandardMatrix};
 
-use crate::decode::{ColorMatrix, PixelLayout, YuvFrame};
+use crate::decode::{ColorMatrix, PixelLayout, YuvFrame, YuvPlanes};
 use crate::{Error, Result};
 
 /// Converts `frame` into tightly packed BGRA (`width * 4` bytes per row).
@@ -44,6 +44,15 @@ pub fn yuv_to_bgra(frame: &YuvFrame, out: &mut Vec<u8>) -> Result<()> {
         }
     };
     result.map_err(|e| Error::Decode(format!("YUV->BGRA: {e:?}")))
+}
+
+/// The frame with 8-bit samples: 16-bit planes are shifted down by `bit_depth - 8`; 8-bit
+/// frames come back as a copy.
+pub fn to_8bit(frame: &YuvFrame) -> YuvFrame {
+    let YuvPlanes::U16(planes) = &frame.planes else { return frame.clone() };
+    let shift = frame.bit_depth.saturating_sub(8);
+    let narrow = |p: &Vec<u16>| p.iter().map(|&s| (s >> shift).min(255) as u8).collect();
+    YuvFrame { planes: YuvPlanes::U8([narrow(&planes[0]), narrow(&planes[1]), narrow(&planes[2])]), bit_depth: 8, ..frame.clone() }
 }
 
 #[cfg(test)]
@@ -92,6 +101,15 @@ mod tests {
         // BT.709 limited-range pure red: Y=63, U=102, V=240.
         let px = first_pixel(&solid(63, 102, 240, false, ColorMatrix::Bt709));
         assert!(close(px, [0, 0, 255, 255]), "got {px:?}");
+    }
+
+    #[test]
+    fn to_8bit_shifts_by_the_bit_depth() {
+        let mut f = solid(0, 0, 0, false, ColorMatrix::Bt709);
+        f.planes = YuvPlanes::U16([vec![1023; 16], vec![512; 4], vec![4; 4]]);
+        f.bit_depth = 10;
+        let n = to_8bit(&f);
+        assert_eq!((n.bit_depth, n.u8_planes().unwrap()[0][0], n.u8_planes().unwrap()[1][0], n.u8_planes().unwrap()[2][0]), (8, 255, 128, 1));
     }
 
     #[test]

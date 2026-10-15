@@ -108,9 +108,9 @@ mod backend {
         fn supports_video(&self, stream: &StreamInfo) -> bool {
             self.supports(stream, StreamKind::Video)
         }
-        fn open_video_decoder(&self, stream: &StreamInfo, _threads: usize, _prefs: crate::output::OutputPrefs) -> Result<Box<dyn VideoDecoder>> {
+        fn open_video_decoder(&self, stream: &StreamInfo, _threads: usize, prefs: crate::output::OutputPrefs) -> Result<Box<dyn VideoDecoder>> {
             let info = self.ffmpeg().ok_or(Error::Unsupported("ffmpeg not found"))?;
-            Ok(Box::new(super::FfmpegVideoDecoder::new(info, stream, self.config.hwaccel)?))
+            Ok(Box::new(super::FfmpegVideoDecoder::new(info, stream, self.config.hwaccel, prefs.ten_bit)?))
         }
         fn supports_audio(&self, stream: &StreamInfo) -> bool {
             self.supports(stream, StreamKind::Audio)

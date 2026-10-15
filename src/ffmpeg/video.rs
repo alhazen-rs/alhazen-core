@@ -41,11 +41,15 @@ pub struct FfmpegVideoDecoder {
     pending: BTreeMap<u64, Duration>,
     ready: VecDeque<Raw>,
     eof: bool,
+    /// Ask ffmpeg for 10-bit samples (`yuv420p10le`): a 10/12-bit stream and `ten_bit` wanted.
+    wide: bool,
 }
 
 impl FfmpegVideoDecoder {
-    pub fn new(info: Arc<FfmpegInfo>, stream: &StreamInfo, hwaccel: bool) -> Result<Self> {
+    pub fn new(info: Arc<FfmpegInfo>, stream: &StreamInfo, hwaccel: bool, ten_bit: bool) -> Result<Self> {
         header(stream).ok_or(Error::Unsupported("codec cannot be passed to ffmpeg"))?;
+        let depth = stream.extradata.as_deref().and_then(|c| crate::nal::bit_depth(&stream.codec, c));
+        let wide = ten_bit && depth.is_some_and(|d| d > 8);
         Ok(Self {
             info,
             stream: stream.clone(),
@@ -55,6 +59,7 @@ impl FfmpegVideoDecoder {
             pending: BTreeMap::new(),
             ready: VecDeque::new(),
             eof: false,
+            wide,
         })
     }
 
@@ -67,7 +72,13 @@ impl FfmpegVideoDecoder {
         a.extend(["-probesize", "32768", "-analyzeduration", "1"].map(String::from));
         a.extend(["-f", "matroska", "-i", "pipe:0", "-map", "0:v:0", "-an", "-sn"].map(String::from));
         a.extend(self.info.passthrough_args().map(String::from));
-        a.extend(["-copyts", "-c:v", "rawvideo", "-pix_fmt", "yuv420p", "-f", "matroska", "pipe:1"].map(String::from));
+        let pix_fmt = if self.wide { "yuv420p10le" } else { "yuv420p" };
+        if self.wide {
+            // Matroska has no codec ID for raw 10-bit YUV: store it as VFW (our demuxer only needs
+            // the track's size and the packets).
+            a.extend(["-allow_raw_vfw", "1"].map(String::from));
+        }
+        a.extend(["-copyts", "-c:v", "rawvideo", "-pix_fmt", pix_fmt, "-f", "matroska", "pipe:1"].map(String::from));
         a
     }
 
@@ -88,16 +99,24 @@ impl FfmpegVideoDecoder {
         let pts = match_pts(&mut self.pending, ms);
         let (cw, ch) = chroma_size(PixelLayout::I420, width, height);
         let (ys, cs) = ((width * height) as usize, (cw * ch) as usize);
-        let mut data = data;
-        let v = data.split_off(ys + cs);
-        let u = data.split_off(ys);
+        let (planes, bit_depth) = if self.wide {
+            let mut samples: Vec<u16> = data.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
+            let v = samples.split_off(ys + cs);
+            let u = samples.split_off(ys);
+            (crate::decode::YuvPlanes::U16([samples, u, v]), 10)
+        } else {
+            let mut data = data;
+            let v = data.split_off(ys + cs);
+            let u = data.split_off(ys);
+            (crate::decode::YuvPlanes::U8([data, u, v]), 8)
+        };
         Ok(DecodedFrame::Yuv(YuvFrame {
             width,
             height,
             layout: PixelLayout::I420,
-            planes: crate::decode::YuvPlanes::U8([data, u, v]),
+            planes,
             strides: [width as usize, cw as usize, cw as usize],
-            bit_depth: 8,
+            bit_depth,
             color: crate::color::ColorInfo::sdr(matrix.and_then(ColorMatrix::from_h273).unwrap_or_else(|| ColorMatrix::guess_for_height(height)), full_range.unwrap_or(false)),
             pts,
         }))
@@ -242,7 +261,8 @@ pub(crate) fn read_raw(stdout: ChildStdout, tx: Sender<Raw>) {
         if p.stream != track.id {
             continue;
         }
-        if size == 0 || p.data.len() != size {
+        // One byte per sample (yuv420p), or two (yuv420p10le, when 10-bit output was asked for).
+        if size == 0 || (p.data.len() != size && p.data.len() != 2 * size) {
             let _ = tx.send(Raw::Bad(format!("{} byte frame for {width}x{height}", p.data.len())));
             return;
         }

@@ -250,3 +250,33 @@ fn aac_padding_is_trimmed() {
     let worst = ours[..n].iter().zip(&reference[..n]).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
     assert!(worst < 0.01, "not aligned with ffmpeg: worst {worst}");
 }
+
+#[test]
+fn ten_bit_hevc_keeps_its_samples() {
+    let mut d = demuxer("hdr_pq.mkv");
+    let s = track(d.as_ref(), StreamKind::Video);
+    let mut dec = MfVideoDecoder::new(HwCodec::Hevc, &s, true).unwrap().with_ten_bit(true);
+    let frame = loop {
+        let Some(p) = d.next_packet().unwrap() else { panic!("no frame") };
+        if p.stream != s.id {
+            continue;
+        }
+        if let Err(e) = dec.send_packet(&p) {
+            if e.to_string().contains("no Media Foundation decoder") {
+                return eprintln!("skipped: {e}");
+            }
+            panic!("{e}");
+        }
+        if let Some(DecodedFrame::Yuv(f)) = dec.receive_frame().unwrap() {
+            break f;
+        }
+    };
+    assert_eq!(frame.bit_depth, 10);
+    let alhazen_core::decode::YuvPlanes::U16(p) = &frame.planes else { panic!("expected 16-bit planes") };
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i", &fixture("hdr_pq.mkv"), "-frames:v", "1", "-pix_fmt", "yuv420p10le", "-f", "rawvideo", "-"])
+        .output();
+    let Ok(out) = out else { return eprintln!("no ffmpeg") };
+    let reference: Vec<u16> = out.stdout.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
+    assert!(p.iter().flatten().copied().eq(reference), "10-bit samples differ from ffmpeg's");
+}

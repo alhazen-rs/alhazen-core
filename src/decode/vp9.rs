@@ -2,7 +2,8 @@
 
 use std::time::Duration;
 
-use super::planar::{double_rows, pack_8bit};
+use super::planar::{double_rows, pack_16bit, pack_8bit};
+use crate::decode::YuvPlanes;
 use super::{ColorMatrix, DecodedFrame, PixelLayout, VideoDecoder, YuvFrame};
 use crate::demux::Packet;
 use crate::{Error, Result};
@@ -10,12 +11,13 @@ use crate::{Error, Result};
 pub struct Vp9Decoder {
     dec: vp9_mt::Vp9Decoder,
     threads: usize,
+    ten_bit: bool,
 }
 
 impl Vp9Decoder {
-    /// `threads == 0` uses the available parallelism.
-    pub fn new(threads: usize) -> Self {
-        Self { dec: vp9_mt::Vp9Decoder::with_threads(threads), threads }
+    /// `threads == 0` uses the available parallelism. `ten_bit` keeps high-bit-depth samples.
+    pub fn new(threads: usize, ten_bit: bool) -> Self {
+        Self { dec: vp9_mt::Vp9Decoder::with_threads(threads), threads, ten_bit }
     }
 }
 
@@ -32,7 +34,7 @@ impl VideoDecoder for Vp9Decoder {
     fn receive_frame(&mut self) -> Result<Option<DecodedFrame>> {
         loop {
             match self.dec.next_picture() {
-                Ok(pic) => return convert(&pic).map(|f| Some(DecodedFrame::Yuv(f))),
+                Ok(pic) => return convert(&pic, self.ten_bit).map(|f| Some(DecodedFrame::Yuv(f))),
                 // A hidden frame (alt-ref) was decoded; the shown one may still be queued.
                 Err(vp9_mt::Error::Again) if self.dec.pending() > 0 => continue,
                 Err(vp9_mt::Error::Again | vp9_mt::Error::Eof) => return Ok(None),
@@ -46,7 +48,7 @@ impl VideoDecoder for Vp9Decoder {
     }
 }
 
-fn convert(pic: &vp9_mt::Picture) -> Result<YuvFrame> {
+fn convert(pic: &vp9_mt::Picture, ten_bit: bool) -> Result<YuvFrame> {
     let (w, h) = (pic.width(), pic.height());
     let bd = pic.bit_depth();
     let matrix = match pic.color_space() {
@@ -56,27 +58,39 @@ fn convert(pic: &vp9_mt::Picture) -> Result<YuvFrame> {
         7 => return Err(Error::Decode("vp9: RGB (color_space 7) streams are not supported".into())),
         _ => ColorMatrix::guess_for_height(h),
     };
-    let pack = |p: usize| {
-        let (data, stride) = pic.plane(p);
-        let (pw, ph) = pic.plane_size(p);
-        (pack_8bit(data, stride, pw, ph, bd), pw)
-    };
-    let (y, _) = pack(0);
-    let ((u, cw), (v, _)) = (pack(1), pack(2));
-    let (layout, u, v) = match pic.subsampling() {
-        (1, 1) => (PixelLayout::I420, u, v),
-        (1, 0) => (PixelLayout::I422, u, v),
-        (0, 0) => (PixelLayout::I444, u, v),
+    let (layout, four_four_zero) = match pic.subsampling() {
+        (1, 1) => (PixelLayout::I420, false),
+        (1, 0) => (PixelLayout::I422, false),
+        (0, 0) => (PixelLayout::I444, false),
         // 4:4:0 (full-width, half-height chroma): repeat chroma rows to get 4:4:4.
-        _ => (PixelLayout::I444, double_rows(&u, cw, h as usize), double_rows(&v, cw, h as usize)),
+        _ => (PixelLayout::I444, true),
+    };
+    let cw = pic.plane_size(1).0;
+    fn rows<T: Copy>(plane: Vec<T>, double: bool, w: usize, height: usize) -> Vec<T> {
+        if double { double_rows(&plane, w, height) } else { plane }
+    }
+    let height = h as usize;
+    let wide = ten_bit && bd > 8;
+    let planes = if wide {
+        let pack = |p: usize| {
+            let ((data, stride), (pw, ph)) = (pic.plane(p), pic.plane_size(p));
+            pack_16bit(data, stride, pw, ph)
+        };
+        YuvPlanes::U16([pack(0), rows(pack(1), four_four_zero, cw, height), rows(pack(2), four_four_zero, cw, height)])
+    } else {
+        let pack = |p: usize| {
+            let ((data, stride), (pw, ph)) = (pic.plane(p), pic.plane_size(p));
+            pack_8bit(data, stride, pw, ph, bd)
+        };
+        YuvPlanes::U8([pack(0), rows(pack(1), four_four_zero, cw, height), rows(pack(2), four_four_zero, cw, height)])
     };
     Ok(YuvFrame {
         width: w,
         height: h,
         layout,
-        planes: crate::decode::YuvPlanes::U8([y, u, v]),
+        planes,
         strides: [w as usize, cw, cw],
-        bit_depth: 8,
+        bit_depth: if wide { bd as u8 } else { 8 },
         color: crate::color::ColorInfo::sdr(matrix, pic.full_range()),
         pts: Duration::from_nanos(pic.pts.unwrap_or(0).max(0) as u64),
     })
@@ -89,7 +103,7 @@ mod tests {
     use crate::source::FileSource;
 
     fn decode_all(mut demuxer: Box<dyn Demuxer>) -> Vec<YuvFrame> {
-        let mut dec = Vp9Decoder::new(2);
+        let mut dec = Vp9Decoder::new(2, false);
         let mut frames = vec![];
         while let Some(p) = demuxer.next_packet().unwrap() {
             dec.send_packet(&p).unwrap();
@@ -138,7 +152,7 @@ mod tests {
     fn flush_then_keyframe_decodes_again() {
         let mut demuxer = webm("vp9_profile0.webm");
         let packets: Vec<_> = std::iter::from_fn(|| demuxer.next_packet().unwrap()).collect();
-        let mut dec = Vp9Decoder::new(2);
+        let mut dec = Vp9Decoder::new(2, false);
         dec.send_packet(&packets[0]).unwrap();
         assert!(dec.receive_frame().unwrap().is_some());
         dec.flush();
@@ -149,7 +163,7 @@ mod tests {
 
     #[test]
     fn garbage_packet_is_an_error_not_a_crash() {
-        let mut dec = Vp9Decoder::new(2);
+        let mut dec = Vp9Decoder::new(2, false);
         let p = Packet { stream: 1, pts: Duration::ZERO, keyframe: true, data: vec![0xFF; 64], generation: 0 };
         let sent = dec.send_packet(&p);
         let received = dec.receive_frame();

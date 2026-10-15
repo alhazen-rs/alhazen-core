@@ -255,11 +255,11 @@ impl Backend for NativeBackend {
         use crate::demux::Codec;
         matches!(stream.codec, Codec::Av1 | Codec::Vp9 | Codec::Vp8 | Codec::ProRes)
     }
-    fn open_video_decoder(&self, stream: &StreamInfo, threads: usize, _prefs: crate::output::OutputPrefs) -> Result<Box<dyn VideoDecoder>> {
+    fn open_video_decoder(&self, stream: &StreamInfo, threads: usize, prefs: crate::output::OutputPrefs) -> Result<Box<dyn VideoDecoder>> {
         use crate::demux::Codec;
         Ok(match stream.codec {
-            Codec::Av1 => Box::new(crate::decode::Av1Decoder::new(threads)?),
-            Codec::Vp9 => Box::new(crate::decode::Vp9Decoder::new(threads)),
+            Codec::Av1 => Box::new(crate::decode::Av1Decoder::new(threads, prefs.ten_bit)?),
+            Codec::Vp9 => Box::new(crate::decode::Vp9Decoder::new(threads, prefs.ten_bit)),
             Codec::Vp8 => Box::new(crate::decode::Vp8Decoder::new()?),
             Codec::ProRes => Box::new(crate::decode::ProResDecoder::new()),
             _ => return Err(Error::Unsupported("video codec")),

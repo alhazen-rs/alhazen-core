@@ -39,6 +39,34 @@ pub(crate) fn biplanar_to_planar(
     [py, pu, pv]
 }
 
+/// Like [`biplanar_to_planar`] for 16-bit samples (little-endian, value in the high bits, as
+/// VideoToolbox's 10-bit formats store it), keeping all 10 bits: values come out LSB-aligned.
+pub(crate) fn biplanar_to_planar_u16(
+    y: &[u8],
+    y_stride: usize,
+    uv: &[u8],
+    uv_stride: usize,
+    w: u32,
+    h: u32,
+    layout: PixelLayout,
+) -> [Vec<u16>; 3] {
+    let (cw, ch) = chroma_size(layout, w, h);
+    let (w, h, cw, ch) = (w as usize, h as usize, cw as usize, ch as usize);
+    let sample = |b: &[u8; 2]| u16::from_le_bytes(*b) >> 6;
+    let mut py = Vec::with_capacity(w * h);
+    for row in y.chunks(y_stride).take(h) {
+        py.extend(row.as_chunks::<2>().0.iter().take(w).map(sample));
+    }
+    let (mut pu, mut pv) = (Vec::with_capacity(cw * ch), Vec::with_capacity(cw * ch));
+    for row in uv.chunks(uv_stride).take(ch) {
+        for pair in row.as_chunks::<4>().0.iter().take(cw) {
+            pu.push(sample(&[pair[0], pair[1]]));
+            pv.push(sample(&[pair[2], pair[3]]));
+        }
+    }
+    [py, pu, pv]
+}
+
 /// [`biplanar_to_planar`] for 4:2:0.
 #[cfg(test)]
 fn biplanar_to_i420(y: &[u8], y_stride: usize, uv: &[u8], uv_stride: usize, w: u32, h: u32, bytes_per_sample: usize) -> [Vec<u8>; 3] {
@@ -92,5 +120,22 @@ mod tests {
         let uv444 = [10, 20, 11, 21, 12, 22, 13, 23];
         let [_, pu, pv] = biplanar_to_planar(&y, 2, &uv444, 4, 2, 2, 1, PixelLayout::I444);
         assert_eq!((pu, pv), (vec![10, 11, 12, 13], vec![20, 21, 22, 23]));
+    }
+
+    #[test]
+    fn sixteen_bit_keeps_ten_bit_values_lsb_aligned() {
+        // 2x2 luma, 10-bit values 1023, 0, 512, 64 stored MSB-aligned (<< 6), little-endian, stride 6 bytes.
+        let le = |v: u16| (v << 6).to_le_bytes();
+        let mut y = Vec::new();
+        for row in [[1023u16, 0], [512, 64]] {
+            for v in row {
+                y.extend_from_slice(&le(v));
+            }
+            y.extend_from_slice(&[0xAA, 0xAA]); // padding
+        }
+        // One chroma pair: U 300, V 700.
+        let uv: Vec<u8> = [le(300), le(700)].concat();
+        let [py, pu, pv] = biplanar_to_planar_u16(&y, 6, &uv, 4, 2, 2, PixelLayout::I420);
+        assert_eq!((py, pu, pv), (vec![1023, 0, 512, 64], vec![300], vec![700]));
     }
 }

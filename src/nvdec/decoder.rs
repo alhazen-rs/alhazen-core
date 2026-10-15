@@ -56,6 +56,8 @@ struct Inner {
     error: Option<Error>,
     stream_matrix: Option<u8>,
     stream_full_range: Option<bool>,
+    /// Keep 10-bit samples (`YuvPlanes::U16`) instead of shifting them to 8 bits.
+    ten_bit: bool,
 }
 
 pub struct NvdecVideoDecoder {
@@ -80,7 +82,7 @@ const FORMAT_WITHIN_PACKETS: u32 = 3;
 unsafe impl Send for NvdecVideoDecoder {}
 
 impl NvdecVideoDecoder {
-    pub fn new(stream: &StreamInfo) -> Result<Self> {
+    pub fn new(stream: &StreamInfo, prefs: crate::output::OutputPrefs) -> Result<Self> {
         let dev = device::get().ok_or(Error::Unsupported("NVDEC"))?;
         let hw = HwCodec::of(stream).ok_or(Error::Unsupported("codec for NVDEC"))?;
         let codec = device::cuda_codec(hw).ok_or(Error::Unsupported("codec for NVDEC"))?;
@@ -104,6 +106,7 @@ impl NvdecVideoDecoder {
             error: None,
             stream_matrix: stream.color_matrix,
             stream_full_range: stream.full_range,
+            ten_bit: prefs.ten_bit,
         }));
         Ok(Self {
             inner,
@@ -443,8 +446,12 @@ impl Inner {
         copy(chroma_src, unsafe { self.host.ptr.add(row * h) }, chroma_rows)
     }
 
-    /// The pinned buffer as an 8-bit I420 frame (P016: the high byte of each sample).
+    /// The pinned buffer as an I420 frame: 8-bit (P016: the high byte of each sample), or with
+    /// `ten_bit` and a 10-bit stream, LSB-aligned 16-bit samples.
     fn to_frame(&self, s: &Setup, pts: Duration) -> YuvFrame {
+        if self.ten_bit && s.bit_depth > 8 {
+            return self.to_frame_16(s, pts);
+        }
         let bps = if s.bit_depth > 8 { 2 } else { 1 };
         let (w, h) = s.target;
         let (cw, ch) = chroma_size(PixelLayout::I420, w, h);
@@ -471,6 +478,38 @@ impl Inner {
             planes: crate::decode::YuvPlanes::U8([y, u, v]),
             strides: [w as usize, cw, cw],
             bit_depth: 8,
+            color: crate::color::ColorInfo::sdr(s.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(display_height)), s.full_range),
+            pts,
+        }
+    }
+
+    /// The pinned P016 buffer as a 16-bit I420 frame, samples shifted to the low bits.
+    fn to_frame_16(&self, s: &Setup, pts: Duration) -> YuvFrame {
+        let (w, h) = s.target;
+        let (cw, ch) = chroma_size(PixelLayout::I420, w, h);
+        let row = w as usize * 2;
+        // SAFETY: `copy_out` filled `row * (h + ch)` bytes of the buffer.
+        let buf = unsafe { std::slice::from_raw_parts(self.host.ptr, row * (h + ch) as usize) };
+        let (luma, chroma) = buf.split_at(row * h as usize);
+        let shift = 16 - s.bit_depth;
+        let sample = |c: &[u8; 2]| u16::from_le_bytes(*c) >> shift;
+        let y: Vec<u16> = luma.as_chunks::<2>().0.iter().map(sample).collect();
+        let cw = cw as usize;
+        let (mut u, mut v) = (vec![0u16; cw * ch as usize], vec![0u16; cw * ch as usize]);
+        for ((src, u), v) in chroma.chunks_exact(row).zip(u.chunks_exact_mut(cw)).zip(v.chunks_exact_mut(cw)) {
+            for ((pair, u), v) in src[..cw * 4].as_chunks::<4>().0.iter().zip(u).zip(v) {
+                *u = sample(&[pair[0], pair[1]]);
+                *v = sample(&[pair[2], pair[3]]);
+            }
+        }
+        let display_height = s.display_size().1;
+        YuvFrame {
+            width: w,
+            height: h,
+            layout: PixelLayout::I420,
+            planes: crate::decode::YuvPlanes::U16([y, u, v]),
+            strides: [w as usize, cw, cw],
+            bit_depth: s.bit_depth as u8,
             color: crate::color::ColorInfo::sdr(s.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(display_height)), s.full_range),
             pts,
         }
