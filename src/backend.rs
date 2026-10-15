@@ -169,6 +169,14 @@ impl Registry {
         self.open_video_decoder_except(stream, threads, prefs, order, None).map(|(_, d)| d)
     }
 
+    /// A video decoder from the backend named `name` (with the stream's colour applied, as
+    /// `open_video_decoder` does).
+    pub fn open_video_decoder_from(&self, name: &str, stream: &StreamInfo, threads: usize, prefs: OutputPrefs) -> Result<Box<dyn VideoDecoder>> {
+        let b = self.backends.iter().find(|b| b.name() == name).ok_or(Error::Unsupported("backend"))?;
+        let d = b.open_video_decoder(stream, threads, prefs)?;
+        Ok(Box::new(StreamColored { inner: d, color: crate::color::StreamColor::of(stream) }))
+    }
+
     /// Like `open_video_decoder`, skipping the backend named `except`; also returns the name of
     /// the backend that opened it. Used to find a faster decoder when the current one is too slow.
     pub fn open_video_decoder_except(

@@ -288,6 +288,9 @@ fn send(shared: &Shared, tx: &Sender<Msg>, commands: &Receiver<Command>, mut msg
     }
 }
 
+/// Backends that always decode on the GPU: never replaced for being too slow.
+const HARDWARE: [&str; 2] = ["nvdec", "videotoolbox"];
+
 struct DecodeLoop {
     decoder: Box<dyn VideoDecoder>,
     pool: Arc<rayon::ThreadPool>,
@@ -310,6 +313,8 @@ struct DecodeLoop {
     /// Pts of the last frame converted and queued.
     last_shown: Option<Duration>,
     scaler: crate::scale::FrameScaler,
+    /// The current decoder hands out frames converted on the GPU.
+    gpu_converting: bool,
 }
 
 impl DecodeLoop {
@@ -329,6 +334,7 @@ impl DecodeLoop {
             busy: Duration::ZERO,
             last_shown: None,
             scaler: crate::scale::FrameScaler::default(),
+            gpu_converting: false,
         }
     }
 
@@ -458,8 +464,42 @@ impl DecodeLoop {
         // At most one frame waiting: the renderer is eating frames as fast as we make them.
         let behind = shared.queue.len() <= 1;
         self.monitor.record_drops(now, shared.queue.dropped(), behind);
-        if self.monitor.too_slow(now) {
-            self.switch_backend(shared, "decoding is too slow for this video");
+        if !self.monitor.too_slow(now) || (self.gpu_converting && self.convert_on_the_cpu(shared)) {
+            return;
+        }
+        // A hardware decoder already on the CPU path: the other backends (software decoders,
+        // ffmpeg) would be slower still. Keep it and let late frames drop.
+        if self.fallback.as_ref().is_some_and(|f| HARDWARE.contains(&f.current)) {
+            self.monitor.reset();
+            return;
+        }
+        self.switch_backend(shared, "decoding is too slow for this video");
+    }
+
+    /// Too slow while converting on the GPU (copying finished BGRA frames back costs more than
+    /// YUV at high frame rates): reopens the same backend handing out YUV for the CPU path
+    /// before giving up on it. Returns whether it did.
+    fn convert_on_the_cpu(&mut self, shared: &Shared) -> bool {
+        self.gpu_converting = false;
+        let Some(f) = &self.fallback else { return false };
+        let prefs = OutputPrefs { gpu_bgra: false, ..OutputPrefs::for_stream(&shared.frame_formats, &f.stream) };
+        match f.registry.open_video_decoder_from(f.current, &f.stream, f.threads, prefs) {
+            Ok(decoder) => {
+                log::info!("{} is too slow converting on the GPU; converting on the CPU", f.current);
+                self.decoder = decoder;
+                self.decoded_any = false;
+                self.monitor.reset();
+                if shared.seekable {
+                    shared.seek_to_now_if_current(self.generation);
+                } else {
+                    self.waiting_for_keyframe = true;
+                }
+                true
+            }
+            Err(e) => {
+                log::info!("{} can't decode without converting on the GPU: {e}", f.current);
+                false
+            }
         }
     }
 
@@ -475,6 +515,7 @@ impl DecodeLoop {
                 )));
                 self.decoder = decoder;
                 self.decoded_any = false;
+                self.gpu_converting = false;
                 *shared.video_backend.lock().unwrap() = Some(name);
                 if shared.seekable {
                     // Restart decoding from where playback is: the demuxer goes back to the
@@ -576,6 +617,7 @@ impl DecodeLoop {
         let max = shared.max_output_size();
         let f = match f {
             DecodedFrame::Bgra { width, height, bgra, transfer, pts } => {
+                self.gpu_converting = true;
                 *shared.hdr.lock().unwrap() = transfer;
                 shared.set_conversion("gpu");
                 return self.queue(shared, VideoFrame::Bgra { width, height, bgra, pts }, start);
@@ -839,6 +881,101 @@ mod tests {
         }
         assert_eq!(*shared.video_backend.lock().unwrap(), Some("spare"));
         assert_eq!(shared.queue.dropped(), 0, "the drop rule did not do it");
+    }
+
+    /// A backend whose decoders are recorded with the preferences they were opened with.
+    struct Recording(&'static str, Arc<Mutex<Vec<crate::output::OutputPrefs>>>);
+    impl crate::backend::Backend for Recording {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn priority(&self) -> i32 {
+            0
+        }
+        fn supports_container(&self, _: crate::demux::ContainerFormat) -> bool {
+            false
+        }
+        fn open_demuxer(&self, _: crate::demux::ContainerFormat, _: Box<dyn crate::source::MediaSource>) -> Result<Box<dyn Demuxer>> {
+            unreachable!()
+        }
+        fn supports_video(&self, _: &StreamInfo) -> bool {
+            true
+        }
+        fn open_video_decoder(&self, _: &StreamInfo, _: usize, prefs: crate::output::OutputPrefs) -> Result<Box<dyn VideoDecoder>> {
+            self.1.lock().unwrap().push(prefs);
+            Ok(Box::new(NoDecoder))
+        }
+    }
+
+    #[test]
+    fn too_slow_on_the_gpu_first_converts_on_the_cpu_with_the_same_decoder() {
+        let clock = Arc::new(MockClock::new());
+        let shared = shared(clock.clone());
+        *shared.state.lock().unwrap() = PlayerState::Playing;
+        shared.ready_generation.store(0, Ordering::SeqCst);
+        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+        let (gpu_opens, spare_opens) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
+        let mut registry = Registry::empty();
+        registry.register(Arc::new(Recording("gpu", gpu_opens.clone())));
+        registry.register(Arc::new(Recording("spare", spare_opens.clone())));
+        let mut decode = DecodeLoop::new(Box::new(NoDecoder), pool);
+        decode.fallback = Some(Fallback {
+            registry: Arc::new(registry),
+            stream: StreamInfo::new(1, crate::demux::StreamKind::Video, crate::demux::Codec::Hevc),
+            threads: 1,
+            order: None,
+            current: "gpu",
+            speed: true,
+        });
+        let start = Instant::now();
+        let mut pts = Duration::ZERO;
+        // GPU-converted frames that keep reaching the queue 300 ms late.
+        while gpu_opens.lock().unwrap().is_empty() && spare_opens.lock().unwrap().is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(4), "never reacted");
+            clock.set(pts + Duration::from_millis(300));
+            let frame = DecodedFrame::Bgra { width: 2, height: 2, bgra: Arc::from(vec![0u8; 16]), transfer: crate::color::Transfer::Sdr, pts };
+            decode.present(&shared, frame);
+            shared.queue.frame_for(clock.now());
+            pts += Duration::from_millis(16);
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        assert_eq!(*gpu_opens.lock().unwrap(), vec![crate::output::OutputPrefs { gpu_bgra: false, ..Default::default() }], "reopened without GPU conversion");
+        assert!(spare_opens.lock().unwrap().is_empty(), "no other backend yet");
+        assert_eq!(*shared.video_backend.lock().unwrap(), None, "same backend");
+        assert!(decode.fallback.is_some(), "a backend switch is still possible if that is too slow too");
+    }
+
+    #[test]
+    fn a_hardware_decoder_is_not_swapped_for_a_slower_one() {
+        // NVDEC already converting on the CPU and still behind: the other backends (software,
+        // ffmpeg) would only be slower, so it stays.
+        let clock = Arc::new(MockClock::new());
+        let shared = shared(clock.clone());
+        *shared.state.lock().unwrap() = PlayerState::Playing;
+        shared.ready_generation.store(0, Ordering::SeqCst);
+        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+        let spare_opens = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = Registry::empty();
+        registry.register(Arc::new(Recording("spare", spare_opens.clone())));
+        let mut decode = DecodeLoop::new(Box::new(NoDecoder), pool);
+        decode.fallback = Some(Fallback {
+            registry: Arc::new(registry),
+            stream: StreamInfo::new(1, crate::demux::StreamKind::Video, crate::demux::Codec::Hevc),
+            threads: 1,
+            order: None,
+            current: "nvdec",
+            speed: true,
+        });
+        let start = Instant::now();
+        let mut pts = Duration::ZERO;
+        while start.elapsed() < Duration::from_secs(3) {
+            clock.set(pts + Duration::from_millis(300));
+            decode.present(&shared, frame(pts));
+            shared.queue.frame_for(clock.now());
+            pts += Duration::from_millis(16);
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        assert!(spare_opens.lock().unwrap().is_empty(), "switched away from the hardware decoder");
     }
 
     #[test]
