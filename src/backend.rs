@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::decode::{AudioDecoder, VideoDecoder};
 use crate::demux::{ContainerFormat, Demuxer, StreamInfo};
+use crate::output::OutputPrefs;
 use crate::source::{MediaSource, Source};
 use crate::{Error, Result};
 
@@ -14,7 +15,9 @@ pub trait Backend: Send + Sync {
     fn supports_container(&self, format: ContainerFormat) -> bool;
     fn open_demuxer(&self, format: ContainerFormat, src: Box<dyn MediaSource>) -> Result<Box<dyn Demuxer>>;
     fn supports_video(&self, stream: &StreamInfo) -> bool;
-    fn open_video_decoder(&self, stream: &StreamInfo, threads: usize) -> Result<Box<dyn VideoDecoder>>;
+    /// `prefs` says what the player will do with the frames (GPU BGRA, native frames, 10-bit);
+    /// decoders that cannot honour a preference ignore it.
+    fn open_video_decoder(&self, stream: &StreamInfo, threads: usize, prefs: OutputPrefs) -> Result<Box<dyn VideoDecoder>>;
     /// Audio support is optional for a backend.
     fn supports_audio(&self, _stream: &StreamInfo) -> bool {
         false
@@ -160,9 +163,10 @@ impl Registry {
         &self,
         stream: &StreamInfo,
         threads: usize,
+        prefs: OutputPrefs,
         order: Option<&[&'static str]>,
     ) -> Result<Box<dyn VideoDecoder>> {
-        self.open_video_decoder_except(stream, threads, order, None).map(|(_, d)| d)
+        self.open_video_decoder_except(stream, threads, prefs, order, None).map(|(_, d)| d)
     }
 
     /// Like `open_video_decoder`, skipping the backend named `except`; also returns the name of
@@ -171,6 +175,7 @@ impl Registry {
         &self,
         stream: &StreamInfo,
         threads: usize,
+        prefs: OutputPrefs,
         order: Option<&[&'static str]>,
         except: Option<&str>,
     ) -> Result<(&'static str, Box<dyn VideoDecoder>)> {
@@ -178,7 +183,7 @@ impl Registry {
         let candidates = self.ordered(order).into_iter().filter(|b| Some(b.name()) != except);
         for b in candidates.filter(|b| b.supports_video(stream)) {
             tried.push(b.name());
-            match b.open_video_decoder(stream, threads) {
+            match b.open_video_decoder(stream, threads, prefs) {
                 Ok(d) => return Ok((b.name(), d)),
                 Err(e) => log::warn!("backend {} failed to open {} decoder: {e}", b.name(), stream.codec),
             }
@@ -219,7 +224,7 @@ impl Backend for NativeBackend {
         use crate::demux::Codec;
         matches!(stream.codec, Codec::Av1 | Codec::Vp9 | Codec::Vp8 | Codec::ProRes)
     }
-    fn open_video_decoder(&self, stream: &StreamInfo, threads: usize) -> Result<Box<dyn VideoDecoder>> {
+    fn open_video_decoder(&self, stream: &StreamInfo, threads: usize, _prefs: crate::output::OutputPrefs) -> Result<Box<dyn VideoDecoder>> {
         use crate::demux::Codec;
         Ok(match stream.codec {
             Codec::Av1 => Box::new(crate::decode::Av1Decoder::new(threads)?),
@@ -273,7 +278,7 @@ mod tests {
         fn supports_video(&self, _: &StreamInfo) -> bool {
             true
         }
-        fn open_video_decoder(&self, _: &StreamInfo, _: usize) -> Result<Box<dyn VideoDecoder>> {
+        fn open_video_decoder(&self, _: &StreamInfo, _: usize, _prefs: crate::output::OutputPrefs) -> Result<Box<dyn VideoDecoder>> {
             Err(Error::Decode("fake".into()))
         }
     }
@@ -297,7 +302,7 @@ mod tests {
     fn unsupported_codec_reports_tried_backends() {
         let mut r = Registry::empty();
         r.register(Arc::new(Fake("fake", 0)));
-        match r.open_video_decoder(&vp9(), 1, None) {
+        match r.open_video_decoder(&vp9(), 1, Default::default(), None) {
             Err(Error::UnsupportedCodec { codec, tried_backends }) => {
                 assert_eq!(codec, "Vp9");
                 assert_eq!(tried_backends, ["fake"]);
@@ -313,7 +318,7 @@ mod tests {
         let r = Registry::empty_with_native();
         let h264 = StreamInfo::new(1, StreamKind::Video, Codec::H264);
         assert!(matches!(
-            r.open_video_decoder(&h264, 1, None),
+            r.open_video_decoder(&h264, 1, Default::default(), None),
             Err(Error::UnsupportedCodec { tried_backends, .. }) if tried_backends.is_empty()
         ));
     }
@@ -321,6 +326,6 @@ mod tests {
     #[cfg(feature = "native")]
     #[test]
     fn native_backend_opens_vp9() {
-        assert!(Registry::with_defaults().open_video_decoder(&vp9(), 1, None).is_ok());
+        assert!(Registry::with_defaults().open_video_decoder(&vp9(), 1, Default::default(), None).is_ok());
     }
 }

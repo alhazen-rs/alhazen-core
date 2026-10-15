@@ -468,10 +468,10 @@ impl Inner {
             width: w,
             height: h,
             layout: PixelLayout::I420,
-            planes: [y, u, v],
+            planes: crate::decode::YuvPlanes::U8([y, u, v]),
             strides: [w as usize, cw, cw],
-            matrix: s.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(display_height)),
-            full_range: s.full_range,
+            bit_depth: 8,
+            color: crate::color::ColorInfo::sdr(s.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(display_height)), s.full_range),
             pts,
         }
     }

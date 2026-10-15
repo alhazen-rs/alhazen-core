@@ -4,7 +4,7 @@
 use fast_image_resize::images::{Image, ImageRef};
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 
-use crate::decode::{PixelLayout, YuvFrame, chroma_size};
+use crate::decode::{PixelLayout, YuvFrame, YuvPlanes, chroma_size};
 
 /// Frames are only scaled when this would shrink them below this share of their size; close
 /// to 1:1 the cost is not worth the softening.
@@ -36,6 +36,7 @@ impl FrameScaler {
     /// rayon pool.
     pub fn downscale(&mut self, frame: &YuvFrame, max: (u32, u32)) -> Option<YuvFrame> {
         let (tw, th) = fit_within(frame.width, frame.height, max)?;
+        let source = frame.u8_planes()?;
         let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear));
         let (cw, ch) = frame.chroma_size();
         let (tcw, tch) = chroma_size(frame.layout, tw, th);
@@ -45,7 +46,7 @@ impl FrameScaler {
             if frame.layout == PixelLayout::I400 && i > 0 {
                 continue;
             }
-            let packed = pack(&frame.planes[i], frame.strides[i], w as usize, h as usize);
+            let packed = pack(&source[i], frame.strides[i], w as usize, h as usize);
             let src = ImageRef::new(w, h, &packed, PixelType::U8).ok()?;
             let mut dst = Image::new(nw, nh, PixelType::U8);
             self.resizer.resize(&src, &mut dst, &options).ok()?;
@@ -55,10 +56,10 @@ impl FrameScaler {
             width: tw,
             height: th,
             layout: frame.layout,
-            planes,
+            planes: YuvPlanes::U8(planes),
+            bit_depth: 8,
             strides: [tw as usize, tcw as usize, tcw as usize],
-            matrix: frame.matrix,
-            full_range: frame.full_range,
+            color: frame.color,
             pts: frame.pts,
         })
     }
@@ -96,18 +97,18 @@ mod tests {
             width: w,
             height: h,
             layout: PixelLayout::I420,
-            planes: [y, vec![90; 32 * 24], vec![200; 32 * 24]],
+            planes: YuvPlanes::U8([y, vec![90; 32 * 24], vec![200; 32 * 24]]),
             strides: [70, 32, 32],
-            matrix: ColorMatrix::Bt709,
-            full_range: false,
+            bit_depth: 8,
+            color: crate::color::ColorInfo::sdr(ColorMatrix::Bt709, false),
             pts: Duration::from_millis(7),
         };
         let small = FrameScaler::default().downscale(&frame, (32, 32)).unwrap();
         assert_eq!((small.width, small.height, small.layout, small.pts), (32, 24, PixelLayout::I420, frame.pts));
-        assert_eq!((small.planes[0].len(), small.planes[1].len(), small.planes[2].len()), (32 * 24, 16 * 12, 16 * 12));
-        assert!(small.planes[1].iter().all(|&v| v == 90) && small.planes[2].iter().all(|&v| v == 200));
+        assert_eq!((small.u8_planes().unwrap()[0].len(), small.u8_planes().unwrap()[1].len(), small.u8_planes().unwrap()[2].len()), (32 * 24, 16 * 12, 16 * 12));
+        assert!(small.u8_planes().unwrap()[1].iter().all(|&v| v == 90) && small.u8_planes().unwrap()[2].iter().all(|&v| v == 200));
         // The ramp survives: left dark, right bright, increasing along the row.
-        let row = &small.planes[0][..32];
+        let row = &small.u8_planes().unwrap()[0][..32];
         assert!(row[0] < 20 && row[31] > 230, "{row:?}");
         assert!(row.windows(2).all(|p| p[0] <= p[1]), "{row:?}");
     }
@@ -118,10 +119,10 @@ mod tests {
             width: 4,
             height: 4,
             layout: PixelLayout::I420,
-            planes: [vec![0; 16], vec![0; 4], vec![0; 4]],
+            planes: YuvPlanes::U8([vec![0; 16], vec![0; 4], vec![0; 4]]),
             strides: [4, 2, 2],
-            matrix: ColorMatrix::Bt709,
-            full_range: false,
+            bit_depth: 8,
+            color: crate::color::ColorInfo::sdr(ColorMatrix::Bt709, false),
             pts: Duration::ZERO,
         };
         assert!(FrameScaler::default().downscale(&frame, (8, 8)).is_none());

@@ -96,7 +96,7 @@ fn check_pictures(name: &str, frames: &[YuvFrame]) {
             eprintln!("no ffmpeg: picture comparison skipped");
             return;
         };
-        let db = psnr(&f.planes.concat(), &reference);
+        let db = psnr(&f.u8_planes().unwrap().concat(), &reference);
         assert!(db >= 30.0, "{name} frame {i} at {}x{}: {db:.1} dB", f.width, f.height);
     }
 }

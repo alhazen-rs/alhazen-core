@@ -5,24 +5,42 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crate::decode::YuvFrame;
+
 #[derive(Clone, Debug)]
 pub enum VideoFrame {
-    /// Tightly packed BGRA, `width * 4` bytes per row.
-    Cpu { width: u32, height: u32, bgra: Arc<[u8]>, pts: Duration },
-    // Phase 4 (macOS): MacSurface(CVPixelBuffer)
+    /// Tightly packed BGRA, `width * 4` bytes per row. Always SDR.
+    Bgra { width: u32, height: u32, bgra: Arc<[u8]>, pts: Duration },
+    /// Planar YUV: 8-bit, or 10-bit when `FrameFormat::Yuv10` was asked for.
+    Yuv(Arc<YuvFrame>),
 }
 
 impl VideoFrame {
     pub fn pts(&self) -> Duration {
         match self {
-            VideoFrame::Cpu { pts, .. } => *pts,
+            VideoFrame::Bgra { pts, .. } => *pts,
+            VideoFrame::Yuv(f) => f.pts,
         }
     }
     pub fn size(&self) -> (u32, u32) {
         match self {
-            VideoFrame::Cpu { width, height, .. } => (*width, *height),
+            VideoFrame::Bgra { width, height, .. } => (*width, *height),
+            VideoFrame::Yuv(f) => (f.width, f.height),
         }
     }
+}
+
+/// A frame format the renderer can draw (`PlayerConfig::frame_formats`, most preferred first).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameFormat {
+    /// BGRA, always SDR; always available as the fallback.
+    Bgra,
+    /// 8-bit planar YUV with its colour description.
+    Yuv,
+    /// Planar YUV keeping 10-bit samples (16-bit planes) and HDR metadata.
+    Yuv10,
+    /// macOS: VideoToolbox's own pixel buffer, for zero-copy drawing (SDR sources only).
+    Native,
 }
 
 struct Inner {
@@ -136,7 +154,7 @@ mod tests {
     use std::thread;
 
     fn frame(ms: u64) -> VideoFrame {
-        VideoFrame::Cpu { width: 1, height: 1, bgra: Arc::from(vec![0u8; 4]), pts: Duration::from_millis(ms) }
+        VideoFrame::Bgra { width: 1, height: 1, bgra: Arc::from(vec![0u8; 4]), pts: Duration::from_millis(ms) }
     }
 
     #[test]

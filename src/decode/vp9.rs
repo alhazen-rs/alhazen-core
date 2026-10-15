@@ -74,10 +74,10 @@ fn convert(pic: &vp9_mt::Picture) -> Result<YuvFrame> {
         width: w,
         height: h,
         layout,
-        planes: [y, u, v],
+        planes: crate::decode::YuvPlanes::U8([y, u, v]),
         strides: [w as usize, cw, cw],
-        matrix,
-        full_range: pic.full_range(),
+        bit_depth: 8,
+        color: crate::color::ColorInfo::sdr(matrix, pic.full_range()),
         pts: Duration::from_nanos(pic.pts.unwrap_or(0).max(0) as u64),
     })
 }
@@ -114,7 +114,7 @@ mod tests {
         assert_eq!(frames.len(), 60);
         let f = &frames[0];
         assert_eq!((f.width, f.height, f.layout), (320, 240, PixelLayout::I420));
-        assert_eq!((f.planes[0].len(), f.planes[1].len()), (320 * 240, 160 * 120));
+        assert_eq!((f.u8_planes().unwrap()[0].len(), f.u8_planes().unwrap()[1].len()), (320 * 240, 160 * 120));
         assert!(frames.windows(2).all(|w| w[0].pts < w[1].pts), "frames come out in display order");
         assert_eq!(frames[30].pts, Duration::from_secs(1));
     }
@@ -124,7 +124,7 @@ mod tests {
         let frames = decode_all(webm("vp9_10bit.webm"));
         assert_eq!(frames.len(), 60);
         // testsrc2's frame has bright and dark areas; 10-bit samples shifted by 2 span most of 0..=255.
-        let y = &frames[0].planes[0];
+        let y = &frames[0].u8_planes().unwrap()[0];
         assert!(*y.iter().max().unwrap() > 200 && *y.iter().min().unwrap() < 40);
     }
 

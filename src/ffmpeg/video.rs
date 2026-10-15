@@ -95,10 +95,10 @@ impl FfmpegVideoDecoder {
             width,
             height,
             layout: PixelLayout::I420,
-            planes: [data, u, v],
+            planes: crate::decode::YuvPlanes::U8([data, u, v]),
             strides: [width as usize, cw as usize, cw as usize],
-            matrix: matrix.and_then(ColorMatrix::from_h273).unwrap_or_else(|| ColorMatrix::guess_for_height(height)),
-            full_range: full_range.unwrap_or(false),
+            bit_depth: 8,
+            color: crate::color::ColorInfo::sdr(matrix.and_then(ColorMatrix::from_h273).unwrap_or_else(|| ColorMatrix::guess_for_height(height)), full_range.unwrap_or(false)),
             pts,
         }))
     }

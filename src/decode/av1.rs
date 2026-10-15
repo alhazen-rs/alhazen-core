@@ -182,10 +182,10 @@ unsafe fn copy_picture(pic: &Dav1dPicture) -> YuvFrame {
         width: w,
         height: h,
         layout,
-        planes,
+        planes: crate::decode::YuvPlanes::U8(planes),
         strides: [w as usize, cw as usize, cw as usize],
-        matrix,
-        full_range,
+        bit_depth: 8,
+        color: crate::color::ColorInfo::sdr(matrix, full_range),
         pts: Duration::from_nanos(pic.m.timestamp.max(0) as u64),
     }
 }
@@ -218,9 +218,9 @@ mod tests {
         assert_eq!(frames.len(), 60);
         let f = &frames[0];
         assert_eq!((f.width, f.height, f.layout), (320, 240, PixelLayout::I420));
-        assert_eq!(f.planes[0].len(), 320 * 240);
-        assert_eq!(f.planes[1].len(), 160 * 120);
-        assert_eq!(f.matrix, ColorMatrix::Bt601);
+        assert_eq!(f.u8_planes().unwrap()[0].len(), 320 * 240);
+        assert_eq!(f.u8_planes().unwrap()[1].len(), 160 * 120);
+        assert_eq!(f.color.matrix, ColorMatrix::Bt601);
         assert!(frames.windows(2).all(|w| w[0].pts < w[1].pts), "frames come out in display order");
     }
 

@@ -108,7 +108,7 @@ mod backend {
         fn supports_video(&self, stream: &StreamInfo) -> bool {
             self.supports(stream, StreamKind::Video)
         }
-        fn open_video_decoder(&self, stream: &StreamInfo, _threads: usize) -> Result<Box<dyn VideoDecoder>> {
+        fn open_video_decoder(&self, stream: &StreamInfo, _threads: usize, _prefs: crate::output::OutputPrefs) -> Result<Box<dyn VideoDecoder>> {
             let info = self.ffmpeg().ok_or(Error::Unsupported("ffmpeg not found"))?;
             Ok(Box::new(super::FfmpegVideoDecoder::new(info, stream, self.config.hwaccel)?))
         }
@@ -165,7 +165,7 @@ mod backend {
             });
             let h264 = StreamInfo::new(1, StreamKind::Video, Codec::H264);
             assert!(!b.supports_video(&h264));
-            assert!(b.open_video_decoder(&h264, 1).is_err());
+            assert!(b.open_video_decoder(&h264, 1, Default::default()).is_err());
         }
 
         #[test]

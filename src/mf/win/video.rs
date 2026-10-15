@@ -275,10 +275,10 @@ fn read_frame(sample: &IMFSample, out: &OutFormat) -> Result<YuvFrame> {
             width: w,
             height: h,
             layout: PixelLayout::I420,
-            planes: [y, u, v],
+            planes: crate::decode::YuvPlanes::U8([y, u, v]),
             strides: [w as usize, cw as usize, cw as usize],
-            matrix: out.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(h)),
-            full_range: out.full_range,
+            bit_depth: 8,
+            color: crate::color::ColorInfo::sdr(out.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(h)), out.full_range),
             pts,
         })
     }

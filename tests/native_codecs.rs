@@ -22,7 +22,7 @@ fn native_first_frame(name: &str) -> YuvFrame {
     let registry = Registry::empty_with_native();
     let mut demuxer = registry.open_demuxer(&source, format, src, None).unwrap();
     let stream = demuxer.streams().iter().find(|s| s.kind == StreamKind::Video).unwrap().clone();
-    let mut dec = registry.open_video_decoder(&stream, 2, None).unwrap();
+    let mut dec = registry.open_video_decoder(&stream, 2, Default::default(), None).unwrap();
     while let Some(p) = demuxer.next_packet().unwrap() {
         if p.stream != stream.id {
             continue;
@@ -58,13 +58,13 @@ fn check(name: &str, layout: PixelLayout, pix_fmt: &str, min_db: f64) {
         eprintln!("skipped {name}: ffmpeg not found on PATH");
         return;
     };
-    let ours: Vec<u8> = native.planes.concat();
+    let ours: Vec<u8> = native.u8_planes().unwrap().concat();
     let db = psnr(&ours, &reference);
     assert!(db >= min_db, "{name}: PSNR {db:.1} dB < {min_db} dB");
     // The bottom rows separately: errors confined to the last macroblock row barely move the
     // whole-frame figure.
     let mut offset = 0;
-    for (i, plane) in native.planes.iter().enumerate() {
+    for (i, plane) in native.u8_planes().unwrap().iter().enumerate() {
         let stride = native.strides[i];
         let rows = plane.len() / stride;
         let tail = (rows.saturating_sub(16) * stride)..plane.len();

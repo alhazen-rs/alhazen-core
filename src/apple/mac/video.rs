@@ -424,10 +424,10 @@ unsafe fn copy_out(pb: &CVImageBuffer, pts: CMTime, sink: &Sink) -> std::result:
         width: w,
         height: h,
         layout,
-        planes,
+        planes: crate::decode::YuvPlanes::U8(planes),
         strides: [w as usize, cw as usize, cw as usize],
-        matrix: sink.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(sink.display_height)),
-        full_range,
+        bit_depth: 8,
+        color: crate::color::ColorInfo::sdr(sink.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(sink.display_height)), full_range),
         pts,
     })
 }

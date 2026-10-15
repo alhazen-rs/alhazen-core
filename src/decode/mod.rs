@@ -61,6 +61,7 @@ pub use vp9::Vp9Decoder;
 
 use crate::Result;
 use crate::demux::Packet;
+pub use crate::color::{ColorInfo, ColorMatrix};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelLayout {
@@ -71,46 +72,45 @@ pub enum PixelLayout {
     I444,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ColorMatrix {
-    Bt601,
-    Bt709,
-    Bt2020,
+/// The samples of a planar YUV picture: 8-bit, or 16-bit holding up to 16 significant bits,
+/// LSB-aligned (0–1023 for 10-bit).
+#[derive(Clone, Debug)]
+pub enum YuvPlanes {
+    U8([Vec<u8>; 3]),
+    U16([Vec<u16>; 3]),
 }
 
-impl ColorMatrix {
-    /// From an ITU-T H.273 MatrixCoefficients value (as in containers and codec headers).
-    pub fn from_h273(m: u8) -> Option<ColorMatrix> {
-        match m {
-            1 => Some(ColorMatrix::Bt709),
-            5 | 6 => Some(ColorMatrix::Bt601),
-            9 | 10 => Some(ColorMatrix::Bt2020),
-            _ => None,
-        }
-    }
-
-    /// Fallback when the stream does not say: HD and larger is BT.709, SD is BT.601.
-    pub fn guess_for_height(height: u32) -> ColorMatrix {
-        if height >= 720 { ColorMatrix::Bt709 } else { ColorMatrix::Bt601 }
-    }
-}
-
-/// A decoded 8-bit planar YUV picture. Higher bit depths are shifted down to 8 bits by the decoder.
+/// A decoded planar YUV picture. 8-bit unless 10-bit output was asked for (`FrameFormat::Yuv10`).
 #[derive(Clone, Debug)]
 pub struct YuvFrame {
     pub width: u32,
     pub height: u32,
     pub layout: PixelLayout,
     /// Y, U, V. U and V are empty for `I400`.
-    pub planes: [Vec<u8>; 3],
-    /// Bytes per row for each plane.
+    pub planes: YuvPlanes,
+    /// Significant bits per sample: 8 for `U8` planes, 10 for 10-bit `U16` planes.
+    pub bit_depth: u8,
+    /// Samples per row for each plane.
     pub strides: [usize; 3],
-    pub matrix: ColorMatrix,
-    pub full_range: bool,
+    pub color: ColorInfo,
     pub pts: Duration,
 }
 
 impl YuvFrame {
+    pub fn u8_planes(&self) -> Option<&[Vec<u8>; 3]> {
+        match &self.planes {
+            YuvPlanes::U8(p) => Some(p),
+            YuvPlanes::U16(_) => None,
+        }
+    }
+
+    pub fn u16_planes(&self) -> Option<&[Vec<u16>; 3]> {
+        match &self.planes {
+            YuvPlanes::U16(p) => Some(p),
+            YuvPlanes::U8(_) => None,
+        }
+    }
+
     /// Chroma plane dimensions for this layout.
     pub fn chroma_size(&self) -> (u32, u32) {
         chroma_size(self.layout, self.width, self.height)

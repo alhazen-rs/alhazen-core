@@ -72,7 +72,7 @@ impl Backend for AppleBackend {
     fn supports_video(&self, stream: &StreamInfo) -> bool {
         rules::stream_ok(stream) && select::claims(stream, &Apple, self.prefer_hardware)
     }
-    fn open_video_decoder(&self, stream: &StreamInfo, _threads: usize) -> Result<Box<dyn VideoDecoder>> {
+    fn open_video_decoder(&self, stream: &StreamInfo, _threads: usize, _prefs: crate::output::OutputPrefs) -> Result<Box<dyn VideoDecoder>> {
         Ok(Box::new(VtVideoDecoder::new(stream)?))
     }
     fn supports_audio(&self, stream: &StreamInfo) -> bool {

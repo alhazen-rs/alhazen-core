@@ -12,6 +12,7 @@ use super::audio_thread::AudioLoop;
 use super::speed::SpeedMonitor;
 use super::PlayerState;
 use crate::backend::Registry;
+use crate::output::OutputPrefs;
 use super::{Command, PlayerEvent, Shared};
 use crate::audio::OutputShared;
 use crate::convert::yuv_to_bgra;
@@ -465,7 +466,7 @@ impl DecodeLoop {
     fn switch_backend(&mut self, shared: &Shared, why: &str) -> bool {
         let Some(f) = self.fallback.take() else { return false };
         let codec = &f.stream.codec;
-        match f.registry.open_video_decoder_except(&f.stream, f.threads, f.order.as_deref(), Some(f.current)) {
+        match f.registry.open_video_decoder_except(&f.stream, f.threads, OutputPrefs::for_stream(&shared.frame_formats, &f.stream), f.order.as_deref(), Some(f.current)) {
             Ok((name, decoder)) => {
                 let _ = shared.events.send(PlayerEvent::Warning(format!(
                     "{} {codec} {why}; switching to {name}",
@@ -503,7 +504,7 @@ impl DecodeLoop {
             return false;
         }
         let Some(r) = self.reopen.clone() else { return true };
-        match r.registry.open_video_decoder_except(&info, r.threads, r.order.as_deref(), None) {
+        match r.registry.open_video_decoder_except(&info, r.threads, OutputPrefs::for_stream(&shared.frame_formats, &info), r.order.as_deref(), None) {
             Ok((name, decoder)) => {
                 log::info!("video format changed ({} {}x{}): decoding with {name}", info.codec, info.width, info.height);
                 self.decoder = decoder;
@@ -568,22 +569,28 @@ impl DecodeLoop {
             shared.queue.note_skipped();
             return true;
         }
-        let mut bgra = Vec::new();
         let start = Instant::now();
         let scaler = &mut self.scaler;
         let max = shared.max_output_size();
-        let converted = self.pool.install(|| {
-            let scaled = max.and_then(|max| scaler.downscale(&f, max));
-            let f = scaled.as_ref().unwrap_or(&f);
-            yuv_to_bgra(f, &mut bgra).map(|()| (f.width, f.height))
-        });
-        let (out_w, out_h) = match converted {
-            Ok(size) => size,
-            Err(e) => return self.on_decode_error(shared, e),
+        let frame = if crate::output::planes_first(&shared.frame_formats) {
+            let scaled = self.pool.install(|| max.and_then(|max| scaler.downscale(&f, max)));
+            VideoFrame::Yuv(Arc::new(scaled.unwrap_or(f)))
+        } else {
+            let mut bgra = Vec::new();
+            let converted = self.pool.install(|| {
+                let scaled = max.and_then(|max| scaler.downscale(&f, max));
+                let f = scaled.as_ref().unwrap_or(&f);
+                yuv_to_bgra(f, &mut bgra).map(|()| (f.width, f.height))
+            });
+            let (width, height) = match converted {
+                Ok(size) => size,
+                Err(e) => return self.on_decode_error(shared, e),
+            };
+            VideoFrame::Bgra { width, height, bgra: bgra.into(), pts: f.pts }
         };
+        shared.set_conversion("cpu");
         let cost = std::mem::take(&mut self.busy) + start.elapsed();
-        self.check_speed(shared, cost, f.pts);
-        let frame = VideoFrame::Cpu { width: out_w, height: out_h, bgra: bgra.into(), pts: f.pts };
+        self.check_speed(shared, cost, frame.pts());
         let first = shared.ready_generation.load(Ordering::SeqCst) != self.generation;
         {
             let _guard = shared.seek_lock.lock().unwrap();
@@ -591,9 +598,9 @@ impl DecodeLoop {
                 // Superseded by a newer seek: must not touch the clock or the queue.
                 return !shared.shutdown.load(Ordering::SeqCst);
             }
-            if first && !shared.audio_master && f.pts > shared.clock.now() {
+            if first && !shared.audio_master && frame.pts() > shared.clock.now() {
                 // Seeked before the first frame: start the clock at the first frame instead.
-                shared.clock.set(f.pts);
+                shared.clock.set(frame.pts());
             }
         }
         let pts = frame.pts();
@@ -725,6 +732,9 @@ mod tests {
             video_backend: Mutex::new(None),
             max_output_size: AtomicU64::new(0),
             diag: Default::default(),
+            frame_formats: vec![crate::frame::FrameFormat::Bgra],
+            conversion: Mutex::new("none"),
+            hdr: Mutex::new(crate::color::Transfer::Sdr),
         }
     }
 
@@ -733,10 +743,10 @@ mod tests {
             width: 2,
             height: 2,
             layout: PixelLayout::I420,
-            planes: [vec![16; 4], vec![128], vec![128]],
+            planes: crate::decode::YuvPlanes::U8([vec![16; 4], vec![128], vec![128]]),
             strides: [2, 1, 1],
-            matrix: ColorMatrix::Bt601,
-            full_range: false,
+            bit_depth: 8,
+            color: crate::color::ColorInfo::sdr(ColorMatrix::Bt601, false),
             pts,
         }
     }
@@ -763,7 +773,7 @@ mod tests {
         fn supports_video(&self, _: &StreamInfo) -> bool {
             true
         }
-        fn open_video_decoder(&self, _: &StreamInfo, _: usize) -> Result<Box<dyn VideoDecoder>> {
+        fn open_video_decoder(&self, _: &StreamInfo, _: usize, _prefs: crate::output::OutputPrefs) -> Result<Box<dyn VideoDecoder>> {
             Ok(Box::new(NoDecoder))
         }
     }
@@ -830,6 +840,37 @@ mod tests {
             decode.present(&shared, frame(pts));
             assert!(shared.queue.frame_for(pts).is_some(), "on-time frame {i} skipped");
         }
+    }
+
+    fn shared_with(formats: Vec<crate::frame::FrameFormat>) -> Shared {
+        let mut s = shared(Arc::new(MockClock::new()));
+        s.frame_formats = formats;
+        s
+    }
+
+    #[test]
+    fn yuv_listed_first_is_delivered_without_conversion() {
+        use crate::frame::FrameFormat;
+        let shared = shared_with(vec![FrameFormat::Yuv, FrameFormat::Bgra]);
+        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+        let mut decode = DecodeLoop::new(Box::new(NoDecoder), pool);
+        assert!(decode.present(&shared, frame(Duration::ZERO)));
+        match shared.queue.frame_for(Duration::ZERO).expect("a frame") {
+            VideoFrame::Yuv(f) => assert_eq!((f.width, f.height, f.bit_depth), (2, 2, 8)),
+            other => panic!("expected Yuv, got {other:?}"),
+        }
+        assert_eq!(shared.conversion(), "cpu");
+    }
+
+    #[test]
+    fn bgra_default_converts_on_cpu() {
+        use crate::frame::FrameFormat;
+        let shared = shared_with(vec![FrameFormat::Bgra]);
+        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+        let mut decode = DecodeLoop::new(Box::new(NoDecoder), pool);
+        assert!(decode.present(&shared, frame(Duration::ZERO)));
+        assert!(matches!(shared.queue.frame_for(Duration::ZERO), Some(VideoFrame::Bgra { .. })));
+        assert_eq!(shared.conversion(), "cpu");
     }
 
     #[test]

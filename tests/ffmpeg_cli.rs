@@ -52,7 +52,7 @@ fn decodes_h264_from_mp4_with_packet_timestamps() {
     let mut d = Mp4Demuxer::open(Box::new(FileSource::open(fixture_path("h264_aac.mp4")).unwrap())).unwrap();
     let stream = d.streams().iter().find(|s| s.kind == StreamKind::Video).unwrap().clone();
     assert!(b.supports_video(&stream));
-    let mut dec = b.open_video_decoder(&stream, 1).unwrap();
+    let mut dec = b.open_video_decoder(&stream, 1, Default::default()).unwrap();
     let mut pts = vec![];
     let mut frames = vec![];
     while let Some(p) = d.next_packet().unwrap() {
@@ -73,7 +73,7 @@ fn decodes_h264_from_mp4_with_packet_timestamps() {
     assert_eq!(frames.len(), 30);
     assert_eq!(frames.iter().map(|f| f.pts).collect::<Vec<_>>(), pts, "presentation order, packet pts");
     let f = &frames[0];
-    assert_eq!((f.width, f.height, f.layout, f.planes[0].len()), (320, 240, PixelLayout::I420, 320 * 240));
+    assert_eq!((f.width, f.height, f.layout, f.u8_planes().unwrap()[0].len()), (320, 240, PixelLayout::I420, 320 * 240));
 }
 
 /// Starting at an open-GOP (CRA) keyframe, as after a seek, ffmpeg skips the leading frames that
@@ -90,7 +90,7 @@ fn frames_keep_their_timestamps_when_ffmpeg_skips_some() {
     }
     let packets: Vec<_> = std::iter::from_fn(|| d.next_packet().unwrap()).collect();
     let key = packets.iter().position(|p| p.keyframe && p.pts == Duration::from_secs(1)).expect("keyframe at 1 s");
-    let mut dec = b.open_video_decoder(&stream, 1).unwrap();
+    let mut dec = b.open_video_decoder(&stream, 1, Default::default()).unwrap();
     let mut shown = vec![];
     for p in &packets[key..] {
         dec.send_packet(p).unwrap();
@@ -120,7 +120,7 @@ fn ffmpeg_first_frame(b: &FfmpegCliBackend, name: &str) -> Option<alhazen_core::
     if !b.supports_video(&stream) {
         return None;
     }
-    let mut dec = b.open_video_decoder(&stream, 1).unwrap();
+    let mut dec = b.open_video_decoder(&stream, 1, Default::default()).unwrap();
     while let Some(p) = d.next_packet().unwrap() {
         if p.stream == stream.id {
             dec.send_packet(&p).unwrap();
@@ -136,7 +136,7 @@ fn ffmpeg_frames_carry_the_streams_colour_matrix_and_range() {
     let Some(b) = backend() else { return };
     let f = ffmpeg_first_frame(&b, "h264_bt709.mp4").unwrap();
     // 320x240 would be guessed BT.601; the stream says BT.709.
-    assert_eq!((f.matrix, f.full_range), (alhazen_core::decode::ColorMatrix::Bt709, false));
+    assert_eq!((f.color.matrix, f.color.full_range), (alhazen_core::decode::ColorMatrix::Bt709, false));
     let Some(f) = ffmpeg_first_frame(&b, "mjpeg_full_range.mkv") else {
         eprintln!("skipped MJPEG: no mjpeg decoder");
         return;
@@ -144,8 +144,8 @@ fn ffmpeg_frames_carry_the_streams_colour_matrix_and_range() {
     // ffmpeg ≥ 7 keeps JPEG's full range; older versions convert to limited range. Either way
     // the tag must match the samples: white above 236 only exists in full range (limited tops
     // out at 235; lossy MJPEG pulls full-range white a little below 255).
-    let white = *f.planes[0].iter().max().unwrap();
-    if f.full_range {
+    let white = *f.u8_planes().unwrap()[0].iter().max().unwrap();
+    if f.color.full_range {
         assert!(white > 236, "tagged full range but white is {white}");
     } else {
         assert!(white <= 236, "tagged limited range but white is {white}");
@@ -161,7 +161,7 @@ fn decodes_hevc_from_matroska() {
         eprintln!("skipped: this ffmpeg has no HEVC decoder");
         return;
     }
-    let mut dec = b.open_video_decoder(&stream, 1).unwrap();
+    let mut dec = b.open_video_decoder(&stream, 1, Default::default()).unwrap();
     let mut n = 0;
     while let Some(p) = d.next_packet().unwrap() {
         dec.send_packet(&p).unwrap();
@@ -308,7 +308,7 @@ fn first_frame_arrives_before_end_of_input() {
     let Some(b) = backend() else { return };
     let mut d = Mp4Demuxer::open(Box::new(FileSource::open(fixture_path("h264_aac.mp4")).unwrap())).unwrap();
     let stream = d.streams().iter().find(|s| s.kind == StreamKind::Video).unwrap().clone();
-    let mut dec = b.open_video_decoder(&stream, 1).unwrap();
+    let mut dec = b.open_video_decoder(&stream, 1, Default::default()).unwrap();
     let mut sent = 0;
     while let Some(p) = d.next_packet().unwrap() {
         if p.stream != stream.id {
@@ -390,7 +390,7 @@ fn ffmpeg_killed_mid_stream_is_an_error_not_a_hang() {
     let b = FfmpegCliBackend::new(FfmpegConfig { path: Some(script), hwaccel: false, ..Default::default() });
     let mut d = MatroskaDemuxer::open(Box::new(FileSource::open(fixture_path("hevc.mkv")).unwrap())).unwrap();
     let stream = d.streams()[0].clone();
-    let mut dec = b.open_video_decoder(&stream, 1).unwrap();
+    let mut dec = b.open_video_decoder(&stream, 1, Default::default()).unwrap();
     let start = Instant::now();
     let mut result = Ok(());
     // Feed slowly so the kill lands mid-stream.
@@ -434,7 +434,7 @@ fn ffmpeg_that_stops_reading_is_an_error_not_a_hang() {
     let b = FfmpegCliBackend::new(FfmpegConfig { path: Some(script), hwaccel: false, ..Default::default() });
     let mut stream = alhazen_core::demux::StreamInfo::new(1, StreamKind::Video, alhazen_core::demux::Codec::H264);
     (stream.width, stream.height) = (320, 240);
-    let mut dec = b.open_video_decoder(&stream, 1).unwrap();
+    let mut dec = b.open_video_decoder(&stream, 1, Default::default()).unwrap();
     let start = Instant::now();
     let mut result = Ok(());
     for i in 0..1000u64 {

@@ -114,7 +114,7 @@ fn pictures_match_ffmpeg() {
         ("vp9_10bit.webm", 35.0),
     ] {
         let f = &decode(name, None)[0];
-        let ours: Vec<u8> = f.planes.concat();
+        let ours: Vec<u8> = f.u8_planes().unwrap().concat();
         let Some(reference) = ffmpeg_first_frame(name) else {
             eprintln!("skipped comparison: no ffmpeg");
             return;
@@ -165,7 +165,7 @@ fn two_decoders_on_two_threads() {
     // Each thread got its own pictures, intact (bit-exact vs ffmpeg for these 8-bit streams).
     for (name, frames) in [("av1.webm", &a), ("h264_aac.mp4", &b)] {
         let Some(reference) = ffmpeg_first_frame(name) else { return };
-        assert_eq!(psnr(&frames[0].planes.concat(), &reference), f64::INFINITY, "{name}");
+        assert_eq!(psnr(&frames[0].u8_planes().unwrap().concat(), &reference), f64::INFINITY, "{name}");
     }
 }
 
@@ -272,7 +272,7 @@ fn output_hint_changes_apply_at_the_next_keyframe_with_intact_pictures() {
         }
         for (i, f) in frames.iter().enumerate().step_by(3) {
             let Some(reference) = ffmpeg_frame(name, i, (f.width, f.height)) else { return };
-            let db = psnr(&f.planes.concat(), &reference);
+            let db = psnr(&f.u8_planes().unwrap().concat(), &reference);
             assert!(db >= 25.0, "{name} frame {i} at {}x{}: {db:.1} dB (corrupt?)", f.width, f.height);
         }
     }

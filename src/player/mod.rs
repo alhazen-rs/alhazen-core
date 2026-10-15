@@ -15,7 +15,8 @@ use crate::audio::{AudioClock, AudioOutputConfig, OutputShared, Volume, open_out
 use crate::backend::Registry;
 use crate::clock::{Clock, SystemClock};
 use crate::demux::{self, Demuxer, Metadata, StreamInfo, StreamKind};
-use crate::frame::{FrameQueue, VideoFrame};
+use crate::color::Transfer;
+use crate::frame::{FrameFormat, FrameQueue, VideoFrame};
 use crate::source::Source;
 use crate::{Error, Result};
 
@@ -63,6 +64,11 @@ pub struct PlayerStats {
     /// Frames decoded but never shown because they were late: discarded by the renderer, or
     /// skipped by the decode thread while catching up.
     pub frames_dropped: u64,
+    /// How video frames are made ready: `"gpu"`, `"cpu"`, `"cpu (fallback)"` (a GPU step
+    /// failed), `"zero-copy"` (macOS native frames), or `"none"` before the first frame.
+    pub conversion: &'static str,
+    /// The video's transfer function: `Sdr`, or `Pq`/`Hlg` for HDR (tone mapped for `Bgra`).
+    pub hdr: Transfer,
 }
 
 #[derive(Clone)]
@@ -97,6 +103,9 @@ pub struct PlayerConfig {
     /// AV1 through Media Foundation on Windows). `false` keeps native first. Ignored when
     /// `registry` is set.
     pub prefer_hardware: bool,
+    /// Frame formats the renderer can draw, most preferred first. `Bgra` is always the fallback,
+    /// listed or not. Default: `[Bgra]`.
+    pub frame_formats: Vec<FrameFormat>,
 }
 
 impl Default for PlayerConfig {
@@ -116,6 +125,7 @@ impl Default for PlayerConfig {
             auto_fallback: true,
             max_output_size: None,
             prefer_hardware: true,
+            frame_formats: vec![FrameFormat::Bgra],
         }
     }
 }
@@ -191,6 +201,22 @@ pub(crate) struct Shared {
     pub max_output_size: AtomicU64,
     /// What each pipeline thread is doing, for `Player::debug_snapshot`.
     pub diag: Diag,
+    /// `PlayerConfig::frame_formats`.
+    pub frame_formats: Vec<FrameFormat>,
+    /// How the last video frame was made ready (`PlayerStats::conversion`).
+    pub conversion: Mutex<&'static str>,
+    /// The video's transfer function, from the frames decoded (`PlayerStats::hdr`).
+    pub hdr: Mutex<Transfer>,
+}
+
+impl Shared {
+    pub fn conversion(&self) -> &'static str {
+        *self.conversion.lock().unwrap()
+    }
+
+    pub fn set_conversion(&self, how: &'static str) {
+        *self.conversion.lock().unwrap() = how;
+    }
 }
 
 /// What each pipeline thread is doing and at which timestamp (diagnosing stalls). Each slot
@@ -445,7 +471,7 @@ impl Player {
 
         let video = streams.iter().find(|s| s.kind == StreamKind::Video).cloned();
         let video_decoder = match &video {
-            Some(v) => Some(registry.open_video_decoder_except(v, config.decoder_threads, order, None)?),
+            Some(v) => Some(registry.open_video_decoder_except(v, config.decoder_threads, crate::output::OutputPrefs::for_stream(&config.frame_formats, v), order, None)?),
             None => None,
         };
 
@@ -508,6 +534,9 @@ impl Player {
             video_backend: Mutex::new(video_decoder.as_ref().map(|(name, _)| *name)),
             max_output_size: AtomicU64::new(pack_size(config.max_output_size)),
             diag: Diag::default(),
+            frame_formats: config.frame_formats.clone(),
+            conversion: Mutex::new("none"),
+            hdr: Mutex::new(Transfer::Sdr),
         });
         let pool = config.thread_pool.clone().unwrap_or_else(shared_thread_pool);
         let reopen = pipeline::Reopen {
@@ -648,6 +677,8 @@ impl Player {
         PlayerStats {
             video_backend: *self.shared.video_backend.lock().unwrap(),
             frames_dropped: self.shared.queue.dropped() + self.shared.queue.skipped(),
+            conversion: self.shared.conversion(),
+            hdr: *self.shared.hdr.lock().unwrap(),
         }
     }
 

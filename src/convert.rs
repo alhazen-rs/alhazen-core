@@ -10,8 +10,9 @@ use crate::{Error, Result};
 pub fn yuv_to_bgra(frame: &YuvFrame, out: &mut Vec<u8>) -> Result<()> {
     let (w, h) = (frame.width, frame.height);
     out.resize(w as usize * h as usize * 4, 0);
-    let range = if frame.full_range { YuvRange::Full } else { YuvRange::Limited };
-    let matrix = match frame.matrix {
+    let planes = frame.u8_planes().ok_or_else(|| Error::Decode("16-bit frame on the 8-bit path".into()))?;
+    let range = if frame.color.full_range { YuvRange::Full } else { YuvRange::Limited };
+    let matrix = match frame.color.matrix {
         ColorMatrix::Bt601 => YuvStandardMatrix::Bt601,
         ColorMatrix::Bt709 => YuvStandardMatrix::Bt709,
         ColorMatrix::Bt2020 => YuvStandardMatrix::Bt2020,
@@ -19,7 +20,7 @@ pub fn yuv_to_bgra(frame: &YuvFrame, out: &mut Vec<u8>) -> Result<()> {
     let stride = w * 4;
     let result = if frame.layout == PixelLayout::I400 {
         let gray = YuvGrayImage {
-            y_plane: &frame.planes[0],
+            y_plane: &planes[0],
             y_stride: frame.strides[0] as u32,
             width: w,
             height: h,
@@ -27,11 +28,11 @@ pub fn yuv_to_bgra(frame: &YuvFrame, out: &mut Vec<u8>) -> Result<()> {
         yuv::yuv400_to_bgra(&gray, out, stride, range, matrix)
     } else {
         let image = YuvPlanarImage {
-            y_plane: &frame.planes[0],
+            y_plane: &planes[0],
             y_stride: frame.strides[0] as u32,
-            u_plane: &frame.planes[1],
+            u_plane: &planes[1],
             u_stride: frame.strides[1] as u32,
-            v_plane: &frame.planes[2],
+            v_plane: &planes[2],
             v_stride: frame.strides[2] as u32,
             width: w,
             height: h,
@@ -56,10 +57,10 @@ mod tests {
             width: w,
             height: h,
             layout: PixelLayout::I420,
-            planes: [vec![y; 16], vec![u; 4], vec![v; 4]],
+            planes: crate::decode::YuvPlanes::U8([vec![y; 16], vec![u; 4], vec![v; 4]]),
             strides: [4, 2, 2],
-            matrix,
-            full_range,
+            bit_depth: 8,
+            color: crate::color::ColorInfo::sdr(matrix, full_range),
             pts: Duration::ZERO,
         }
     }
@@ -97,8 +98,10 @@ mod tests {
     fn grayscale_layout() {
         let mut f = solid(235, 0, 0, false, ColorMatrix::Bt709);
         f.layout = PixelLayout::I400;
-        f.planes[1].clear();
-        f.planes[2].clear();
+        if let crate::decode::YuvPlanes::U8(p) = &mut f.planes {
+            p[1].clear();
+            p[2].clear();
+        }
         assert!(close(first_pixel(&f), [255, 255, 255, 255]));
     }
 }

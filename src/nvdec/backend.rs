@@ -65,7 +65,7 @@ impl Backend for NvdecBackend {
     fn supports_video(&self, stream: &StreamInfo) -> bool {
         select::claims(stream, &Gpu, self.prefer_hardware) && fits(stream)
     }
-    fn open_video_decoder(&self, stream: &StreamInfo, _threads: usize) -> Result<Box<dyn VideoDecoder>> {
+    fn open_video_decoder(&self, stream: &StreamInfo, _threads: usize, _prefs: crate::output::OutputPrefs) -> Result<Box<dyn VideoDecoder>> {
         Ok(Box::new(NvdecVideoDecoder::new(stream)?))
     }
 }
