@@ -501,7 +501,7 @@ fn parse_esds_asc(esds: &[u8]) -> Option<Vec<u8>> {
 
 /// The esds DecoderConfigDescriptor's objectTypeIndication (0x40 AAC, 0x6B/0x69 MP3, …) and the
 /// DecoderSpecificInfo (AudioSpecificConfig for AAC), if present.
-fn parse_esds(esds: &[u8]) -> Option<(u8, Option<Vec<u8>>)> {
+pub(crate) fn parse_esds(esds: &[u8]) -> Option<(u8, Option<Vec<u8>>)> {
     /// Tag and expandable length (1–4 bytes, high bit = more) at `pos`; returns (tag, len, body start).
     fn descriptor(d: &[u8], pos: usize) -> Option<(u8, usize, usize)> {
         let tag = *d.get(pos)?;

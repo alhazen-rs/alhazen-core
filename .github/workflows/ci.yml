@@ -44,7 +44,8 @@ jobs:
           path: target/aac-vectors
           key: aac-vectors-${{ hashFiles('scripts/fetch_aac_vectors.py') }}
       - run: python3 scripts/fetch_aac_vectors.py target/aac-vectors
-      - run: cargo test --locked
+      # --no-fail-fast: one failing test binary must not hide the others' results.
+      - run: cargo test --locked --no-fail-fast
         timeout-minutes: 40
         env:
           AAC_VECTORS_DIR: target/aac-vectors

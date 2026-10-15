@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use super::audio::AudioBuffer;
 
-#[cfg_attr(not(any(feature = "native-aac", feature = "native-mp3", feature = "ffmpeg-cli", all(windows, feature = "media-foundation"))), allow(dead_code))]
+#[cfg_attr(not(any(feature = "native-aac", feature = "native-mp3", feature = "ffmpeg-cli", all(windows, feature = "media-foundation"), all(target_os = "macos", feature = "videotoolbox"))), allow(dead_code))]
 pub(crate) struct DelayTrim {
     delay: Duration,
     /// Frames still to drop, at the output rate (computed when the first buffer's rate is known).
@@ -15,7 +15,7 @@ pub(crate) struct DelayTrim {
     end: Option<Duration>,
 }
 
-#[cfg_attr(not(any(feature = "native-aac", feature = "native-mp3", feature = "ffmpeg-cli", all(windows, feature = "media-foundation"))), allow(dead_code))]
+#[cfg_attr(not(any(feature = "native-aac", feature = "native-mp3", feature = "ffmpeg-cli", all(windows, feature = "media-foundation"), all(target_os = "macos", feature = "videotoolbox"))), allow(dead_code))]
 impl DelayTrim {
     pub fn new(codec_delay: Duration) -> Self {
         Self { delay: codec_delay, skip: None, armed: true, end: None }

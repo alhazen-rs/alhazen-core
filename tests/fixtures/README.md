@@ -215,3 +215,11 @@ packed audio is assembled by the script itself, as ffmpeg's HLS muxer writes TS 
   starts over.
 - `hls/wrap/`: TS VOD whose 33-bit clock starts at 95441 s and wraps 2.7 s in.
 - `long_gop.ts`: 160×90 H.264 with 10 s GOPs, 12 s (seeking must not scan the whole file).
+
+## Apple decoders (5.1 Dolby)
+
+```bash
+for codec in ac3 eac3; do ffmpeg -v error -y -f lavfi -i "sine=f=220:d=2" -f lavfi -i "sine=f=330:d=2" -f lavfi -i "sine=f=440:d=2" -f lavfi -i "sine=f=60:d=2" -f lavfi -i "sine=f=550:d=2" -f lavfi -i "sine=f=660:d=2" -filter_complex "[0][1][2][3][4][5]join=inputs=6:channel_layout=5.1:map=0.0-FL|1.0-FR|2.0-FC|3.0-LFE|4.0-BL|5.0-BR" -c:a $codec -b:a 384k ${codec}_51.mkv; done
+```
+
+- `ac3_51.mkv`, `eac3_51.mkv`: 5.1 with a different tone on every channel (220, 330, 440, 60, 550, 660 Hz), so a decoder that outputs the channels in another order fails the comparison with ffmpeg (`tests/videotoolbox.rs`).

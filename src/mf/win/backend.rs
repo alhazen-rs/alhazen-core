@@ -16,8 +16,8 @@ struct Installed;
 
 impl Catalogue for Installed {
     fn has_decoder(&self, codec: HwCodec, hardware_only: bool) -> bool {
-        if codec == HwCodec::Vp8 {
-            return false; // our VP8 decoder is used on Windows, as before NVDEC existed
+        if matches!(codec, HwCodec::Vp8 | HwCodec::ProRes) {
+            return false; // VP8: our decoder is used on Windows; ProRes: no Windows decoder
         }
         static FOUND: OnceLock<Mutex<HashMap<HwCodec, bool>>> = OnceLock::new();
         let found = *FOUND.get_or_init(Default::default).lock().unwrap().entry(codec).or_insert_with(|| {

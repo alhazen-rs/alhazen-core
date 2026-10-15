@@ -8,7 +8,7 @@ use crate::hw::select::HwCodec;
 /// Output subtypes we accept, in order of preference.
 pub fn outputs(codec: HwCodec) -> &'static [GUID] {
     match codec {
-        HwCodec::H264 | HwCodec::Hevc | HwCodec::Vp8 | HwCodec::Vp9 | HwCodec::Av1 => &[MFVideoFormat_NV12, MFVideoFormat_P010],
+        HwCodec::H264 | HwCodec::Hevc | HwCodec::Vp8 | HwCodec::Vp9 | HwCodec::Av1 | HwCodec::ProRes => &[MFVideoFormat_NV12, MFVideoFormat_P010],
         _ => &[MFAudioFormat_Float, MFAudioFormat_PCM],
     }
 }
@@ -23,6 +23,8 @@ pub fn ids(codec: HwCodec) -> (GUID, GUID, GUID) {
         HwCodec::Vp8 => video(MFVideoFormat_VP80),
         HwCodec::Vp9 => video(MFVideoFormat_VP90),
         HwCodec::Av1 => video(MFVideoFormat_AV1),
+        // Never asked: the catalogue refuses ProRes before looking for a decoder.
+        HwCodec::ProRes => video(GUID::zeroed()),
         HwCodec::Aac => audio(MFAudioFormat_AAC),
         HwCodec::Mp3 => audio(MFAudioFormat_MP3),
         HwCodec::Ac3 => audio(MFAudioFormat_Dolby_AC3),

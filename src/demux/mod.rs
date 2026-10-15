@@ -37,6 +37,8 @@ pub(crate) use matroska::split_xiph_lacing;
 pub use mp3::Mp3Demuxer;
 #[cfg(feature = "native")]
 pub use mp4::Mp4Demuxer;
+#[cfg(all(feature = "native", test))]
+pub(crate) use mp4::parse_esds as mp4_parse_esds;
 #[cfg(feature = "native")]
 pub use ogg::OggDemuxer;
 #[cfg(feature = "native")]

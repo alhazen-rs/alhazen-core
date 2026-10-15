@@ -51,11 +51,13 @@ impl Registry {
         let mut r = Self::empty();
         #[cfg(all(windows, feature = "media-foundation"))]
         r.register(Arc::new(crate::mf::MfBackend::new(prefer_hardware)));
+        #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+        r.register(Arc::new(crate::apple::AppleBackend::new(prefer_hardware)));
         #[cfg(all(target_os = "linux", feature = "nvdec"))]
         if crate::nvdec::available() {
             r.register(Arc::new(crate::nvdec::NvdecBackend::new(prefer_hardware)));
         }
-        #[cfg(not(any(all(windows, feature = "media-foundation"), all(target_os = "linux", feature = "nvdec"))))]
+        #[cfg(not(any(all(windows, feature = "media-foundation"), all(target_os = "linux", feature = "nvdec"), all(target_os = "macos", feature = "videotoolbox"))))]
         let _ = prefer_hardware;
         #[cfg(feature = "native")]
         r.register(Arc::new(NativeBackend));
