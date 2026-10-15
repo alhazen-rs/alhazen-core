@@ -505,9 +505,22 @@ fn hdr_bgra_is_tone_mapped_whichever_path_was_chosen() {
 
 #[test]
 fn the_matrix_comes_from_the_bitstream_when_the_container_has_none() {
-    // hdr_pq_nometa.mkv: BT.2020 only in the HEVC VUI, no container colour tags.
-    let (_, frames) = decode_with("hdr_pq_nometa.mkv", |_| None);
-    let f = frames.first().expect("a frame");
+    // BT.2020 in the HEVC VUI; the container's own matrix tag removed, so only the SPS says it.
+    let mut d = demuxer("hdr_pq_nometa.mkv");
+    let mut s = video(d.as_ref());
+    s.color_matrix = None;
+    let mut dec = VtVideoDecoder::new(&s, Default::default()).unwrap();
+    let mut frame = None;
+    while let Some(p) = d.next_packet().unwrap() {
+        if p.stream == s.id {
+            dec.send_packet(&p).unwrap();
+            if let Some(DecodedFrame::Yuv(f)) = dec.receive_frame().unwrap() {
+                frame = Some(f);
+                break;
+            }
+        }
+    }
+    let f = frame.expect("a frame");
     assert_eq!(f.color.matrix, alhazen_core::decode::ColorMatrix::Bt2020);
 }
 
