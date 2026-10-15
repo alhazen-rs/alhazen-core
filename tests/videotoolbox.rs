@@ -510,3 +510,19 @@ fn the_matrix_comes_from_the_bitstream_when_the_container_has_none() {
     let f = frames.first().expect("a frame");
     assert_eq!(f.color.matrix, alhazen_core::decode::ColorMatrix::Bt2020);
 }
+
+#[test]
+fn sdr_bgra_is_converted_on_the_gpu() {
+    use alhazen_core::{FrameFormat, VideoFrame};
+    let player = open_with_formats("h264_aac.mp4", vec![FrameFormat::Bgra]);
+    let VideoFrame::Bgra { bgra, width, height, .. } = wait_first_frame(&player) else { panic!("expected BGRA") };
+    assert_eq!(player.stats().conversion, "gpu");
+    let Ok(out) = Command::new("ffmpeg")
+        .args(["-v", "error", "-i", &fixture("h264_aac.mp4"), "-frames:v", "1", "-s", &format!("{width}x{height}"), "-pix_fmt", "bgra", "-f", "rawvideo", "-"])
+        .output()
+    else {
+        return eprintln!("no ffmpeg: comparison skipped");
+    };
+    let db = psnr(&bgra, &out.stdout);
+    assert!(db >= 35.0, "{db:.1} dB against ffmpeg");
+}
