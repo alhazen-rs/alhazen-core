@@ -11,9 +11,18 @@ pub(crate) fn pack_8bit(src: &[u16], stride: usize, w: usize, h: usize, bit_dept
     out
 }
 
+/// Packs the visible `w`×`h` samples of a `u16` plane (`stride` samples per row), unshifted.
+pub(crate) fn pack_16bit(src: &[u16], stride: usize, w: usize, h: usize) -> Vec<u16> {
+    let mut out = Vec::with_capacity(w * h);
+    for y in 0..h {
+        out.extend_from_slice(&src[y * stride..y * stride + w]);
+    }
+    out
+}
+
 /// Repeats every row of a `w`-wide plane twice, keeping `height` rows: 4:4:0 chroma (half
 /// height) becomes 4:4:4.
-pub(crate) fn double_rows(plane: &[u8], w: usize, height: usize) -> Vec<u8> {
+pub(crate) fn double_rows<T: Copy>(plane: &[T], w: usize, height: usize) -> Vec<T> {
     let mut out = Vec::with_capacity(w * height);
     for y in 0..height {
         let src = (y / 2) * w;

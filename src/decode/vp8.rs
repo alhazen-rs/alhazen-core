@@ -48,11 +48,11 @@ impl VideoDecoder for Vp8Decoder {
             width: f.width,
             height: f.height,
             layout: PixelLayout::I420,
-            planes: [pack(y), pack(u), pack(v)],
+            planes: crate::decode::YuvPlanes::U8([pack(y), pack(u), pack(v)]),
             strides: [y.width as usize, u.width as usize, v.width as usize],
             // VP8 is always BT.601 studio range (RFC 6386 §9.2: color_space 0 is the only one defined).
-            matrix: ColorMatrix::Bt601,
-            full_range: false,
+            bit_depth: 8,
+            color: crate::color::ColorInfo::sdr(ColorMatrix::Bt601, false),
             pts: Duration::from_nanos(f.timestamp.pts.max(0) as u64),
         })))
     }
@@ -87,7 +87,7 @@ mod tests {
         assert_eq!(frames.len(), 60);
         let f = &frames[0];
         assert_eq!((f.width, f.height, f.layout), (320, 240, PixelLayout::I420));
-        assert_eq!((f.planes[0].len(), f.planes[1].len()), (320 * 240, 160 * 120));
+        assert_eq!((f.u8_planes().unwrap()[0].len(), f.u8_planes().unwrap()[1].len()), (320 * 240, 160 * 120));
         assert_eq!(frames[30].pts, Duration::from_secs(1));
     }
 

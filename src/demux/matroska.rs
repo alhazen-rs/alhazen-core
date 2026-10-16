@@ -350,6 +350,44 @@ impl MatroskaDemuxer {
                                                 2 => info.full_range = Some(true),
                                                 _ => {}
                                             },
+                                            id::TRANSFER_CHARACTERISTICS => {
+                                                let t = self.r.read_uint(known(c)?)?;
+                                                info.transfer = (t != 2 && t < 256).then_some(t as u8);
+                                            }
+                                            id::PRIMARIES => {
+                                                let p = self.r.read_uint(known(c)?)?;
+                                                info.primaries = (p != 2 && p < 256).then_some(p as u8);
+                                            }
+                                            id::MAX_CLL => {
+                                                let v = self.r.read_uint(known(c)?)?.min(u16::MAX as u64) as u16;
+                                                info.hdr.get_or_insert_default().max_cll = Some(v);
+                                            }
+                                            id::MAX_FALL => {
+                                                let v = self.r.read_uint(known(c)?)?.min(u16::MAX as u64) as u16;
+                                                info.hdr.get_or_insert_default().max_fall = Some(v);
+                                            }
+                                            id::MASTERING_METADATA => {
+                                                let end = c.data_start + known(c)?;
+                                                let mut xy = [None; 8];
+                                                let hdr = info.hdr.get_or_insert_default();
+                                                while self.r.position() < end {
+                                                    let m = self.header()?;
+                                                    match m.id {
+                                                        id::PRIMARY_R_X..=id::WHITE_POINT_Y => {
+                                                            xy[(m.id - id::PRIMARY_R_X) as usize] = Some(self.r.read_float(known(m)?)? as f32);
+                                                        }
+                                                        id::LUMINANCE_MAX => hdr.max_luminance = Some(self.r.read_float(known(m)?)? as f32),
+                                                        id::LUMINANCE_MIN => hdr.min_luminance = Some(self.r.read_float(known(m)?)? as f32),
+                                                        _ => self.r.skip(known(m)?)?,
+                                                    }
+                                                }
+                                                if let [Some(rx), Some(ry), Some(gx), Some(gy), Some(bx), Some(by), ..] = xy {
+                                                    hdr.display_primaries = Some([(rx, ry), (gx, gy), (bx, by)]);
+                                                }
+                                                if let [.., Some(wx), Some(wy)] = xy {
+                                                    hdr.white_point = Some((wx, wy));
+                                                }
+                                            }
                                             _ => self.r.skip(known(c)?)?,
                                         }
                                     }
@@ -933,5 +971,40 @@ mod tests {
             let s = &d.streams()[0];
             assert_eq!((s.kind, &s.codec, s.sample_rate, s.channels), (StreamKind::Audio, &codec, 48_000, 2), "{name}");
         }
+    }
+}
+
+#[cfg(test)]
+mod hdr_tests {
+    use super::*;
+    use crate::source::FileSource;
+
+    fn open(name: &str) -> MatroskaDemuxer {
+        MatroskaDemuxer::open(Box::new(FileSource::open(format!("tests/fixtures/{name}")).unwrap())).unwrap()
+    }
+
+    #[test]
+    fn hdr10_colour_and_mastering_metadata() {
+        let d = open("hdr_pq.mkv");
+        let s = &d.streams()[0];
+        assert_eq!((s.primaries, s.transfer, s.color_matrix), (Some(9), Some(16), Some(9)));
+        let hdr = s.hdr.expect("mastering metadata");
+        assert_eq!((hdr.max_cll, hdr.max_fall), (Some(1000), Some(400)));
+        assert!((hdr.max_luminance.unwrap() - 1000.0).abs() < 0.5);
+        assert!((hdr.min_luminance.unwrap() - 0.005).abs() < 0.001);
+        let [r, g, b] = hdr.display_primaries.expect("primaries");
+        assert!((r.0 - 0.68).abs() < 1e-3 && (g.1 - 0.69).abs() < 1e-3 && (b.0 - 0.15).abs() < 1e-3, "{r:?} {g:?} {b:?}");
+    }
+
+    #[test]
+    fn hlg_transfer() {
+        assert_eq!(open("hdr_hlg.mkv").streams()[0].transfer, Some(18));
+    }
+
+    #[test]
+    fn no_container_colour_means_none() {
+        let d = open("hdr_pq_nometa.mkv");
+        let s = &d.streams()[0];
+        assert_eq!((s.primaries, s.transfer, s.hdr), (None, None, None));
     }
 }

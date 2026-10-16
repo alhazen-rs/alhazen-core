@@ -34,7 +34,7 @@ fn decode_with(name: &str, hint: impl Fn(usize) -> Option<(u32, u32)>) -> (usize
 fn try_decode(name: &str, hint: impl Fn(usize) -> Option<(u32, u32)>) -> Result<(usize, Vec<YuvFrame>), String> {
     let mut d = demuxer(name);
     let s = video(d.as_ref());
-    let mut dec = VtVideoDecoder::new(&s).unwrap();
+    let mut dec = VtVideoDecoder::new(&s, Default::default()).unwrap();
     let (mut packets, mut frames) = (0, vec![]);
     while let Some(p) = d.next_packet().unwrap() {
         if p.stream != s.id {
@@ -96,7 +96,7 @@ fn check_pictures(name: &str, frames: &[YuvFrame]) {
             eprintln!("no ffmpeg: picture comparison skipped");
             return;
         };
-        let db = psnr(&f.planes.concat(), &reference);
+        let db = psnr(&f.u8_planes().unwrap().concat(), &reference);
         assert!(db >= 30.0, "{name} frame {i} at {}x{}: {db:.1} dB", f.width, f.height);
     }
 }
@@ -184,7 +184,7 @@ fn output_size_changes_at_keyframes_with_intact_pictures() {
 fn flush_then_decode_again_from_a_keyframe() {
     let mut d = demuxer("h264_aac.mp4");
     let s = video(d.as_ref());
-    let mut dec = VtVideoDecoder::new(&s).unwrap();
+    let mut dec = VtVideoDecoder::new(&s, Default::default()).unwrap();
     let packets: Vec<_> = std::iter::from_fn(|| d.next_packet().unwrap()).filter(|p| p.stream == s.id).collect();
     for p in &packets[..10] {
         dec.send_packet(p).unwrap();
@@ -379,4 +379,192 @@ fn a_corrupt_packet_does_not_stop_the_decoder() {
         }
     }
     assert!(frames >= 8 * 1536, "decoding goes on after a corrupt packet: {frames} frames");
+}
+
+#[test]
+fn ten_bit_hevc_keeps_its_samples() {
+    let mut d = demuxer("hdr_pq.mkv");
+    let s = video(d.as_ref());
+    let prefs = alhazen_core::OutputPrefs { ten_bit: true, ..Default::default() };
+    let mut dec = VtVideoDecoder::new(&s, prefs).unwrap();
+    let mut frame = None;
+    while let Some(p) = d.next_packet().unwrap() {
+        if p.stream != s.id {
+            continue;
+        }
+        dec.send_packet(&p).unwrap();
+        if let Some(DecodedFrame::Yuv(f)) = dec.receive_frame().unwrap() {
+            frame = Some(f);
+            break;
+        }
+    }
+    if frame.is_none() {
+        dec.send_eof();
+        if let Some(DecodedFrame::Yuv(f)) = dec.receive_frame().unwrap() {
+            frame = Some(f);
+        }
+    }
+    let f = frame.expect("a frame");
+    assert_eq!(f.bit_depth, 10);
+    let alhazen_core::decode::YuvPlanes::U16(p) = &f.planes else { panic!("expected 16-bit planes") };
+    let Ok(out) = Command::new("ffmpeg")
+        .args(["-v", "error", "-i", &fixture("hdr_pq.mkv"), "-frames:v", "1", "-pix_fmt", "yuv420p10le", "-f", "rawvideo", "-"])
+        .output()
+    else {
+        return eprintln!("no ffmpeg");
+    };
+    let reference: Vec<u16> = out.stdout.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
+    assert!(p.iter().flatten().copied().eq(reference), "10-bit samples differ from ffmpeg's");
+}
+
+// Frame formats: zero-copy `Native` frames for SDR, tone-mapped BGRA for HDR.
+
+fn open_with_formats(name: &str, formats: Vec<alhazen_core::FrameFormat>) -> Player {
+    let config = PlayerConfig {
+        clock: Some(std::sync::Arc::new(alhazen_core::clock::MockClock::new())),
+        audio_output: AudioOutputConfig::Disabled,
+        decoder_threads: 2,
+        frame_formats: formats,
+        ..Default::default()
+    };
+    Player::open(Source::parse(&fixture(name)).unwrap(), config).unwrap()
+}
+
+fn wait_first_frame(player: &Player) -> alhazen_core::VideoFrame {
+    let start = Instant::now();
+    loop {
+        if let Some(f) = player.current_frame() {
+            return f;
+        }
+        assert!(!matches!(player.state(), PlayerState::Error(_)), "{:?}", player.state());
+        assert!(start.elapsed() < Duration::from_secs(10), "no frame");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn sdr_frames_arrive_native_and_match_ffmpeg() {
+    use alhazen_core::{FrameFormat, VideoFrame};
+    let player = open_with_formats("h264_aac.mp4", vec![FrameFormat::Native, FrameFormat::Bgra]);
+    let f = wait_first_frame(&player);
+    let VideoFrame::Native(n) = &f else { panic!("expected a Native frame, got {f:?}") };
+    assert_eq!(player.stats().conversion, "zero-copy");
+    assert_eq!((n.width, n.height), (320, 240));
+    let yuv = n.to_yuv().expect("a readable pixel buffer");
+    let Some(reference) = ffmpeg_frame("h264_aac.mp4", 0, (yuv.width, yuv.height), yuv.layout) else {
+        return eprintln!("no ffmpeg: picture comparison skipped");
+    };
+    let db = psnr(&yuv.u8_planes().unwrap().concat(), &reference);
+    assert!(db >= 40.0, "{db:.1} dB");
+}
+
+#[test]
+fn hdr_never_arrives_native() {
+    use alhazen_core::{FrameFormat, VideoFrame};
+    let player = open_with_formats("hdr_pq.mkv", vec![FrameFormat::Native, FrameFormat::Bgra]);
+    let f = wait_first_frame(&player);
+    assert!(matches!(f, VideoFrame::Bgra { .. }), "{f:?}");
+    assert_eq!(player.stats().hdr, alhazen_core::Transfer::Pq);
+}
+
+/// Our CPU tone mapping of `name`'s first frame (VideoToolbox decode, 10-bit), as BGRA.
+fn cpu_tone_mapped_first_frame(name: &str) -> Vec<u8> {
+    let mut d = demuxer(name);
+    let s = video(d.as_ref());
+    let mut dec = VtVideoDecoder::new(&s, alhazen_core::OutputPrefs { ten_bit: true, ..Default::default() }).unwrap();
+    let mut frame = None;
+    while frame.is_none() {
+        let Some(p) = d.next_packet().unwrap() else {
+            dec.send_eof();
+            frame = dec.receive_frame().unwrap();
+            break;
+        };
+        if p.stream == s.id {
+            dec.send_packet(&p).unwrap();
+            frame = dec.receive_frame().unwrap();
+        }
+    }
+    let Some(DecodedFrame::Yuv(mut y)) = frame else { panic!("{name}: no frame") };
+    y.color.apply_stream(&alhazen_core::color::StreamColor::of(&s));
+    let mut out = Vec::new();
+    alhazen_core::convert::frame_to_bgra(&y, &mut out).unwrap();
+    out
+}
+
+#[test]
+fn hdr_bgra_is_tone_mapped_whichever_path_was_chosen() {
+    use alhazen_core::{FrameFormat, VideoFrame};
+    let player = open_with_formats("hdr_pq.mkv", vec![FrameFormat::Native, FrameFormat::Bgra]);
+    let VideoFrame::Bgra { bgra, .. } = wait_first_frame(&player) else { panic!("expected BGRA") };
+    let conversion = player.stats().conversion;
+    assert!(conversion == "gpu" || conversion == "cpu (fallback)", "{conversion}");
+    let db = psnr(&bgra, &cpu_tone_mapped_first_frame("hdr_pq.mkv"));
+    eprintln!("HDR through {conversion}: {db:.1} dB against the CPU tone mapper");
+    assert!(db >= 30.0, "{db:.1} dB");
+}
+
+#[test]
+fn the_matrix_comes_from_the_bitstream_when_the_container_has_none() {
+    // BT.2020 in the HEVC VUI; the container's own matrix tag removed, so only the SPS says it.
+    let mut d = demuxer("hdr_pq_nometa.mkv");
+    let mut s = video(d.as_ref());
+    s.color_matrix = None;
+    let mut dec = VtVideoDecoder::new(&s, Default::default()).unwrap();
+    let mut frame = None;
+    while let Some(p) = d.next_packet().unwrap() {
+        if p.stream == s.id {
+            dec.send_packet(&p).unwrap();
+            if let Some(DecodedFrame::Yuv(f)) = dec.receive_frame().unwrap() {
+                frame = Some(f);
+                break;
+            }
+        }
+    }
+    let f = frame.expect("a frame");
+    assert_eq!(f.color.matrix, alhazen_core::decode::ColorMatrix::Bt2020);
+}
+
+/// Log records, kept so a failing test can show why (e.g. why a GPU path fell back).
+struct Captured(std::sync::Mutex<Vec<String>>);
+
+impl log::Log for Captured {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Info
+    }
+    fn log(&self, r: &log::Record) {
+        if self.enabled(r.metadata()) {
+            self.0.lock().unwrap().push(format!("{} {}: {}", r.level(), r.target(), r.args()));
+        }
+    }
+    fn flush(&self) {}
+}
+
+fn captured_log() -> &'static Captured {
+    static LOG: std::sync::OnceLock<&'static Captured> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| {
+        let logger: &'static Captured = Box::leak(Box::new(Captured(std::sync::Mutex::new(Vec::new()))));
+        let _ = log::set_logger(logger);
+        log::set_max_level(log::LevelFilter::Info);
+        logger
+    })
+}
+
+#[test]
+fn sdr_bgra_is_converted_on_the_gpu() {
+    use alhazen_core::{FrameFormat, VideoFrame};
+    let log = captured_log();
+    let player = open_with_formats("h264_aac.mp4", vec![FrameFormat::Bgra]);
+    let VideoFrame::Bgra { bgra, width, height, .. } = wait_first_frame(&player) else { panic!("expected BGRA") };
+    let notes: Vec<String> = log.0.lock().unwrap().iter().filter(|l| l.contains("VideoToolbox") || l.contains("GPU")).cloned().collect();
+    assert_eq!(player.stats().conversion, "gpu", "log: {notes:#?}");
+    let Ok(out) = Command::new("ffmpeg")
+        .args(["-v", "error", "-i", &fixture("h264_aac.mp4"), "-frames:v", "1", "-s", &format!("{width}x{height}"), "-pix_fmt", "bgra", "-f", "rawvideo", "-"])
+        .output()
+    else {
+        return eprintln!("no ffmpeg: comparison skipped");
+    };
+    // Luma: converters filter chroma differently at the test pattern's hard colour edges.
+    let luma = |p: &[u8]| p.as_chunks::<4>().0.iter().map(|p| (0.0722 * p[0] as f64 + 0.7152 * p[1] as f64 + 0.2126 * p[2] as f64) as u8).collect::<Vec<u8>>();
+    let db = psnr(&luma(&bgra), &luma(&out.stdout));
+    assert!(db >= 35.0, "{db:.1} dB (luma) against ffmpeg");
 }

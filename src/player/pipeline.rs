@@ -12,10 +12,12 @@ use super::audio_thread::AudioLoop;
 use super::speed::SpeedMonitor;
 use super::PlayerState;
 use crate::backend::Registry;
+use crate::output::OutputPrefs;
 use super::{Command, PlayerEvent, Shared};
 use crate::audio::OutputShared;
-use crate::convert::yuv_to_bgra;
-use crate::decode::{AudioDecoder, DecodedFrame, VideoDecoder, YuvFrame};
+use crate::convert::{frame_to_bgra, to_8bit};
+use crate::frame::FrameFormat;
+use crate::decode::{AudioDecoder, DecodedFrame, VideoDecoder};
 use crate::demux::{Demuxer, Packet, StreamInfo};
 use crate::frame::VideoFrame;
 use crate::{Error, Result};
@@ -286,13 +288,16 @@ fn send(shared: &Shared, tx: &Sender<Msg>, commands: &Receiver<Command>, mut msg
     }
 }
 
+/// Backends that always decode on the GPU: never replaced for being too slow.
+const HARDWARE: [&str; 2] = ["nvdec", "videotoolbox"];
+
 struct DecodeLoop {
     decoder: Box<dyn VideoDecoder>,
     pool: Arc<rayon::ThreadPool>,
     generation: u64,
     /// Accurate-seek target: frames up to here are held back, only the last one is shown.
     target: Option<Duration>,
-    held: Option<YuvFrame>,
+    held: Option<DecodedFrame>,
     errors: u32,
     waiting_for_keyframe: bool,
     /// Set until the one allowed switch to another backend has happened.
@@ -308,6 +313,8 @@ struct DecodeLoop {
     /// Pts of the last frame converted and queued.
     last_shown: Option<Duration>,
     scaler: crate::scale::FrameScaler,
+    /// The current decoder hands out frames converted on the GPU.
+    gpu_converting: bool,
 }
 
 impl DecodeLoop {
@@ -327,6 +334,7 @@ impl DecodeLoop {
             busy: Duration::ZERO,
             last_shown: None,
             scaler: crate::scale::FrameScaler::default(),
+            gpu_converting: false,
         }
     }
 
@@ -411,7 +419,7 @@ impl DecodeLoop {
             let received = self.decoder.receive_frame();
             self.busy += start.elapsed();
             match received {
-                Ok(Some(DecodedFrame::Yuv(f))) => {
+                Ok(Some(f)) => {
                     self.errors = 0;
                     self.decoded_any = true;
                     if !self.on_frame(shared, f) {
@@ -424,9 +432,9 @@ impl DecodeLoop {
         }
     }
 
-    fn on_frame(&mut self, shared: &Shared, f: YuvFrame) -> bool {
+    fn on_frame(&mut self, shared: &Shared, f: DecodedFrame) -> bool {
         if let Some(target) = self.target {
-            if f.pts <= target {
+            if f.pts() <= target {
                 self.held = Some(f);
                 return true;
             }
@@ -456,8 +464,42 @@ impl DecodeLoop {
         // At most one frame waiting: the renderer is eating frames as fast as we make them.
         let behind = shared.queue.len() <= 1;
         self.monitor.record_drops(now, shared.queue.dropped(), behind);
-        if self.monitor.too_slow(now) {
-            self.switch_backend(shared, "decoding is too slow for this video");
+        if !self.monitor.too_slow(now) || (self.gpu_converting && self.convert_on_the_cpu(shared)) {
+            return;
+        }
+        // A hardware decoder already on the CPU path: the other backends (software decoders,
+        // ffmpeg) would be slower still. Keep it and let late frames drop.
+        if self.fallback.as_ref().is_some_and(|f| HARDWARE.contains(&f.current)) {
+            self.monitor.reset();
+            return;
+        }
+        self.switch_backend(shared, "decoding is too slow for this video");
+    }
+
+    /// Too slow while converting on the GPU (copying finished BGRA frames back costs more than
+    /// YUV at high frame rates): reopens the same backend handing out YUV for the CPU path
+    /// before giving up on it. Returns whether it did.
+    fn convert_on_the_cpu(&mut self, shared: &Shared) -> bool {
+        self.gpu_converting = false;
+        let Some(f) = &self.fallback else { return false };
+        let prefs = OutputPrefs { gpu_bgra: false, ..OutputPrefs::for_stream(&shared.frame_formats, &f.stream) };
+        match f.registry.open_video_decoder_from(f.current, &f.stream, f.threads, prefs) {
+            Ok(decoder) => {
+                log::info!("{} is too slow converting on the GPU; converting on the CPU", f.current);
+                self.decoder = decoder;
+                self.decoded_any = false;
+                self.monitor.reset();
+                if shared.seekable {
+                    shared.seek_to_now_if_current(self.generation);
+                } else {
+                    self.waiting_for_keyframe = true;
+                }
+                true
+            }
+            Err(e) => {
+                log::info!("{} can't decode without converting on the GPU: {e}", f.current);
+                false
+            }
         }
     }
 
@@ -465,7 +507,7 @@ impl DecodeLoop {
     fn switch_backend(&mut self, shared: &Shared, why: &str) -> bool {
         let Some(f) = self.fallback.take() else { return false };
         let codec = &f.stream.codec;
-        match f.registry.open_video_decoder_except(&f.stream, f.threads, f.order.as_deref(), Some(f.current)) {
+        match f.registry.open_video_decoder_except(&f.stream, f.threads, OutputPrefs::for_stream(&shared.frame_formats, &f.stream), f.order.as_deref(), Some(f.current)) {
             Ok((name, decoder)) => {
                 let _ = shared.events.send(PlayerEvent::Warning(format!(
                     "{} {codec} {why}; switching to {name}",
@@ -473,6 +515,7 @@ impl DecodeLoop {
                 )));
                 self.decoder = decoder;
                 self.decoded_any = false;
+                self.gpu_converting = false;
                 *shared.video_backend.lock().unwrap() = Some(name);
                 if shared.seekable {
                     // Restart decoding from where playback is: the demuxer goes back to the
@@ -503,7 +546,7 @@ impl DecodeLoop {
             return false;
         }
         let Some(r) = self.reopen.clone() else { return true };
-        match r.registry.open_video_decoder_except(&info, r.threads, r.order.as_deref(), None) {
+        match r.registry.open_video_decoder_except(&info, r.threads, OutputPrefs::for_stream(&shared.frame_formats, &info), r.order.as_deref(), None) {
             Ok((name, decoder)) => {
                 log::info!("video format changed ({} {}x{}): decoding with {name}", info.codec, info.width, info.height);
                 self.decoder = decoder;
@@ -554,36 +597,71 @@ impl DecodeLoop {
     }
 
     /// Converts and queues a frame. Returns `false` only on shutdown.
-    fn present(&mut self, shared: &Shared, f: YuvFrame) -> bool {
+    fn present(&mut self, shared: &Shared, f: impl Into<DecodedFrame>) -> bool {
+        let f = f.into();
         // Catch-up: while behind the clock, don't spend time converting frames that are already
         // late, so the decoder can get ahead again; still show one every MIN_SHOW_INTERVAL.
         let first = shared.ready_generation.load(Ordering::SeqCst) != self.generation;
         if !first
-            && shared.clock.now().saturating_sub(f.pts) > SKIP_LATE
-            && self.last_shown.is_some_and(|p| f.pts.saturating_sub(p) < MIN_SHOW_INTERVAL)
+            && shared.clock.now().saturating_sub(f.pts()) > SKIP_LATE
+            && self.last_shown.is_some_and(|p| f.pts().saturating_sub(p) < MIN_SHOW_INTERVAL)
             && shared.state() == PlayerState::Playing
         {
             let cost = std::mem::take(&mut self.busy);
-            self.check_speed(shared, cost, f.pts);
+            self.check_speed(shared, cost, f.pts());
             shared.queue.note_skipped();
             return true;
         }
-        let mut bgra = Vec::new();
         let start = Instant::now();
         let scaler = &mut self.scaler;
         let max = shared.max_output_size();
-        let converted = self.pool.install(|| {
-            let scaled = max.and_then(|max| scaler.downscale(&f, max));
-            let f = scaled.as_ref().unwrap_or(&f);
-            yuv_to_bgra(f, &mut bgra).map(|()| (f.width, f.height))
-        });
-        let (out_w, out_h) = match converted {
-            Ok(size) => size,
-            Err(e) => return self.on_decode_error(shared, e),
+        let f = match f {
+            DecodedFrame::Bgra { width, height, bgra, transfer, pts } => {
+                self.gpu_converting = true;
+                *shared.hdr.lock().unwrap() = transfer;
+                shared.set_conversion("gpu");
+                return self.queue(shared, VideoFrame::Bgra { width, height, bgra, pts }, start);
+            }
+            #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+            DecodedFrame::Native(n) if shared.frame_formats.contains(&FrameFormat::Native) => {
+                *shared.hdr.lock().unwrap() = n.color.transfer;
+                shared.set_conversion("zero-copy");
+                return self.queue(shared, VideoFrame::Native(n), start);
+            }
+            #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+            DecodedFrame::Native(n) => match n.to_yuv() {
+                Ok(f) => f,
+                Err(e) => return self.on_decode_error(shared, e),
+            },
+            DecodedFrame::Yuv(f) => f,
         };
+        *shared.hdr.lock().unwrap() = f.color.transfer;
+        let frame = if crate::output::planes_first(&shared.frame_formats) {
+            // 10-bit samples only for apps that asked for them.
+            let f = if f.bit_depth > 8 && !shared.frame_formats.contains(&FrameFormat::Yuv10) { to_8bit(&f) } else { f };
+            let scaled = self.pool.install(|| max.and_then(|max| scaler.downscale(&f, max)));
+            VideoFrame::Yuv(Arc::new(scaled.unwrap_or(f)))
+        } else {
+            let mut bgra = Vec::new();
+            let converted = self.pool.install(|| {
+                let scaled = max.and_then(|max| scaler.downscale(&f, max));
+                let f = scaled.as_ref().unwrap_or(&f);
+                frame_to_bgra(f, &mut bgra).map(|()| (f.width, f.height))
+            });
+            let (width, height) = match converted {
+                Ok(size) => size,
+                Err(e) => return self.on_decode_error(shared, e),
+            };
+            VideoFrame::Bgra { width, height, bgra: bgra.into(), pts: f.pts }
+        };
+        shared.set_conversion(if self.decoder.gpu_fallback() { "cpu (fallback)" } else { "cpu" });
+        self.queue(shared, frame, start)
+    }
+
+    /// Queues a ready frame (and starts the clock on the first one). `false` only on shutdown.
+    fn queue(&mut self, shared: &Shared, frame: VideoFrame, start: Instant) -> bool {
         let cost = std::mem::take(&mut self.busy) + start.elapsed();
-        self.check_speed(shared, cost, f.pts);
-        let frame = VideoFrame::Cpu { width: out_w, height: out_h, bgra: bgra.into(), pts: f.pts };
+        self.check_speed(shared, cost, frame.pts());
         let first = shared.ready_generation.load(Ordering::SeqCst) != self.generation;
         {
             let _guard = shared.seek_lock.lock().unwrap();
@@ -591,9 +669,9 @@ impl DecodeLoop {
                 // Superseded by a newer seek: must not touch the clock or the queue.
                 return !shared.shutdown.load(Ordering::SeqCst);
             }
-            if first && !shared.audio_master && f.pts > shared.clock.now() {
+            if first && !shared.audio_master && frame.pts() > shared.clock.now() {
                 // Seeked before the first frame: start the clock at the first frame instead.
-                shared.clock.set(f.pts);
+                shared.clock.set(frame.pts());
             }
         }
         let pts = frame.pts();
@@ -617,7 +695,7 @@ mod tests {
     use super::*;
     use crate::player::PlayerState;
     use crate::clock::{Clock, MockClock};
-    use crate::decode::{ColorMatrix, PixelLayout, VideoDecoder};
+    use crate::decode::{ColorMatrix, PixelLayout, VideoDecoder, YuvFrame};
     use crate::frame::FrameQueue;
 
     struct NoDecoder;
@@ -725,6 +803,9 @@ mod tests {
             video_backend: Mutex::new(None),
             max_output_size: AtomicU64::new(0),
             diag: Default::default(),
+            frame_formats: vec![crate::frame::FrameFormat::Bgra],
+            conversion: Mutex::new("none"),
+            hdr: Mutex::new(crate::color::Transfer::Sdr),
         }
     }
 
@@ -733,10 +814,10 @@ mod tests {
             width: 2,
             height: 2,
             layout: PixelLayout::I420,
-            planes: [vec![16; 4], vec![128], vec![128]],
+            planes: crate::decode::YuvPlanes::U8([vec![16; 4], vec![128], vec![128]]),
             strides: [2, 1, 1],
-            matrix: ColorMatrix::Bt601,
-            full_range: false,
+            bit_depth: 8,
+            color: crate::color::ColorInfo::sdr(ColorMatrix::Bt601, false),
             pts,
         }
     }
@@ -763,7 +844,7 @@ mod tests {
         fn supports_video(&self, _: &StreamInfo) -> bool {
             true
         }
-        fn open_video_decoder(&self, _: &StreamInfo, _: usize) -> Result<Box<dyn VideoDecoder>> {
+        fn open_video_decoder(&self, _: &StreamInfo, _: usize, _prefs: crate::output::OutputPrefs) -> Result<Box<dyn VideoDecoder>> {
             Ok(Box::new(NoDecoder))
         }
     }
@@ -802,6 +883,101 @@ mod tests {
         assert_eq!(shared.queue.dropped(), 0, "the drop rule did not do it");
     }
 
+    /// A backend whose decoders are recorded with the preferences they were opened with.
+    struct Recording(&'static str, Arc<Mutex<Vec<crate::output::OutputPrefs>>>);
+    impl crate::backend::Backend for Recording {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn priority(&self) -> i32 {
+            0
+        }
+        fn supports_container(&self, _: crate::demux::ContainerFormat) -> bool {
+            false
+        }
+        fn open_demuxer(&self, _: crate::demux::ContainerFormat, _: Box<dyn crate::source::MediaSource>) -> Result<Box<dyn Demuxer>> {
+            unreachable!()
+        }
+        fn supports_video(&self, _: &StreamInfo) -> bool {
+            true
+        }
+        fn open_video_decoder(&self, _: &StreamInfo, _: usize, prefs: crate::output::OutputPrefs) -> Result<Box<dyn VideoDecoder>> {
+            self.1.lock().unwrap().push(prefs);
+            Ok(Box::new(NoDecoder))
+        }
+    }
+
+    #[test]
+    fn too_slow_on_the_gpu_first_converts_on_the_cpu_with_the_same_decoder() {
+        let clock = Arc::new(MockClock::new());
+        let shared = shared(clock.clone());
+        *shared.state.lock().unwrap() = PlayerState::Playing;
+        shared.ready_generation.store(0, Ordering::SeqCst);
+        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+        let (gpu_opens, spare_opens) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
+        let mut registry = Registry::empty();
+        registry.register(Arc::new(Recording("gpu", gpu_opens.clone())));
+        registry.register(Arc::new(Recording("spare", spare_opens.clone())));
+        let mut decode = DecodeLoop::new(Box::new(NoDecoder), pool);
+        decode.fallback = Some(Fallback {
+            registry: Arc::new(registry),
+            stream: StreamInfo::new(1, crate::demux::StreamKind::Video, crate::demux::Codec::Hevc),
+            threads: 1,
+            order: None,
+            current: "gpu",
+            speed: true,
+        });
+        let start = Instant::now();
+        let mut pts = Duration::ZERO;
+        // GPU-converted frames that keep reaching the queue 300 ms late.
+        while gpu_opens.lock().unwrap().is_empty() && spare_opens.lock().unwrap().is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(4), "never reacted");
+            clock.set(pts + Duration::from_millis(300));
+            let frame = DecodedFrame::Bgra { width: 2, height: 2, bgra: Arc::from(vec![0u8; 16]), transfer: crate::color::Transfer::Sdr, pts };
+            decode.present(&shared, frame);
+            shared.queue.frame_for(clock.now());
+            pts += Duration::from_millis(16);
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        assert_eq!(*gpu_opens.lock().unwrap(), vec![crate::output::OutputPrefs { gpu_bgra: false, ..Default::default() }], "reopened without GPU conversion");
+        assert!(spare_opens.lock().unwrap().is_empty(), "no other backend yet");
+        assert_eq!(*shared.video_backend.lock().unwrap(), None, "same backend");
+        assert!(decode.fallback.is_some(), "a backend switch is still possible if that is too slow too");
+    }
+
+    #[test]
+    fn a_hardware_decoder_is_not_swapped_for_a_slower_one() {
+        // NVDEC already converting on the CPU and still behind: the other backends (software,
+        // ffmpeg) would only be slower, so it stays.
+        let clock = Arc::new(MockClock::new());
+        let shared = shared(clock.clone());
+        *shared.state.lock().unwrap() = PlayerState::Playing;
+        shared.ready_generation.store(0, Ordering::SeqCst);
+        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+        let spare_opens = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = Registry::empty();
+        registry.register(Arc::new(Recording("spare", spare_opens.clone())));
+        let mut decode = DecodeLoop::new(Box::new(NoDecoder), pool);
+        decode.fallback = Some(Fallback {
+            registry: Arc::new(registry),
+            stream: StreamInfo::new(1, crate::demux::StreamKind::Video, crate::demux::Codec::Hevc),
+            threads: 1,
+            order: None,
+            current: "nvdec",
+            speed: true,
+        });
+        let start = Instant::now();
+        let mut pts = Duration::ZERO;
+        while start.elapsed() < Duration::from_secs(3) {
+            clock.set(pts + Duration::from_millis(300));
+            decode.present(&shared, frame(pts));
+            shared.queue.frame_for(clock.now());
+            pts += Duration::from_millis(16);
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        assert!(spare_opens.lock().unwrap().is_empty(), "switched away from the hardware decoder");
+    }
+
     #[test]
     fn late_frames_are_skipped_but_the_picture_still_updates() {
         let clock = Arc::new(MockClock::new());
@@ -830,6 +1006,62 @@ mod tests {
             decode.present(&shared, frame(pts));
             assert!(shared.queue.frame_for(pts).is_some(), "on-time frame {i} skipped");
         }
+    }
+
+    fn shared_with(formats: Vec<crate::frame::FrameFormat>) -> Shared {
+        let mut s = shared(Arc::new(MockClock::new()));
+        s.frame_formats = formats;
+        s
+    }
+
+    #[test]
+    fn yuv_listed_first_is_delivered_without_conversion() {
+        use crate::frame::FrameFormat;
+        let shared = shared_with(vec![FrameFormat::Yuv, FrameFormat::Bgra]);
+        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+        let mut decode = DecodeLoop::new(Box::new(NoDecoder), pool);
+        assert!(decode.present(&shared, frame(Duration::ZERO)));
+        match shared.queue.frame_for(Duration::ZERO).expect("a frame") {
+            VideoFrame::Yuv(f) => assert_eq!((f.width, f.height, f.bit_depth), (2, 2, 8)),
+            other => panic!("expected Yuv, got {other:?}"),
+        }
+        assert_eq!(shared.conversion(), "cpu");
+    }
+
+    fn frame10(pts: Duration) -> YuvFrame {
+        YuvFrame {
+            planes: crate::decode::YuvPlanes::U16([vec![512; 4], vec![512], vec![512]]),
+            bit_depth: 10,
+            ..frame(pts)
+        }
+    }
+
+    #[test]
+    fn u16_frame_delivered_as_yuv10_only_when_listed() {
+        use crate::frame::FrameFormat;
+        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+        let shared = shared_with(vec![FrameFormat::Yuv]);
+        let mut decode = DecodeLoop::new(Box::new(NoDecoder), pool.clone());
+        assert!(decode.present(&shared, frame10(Duration::ZERO)));
+        let Some(VideoFrame::Yuv(f)) = shared.queue.frame_for(Duration::ZERO) else { panic!("expected Yuv") };
+        assert_eq!(f.bit_depth, 8, "Yuv without Yuv10 gets 8-bit");
+        assert_eq!(f.u8_planes().unwrap()[0][0], 128);
+        let shared = shared_with(vec![FrameFormat::Yuv10]);
+        let mut decode = DecodeLoop::new(Box::new(NoDecoder), pool);
+        assert!(decode.present(&shared, frame10(Duration::ZERO)));
+        let Some(VideoFrame::Yuv(f)) = shared.queue.frame_for(Duration::ZERO) else { panic!("expected Yuv") };
+        assert_eq!((f.bit_depth, f.u16_planes().unwrap()[0][0]), (10, 512));
+    }
+
+    #[test]
+    fn bgra_default_converts_on_cpu() {
+        use crate::frame::FrameFormat;
+        let shared = shared_with(vec![FrameFormat::Bgra]);
+        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+        let mut decode = DecodeLoop::new(Box::new(NoDecoder), pool);
+        assert!(decode.present(&shared, frame(Duration::ZERO)));
+        assert!(matches!(shared.queue.frame_for(Duration::ZERO), Some(VideoFrame::Bgra { .. })));
+        assert_eq!(shared.conversion(), "cpu");
     }
 
     #[test]

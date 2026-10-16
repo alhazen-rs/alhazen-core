@@ -130,6 +130,19 @@ A player in any toolkit comes down to three things:
 3. **Listen to `events()`** to repaint when paused (`FrameReady`), and to show `Warning`s and
    errors.
 
+**Frame formats.** `PlayerConfig::frame_formats` lists what your renderer can draw, most
+preferred first; `Bgra` is always the fallback:
+
+| Format | You get | When to use it |
+|---|---|---|
+| `Bgra` (default) | `VideoFrame::Bgra`, SDR, tone mapped when the source is HDR | Any renderer that draws images |
+| `Yuv` | `VideoFrame::Yuv`, 8-bit planes + `ColorInfo` | Your own YUV shader |
+| `Yuv10` | `VideoFrame::Yuv`, 10-bit planes + HDR metadata (primaries, PQ/HLG, mastering, MaxCLL) | HDR-capable renderers |
+| `Native` (macOS) | `VideoFrame::Native`, VideoToolbox's IOSurface-backed pixel buffer | Zero-copy drawing (Metal, GPUI's `paint_surface`) |
+
+`stats().conversion` says how frames are made ready (`gpu`, `cpu`, `cpu (fallback)`,
+`zero-copy`) and `stats().hdr` the source's transfer function.
+
 [alhazen-gpui](https://github.com/alhazen-rs/alhazen-gpui) is a complete example: about 450
 lines for the player entity and the element.
 
@@ -344,10 +357,22 @@ point. Seeking passes through `Buffering`.
 
 - **VP9:** [vp9-mt](https://github.com/alhazen-rs/vp9-mt) decodes tile columns in parallel,
   bit-identical to libvpx: 45 fps vs 17.5 fps single-threaded on a 4K 10-bit stream.
-- **GPU on Windows:** H.264/HEVC/VP9/AV1 decode on the GPU's video engine; frames are copied
-  back once (NV12/P010) and converted on the CPU.
-- **GPU on Linux (NVIDIA):** frames are decoded *and scaled to the display size* on the GPU, so
-  only display-sized frames are copied back and converted.
+- **GPU conversion:** with hardware decoding, colour conversion, scaling to the display size and
+  HDR tone mapping run on the GPU too: a CUDA kernel with NVDEC (Linux), the D3D11 video
+  processor with Media Foundation (Windows), and on macOS zero-copy `Native` frames or
+  VideoToolbox's pixel transfer for HDR. Frames come back as finished BGRA into reused buffers.
+  Measured on a Ryzen 5 5500 + RTX 4060 (NVDEC, CPU time per second of video, 60 fps, no drops):
+
+  | Video | Shown at | Before (CPU conversion) | GPU conversion |
+  |---|---|---|---|
+  | AV1 4K60 | 3840×2160 | 215% of a core | 65% |
+  | AV1 4K60 | 1920×1080 | 41% | 15% |
+  | HEVC 4K60 | 3840×2160 | 213% | 65% |
+  | HEVC 4K60 | 1920×1080 | 41% | 16% |
+  | HEVC 4K120 | 1920×1080 | 83% | 31% |
+  | HEVC 8K30 | 1920×1080 | 24% | 11% |
+
+  `cargo run --release --example bench_playback -- <file> [seconds] [--display WxH]` measures it.
 - **Scale first:** a 4K frame shown at 1280×720 is scaled down in YUV before conversion.
 - **Catch-up:** after a stall, frames more than 50 ms late are skipped (one is still shown per
   100 ms), so video rejoins the audio quickly.

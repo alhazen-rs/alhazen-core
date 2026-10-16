@@ -5,6 +5,7 @@ mod backend;
 mod codecs;
 mod device;
 mod mft;
+mod processor;
 mod runtime;
 mod video;
 

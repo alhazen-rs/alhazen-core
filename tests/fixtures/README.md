@@ -223,3 +223,23 @@ for codec in ac3 eac3; do ffmpeg -v error -y -f lavfi -i "sine=f=220:d=2" -f lav
 ```
 
 - `ac3_51.mkv`, `eac3_51.mkv`: 5.1 with a different tone on every channel (220, 330, 440, 60, 550, 660 Hz), so a decoder that outputs the channels in another order fails the comparison with ffmpeg (`tests/videotoolbox.rs`).
+
+## HDR (10-bit PQ / HLG)
+
+ffmpeg only writes container colour tags and HDR10 side data (Matroska `Colour`/`MasteringMetadata`, MP4 `colr`/`mdcv`/`clli`) when the frames carry them, so the HDR10 files take two passes: the first puts the SEI into the HEVC stream, the second decodes it (the SEI becomes frame side data) and re-encodes with `setparams`.
+
+```bash
+SRC="testsrc2=s=320x180:r=24:d=2"
+PQ="setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv"
+ffmpeg -y -f lavfi -i "$SRC" -pix_fmt yuv420p10le -c:v libx265 -x265-params "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50):max-cll=1000,400:hdr10=1" pass1.mkv
+ffmpeg -y -i pass1.mkv -vf "$PQ" -pix_fmt yuv420p10le -c:v libx265 -x265-params "hdr10=1:repeat-headers=1" hdr_pq.mkv
+ffmpeg -y -i hdr_pq.mkv -c copy hdr_pq.mp4
+ffmpeg -y -f lavfi -i "$SRC" -vf "setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc:range=tv" -pix_fmt yuv420p10le -c:v libx265 -x265-params "colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc" hdr_hlg.mkv
+ffmpeg -y -f lavfi -i "$SRC" -pix_fmt yuv420p10le -c:v libx265 -x265-params "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc" -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc hdr_pq_nometa.mkv
+ffmpeg -y -i pass1.mkv -vf "$PQ" -pix_fmt yuv420p10le -c:v libsvtav1 hdr_pq_av1.mkv
+```
+
+- `hdr_pq.mkv`, `hdr_pq.mp4`: HEVC Main10, PQ, BT.2020, mastering display 1000/0.005 nits, MaxCLL 1000, MaxFALL 400 (container and SEI).
+- `hdr_hlg.mkv`: HEVC Main10, HLG, BT.2020, no HDR10 metadata.
+- `hdr_pq_nometa.mkv`: HEVC Main10, PQ in the SPS VUI only: no container colour tags, no mastering metadata.
+- `hdr_pq_av1.mkv`: AV1 10-bit, PQ, BT.2020 with mastering display and content light level.

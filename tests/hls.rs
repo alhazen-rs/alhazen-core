@@ -277,6 +277,12 @@ fn throttling_switches_down_through_a_resolution_change() {
 fn manual_variant_then_auto() {
     let (video, audio) = (Server::dir(root()), Server::dir(root()));
     master_with_remote_audio(&video, &audio);
+    // A switch takes effect at the next segment not yet fetched, and segments are fetched a few
+    // ahead: on a fast machine all six 640x360 ones could be in before the switch is seen. Slow
+    // them down so the 320x180 ones are still to come when it is.
+    for i in 1..6 {
+        video.stall(&format!("multi/hi/seg{i}.ts"), Duration::from_millis(300));
+    }
     let config = PlayerConfig { audio_output: AudioOutputConfig::Disabled, decoder_threads: 2, ..Default::default() };
     let player = Player::open(Source::parse(&video.url("multi/master.m3u8")).unwrap(), config).unwrap();
     player.set_variant(alhazen_core::hls::Variant::Index(1));

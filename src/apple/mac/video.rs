@@ -11,7 +11,8 @@ use objc2_core_media::{
     kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms, kCMTimeInvalid,
 };
 use objc2_core_video::{
-    CVImageBuffer, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeightOfPlane,
+    CVImageBuffer, CVPixelBuffer, CVPixelBufferGetHeight, CVPixelBufferGetWidth, kCVPixelBufferIOSurfacePropertiesKey,
+    kCVPixelBufferMetalCompatibilityKey, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeightOfPlane,
     CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidthOfPlane, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
     CVPixelBufferUnlockBaseAddress, kCVPixelBufferHeightKey, kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey,
     kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
@@ -24,8 +25,12 @@ use objc2_core_video::{
 use objc2_video_toolbox::{VTDecodeFrameFlags, VTDecodeInfoFlags, VTDecompressionOutputCallbackRecord, VTDecompressionSession};
 
 use super::cf;
+use super::native::NativeFrame;
+use super::transfer::PixelTransfer;
+use crate::color::{ColorInfo, StreamColor};
+use crate::scale::fit_within;
 use crate::apple::format::{atom_name, prores_subtype, video_codec_type, vpcc_from_keyframe};
-use crate::apple::planes::biplanar_to_planar;
+use crate::apple::planes::{biplanar_to_planar, biplanar_to_planar_u16};
 use crate::decode::{ColorMatrix, DecodedFrame, PixelLayout, VideoDecoder, YuvFrame, chroma_size};
 use crate::demux::{Codec, Packet, StreamInfo};
 use crate::nvdec::size::target_size;
@@ -63,12 +68,32 @@ const FORMATS: [OutputFormat; 12] = {
 /// Timestamps are passed in nanoseconds.
 const TIMESCALE: i32 = 1_000_000_000;
 
+/// A decoded picture: copied out to YUV, or kept in VideoToolbox's pixel buffer (zero-copy
+/// `Native` frames, and HDR pictures converted to BGRA by `PixelTransfer`).
+enum Picture {
+    Copied(YuvFrame),
+    Kept { pixel_buffer: CFRetained<CVPixelBuffer>, size: (u32, u32), pts: Duration },
+}
+
+impl Picture {
+    fn pts(&self) -> Duration {
+        match self {
+            Picture::Copied(f) => f.pts,
+            Picture::Kept { pts, .. } => *pts,
+        }
+    }
+}
+
 /// Where the output callback leaves pictures (called from VideoToolbox's threads).
 struct Sink {
-    frames: Mutex<Vec<YuvFrame>>,
+    frames: Mutex<Vec<Picture>>,
     error: Mutex<Option<String>>,
     matrix: Option<ColorMatrix>,
     display_height: u32,
+    /// Keep 10-bit samples (`YuvPlanes::U16`) instead of shifting them to 8 bits.
+    ten_bit: bool,
+    /// Keep the pixel buffers instead of copying the pictures out.
+    keep: bool,
 }
 
 /// A live session; invalidated (and its callback context freed) when dropped.
@@ -94,13 +119,24 @@ pub struct VtVideoDecoder {
     hint: Option<(u32, u32)>,
     /// Decoded pictures sorted by pts. VideoToolbox emits them in decode order; `depth` of them
     /// are held back so the rest come out in display order (all at the end of the stream).
-    window: Vec<YuvFrame>,
+    window: Vec<Picture>,
     /// Pictures that can follow a later-decoded one in display order: from the stream's SPS,
     /// deepened if a picture ever arrives after a later one was released.
     depth: usize,
     /// The last released picture's pts.
     last_out: Option<Duration>,
     eof: bool,
+    ten_bit: bool,
+    /// Hand out SDR pictures as zero-copy `Native` frames (`OutputPrefs::native`).
+    native: bool,
+    /// Convert pictures (not handed out as `Native`) to SDR BGRA with `PixelTransfer`
+    /// (`OutputPrefs::gpu_bgra`): tone mapped when HDR.
+    gpu_bgra: bool,
+    transfer: Option<PixelTransfer>,
+    /// `PixelTransfer` failed, or did not tone map like our CPU path: YUV for the CPU path.
+    gpu_failed: bool,
+    /// The first converted HDR picture has been checked against the CPU tone mapping.
+    checked: bool,
 }
 
 // SAFETY: the session is created and used only through `&mut self`, on the decode thread; the
@@ -108,7 +144,7 @@ pub struct VtVideoDecoder {
 unsafe impl Send for VtVideoDecoder {}
 
 impl VtVideoDecoder {
-    pub fn new(stream: &StreamInfo) -> Result<Self> {
+    pub fn new(stream: &StreamInfo, prefs: crate::output::OutputPrefs) -> Result<Self> {
         if video_codec_type(&stream.codec).is_none() && stream.codec != Codec::ProRes {
             return Err(Error::Unsupported("codec for VideoToolbox"));
         }
@@ -118,7 +154,22 @@ impl VtVideoDecoder {
             // AV1 and VP9 show frames in decode order (hidden frames are not output); ProRes is intra.
             _ => 0,
         } as usize;
-        Ok(Self { stream: stream.clone(), session: None, hint: None, window: Vec::new(), depth, last_out: None, eof: false })
+        let hdr = StreamColor::of(stream).transfer.is_some_and(|t| t.is_hdr());
+        Ok(Self {
+            stream: stream.clone(),
+            session: None,
+            hint: None,
+            window: Vec::new(),
+            depth,
+            last_out: None,
+            eof: false,
+            ten_bit: prefs.ten_bit,
+            native: prefs.native && !hdr,
+            gpu_bgra: prefs.gpu_bgra && !(prefs.native && !hdr),
+            transfer: None,
+            gpu_failed: false,
+            checked: false,
+        })
     }
 
     fn display(&self) -> (u32, u32) {
@@ -197,13 +248,25 @@ impl VtVideoDecoder {
             entries.push((w_key, tw.as_ref()));
             entries.push((h_key, th.as_ref()));
         }
+        let keep = self.keeps_pictures();
+        let empty = cf::dictionary(&[]);
+        let metal = cf::boolean(true);
+        if keep {
+            // Pictures a GPU renderer draws directly (Metal textures over IOSurfaces).
+            // SAFETY: immutable framework constants.
+            let (iosurface_key, metal_key) = unsafe { (kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferMetalCompatibilityKey) };
+            entries.push((iosurface_key, empty.as_ref()));
+            entries.push((metal_key, metal.as_ref()));
+        }
         let attributes = cf::dictionary(&entries);
 
         let sink = Box::new(Sink {
             frames: Mutex::new(Vec::new()),
             error: Mutex::new(None),
-            matrix: s.color_matrix.and_then(ColorMatrix::from_h273),
+            matrix: Some(self.color(false).matrix),
             display_height: h,
+            ten_bit: self.ten_bit,
+            keep,
         });
         let callback = VTDecompressionOutputCallbackRecord {
             decompressionOutputCallback: Some(on_output),
@@ -227,14 +290,80 @@ impl VtVideoDecoder {
         }
         let frames = std::mem::take(&mut *s.sink.frames.lock().unwrap());
         for f in frames {
-            if !crate::apple::reorder::admit(self.last_out, f.pts, &mut self.depth) {
-                log::warn!("VideoToolbox: picture at {:?} after {:?}; holding back {}", f.pts, self.last_out.unwrap(), self.depth);
+            if !crate::apple::reorder::admit(self.last_out, f.pts(), &mut self.depth) {
+                log::warn!("VideoToolbox: picture at {:?} after {:?}; holding back {}", f.pts(), self.last_out.unwrap(), self.depth);
                 continue;
             }
-            let at = self.window.partition_point(|w| w.pts < f.pts);
+            let at = self.window.partition_point(|w| w.pts() < f.pts());
             self.window.insert(at, f);
         }
         Ok(())
+    }
+
+    fn keeps_pictures(&self) -> bool {
+        self.native || (self.gpu_bgra && !self.gpu_failed)
+    }
+
+    /// The colour of this stream's pictures, with the range of the pixel format decoded to.
+    /// Container tags first, then the SPS VUI, then a guess from the height.
+    fn color(&self, full_range: bool) -> ColorInfo {
+        let s = &self.stream;
+        let vui = s.extradata.as_deref().and_then(|c| crate::nal::vui_color(&s.codec, c));
+        ColorInfo { full_range, ..ColorInfo::resolve(s, vui, s.height) }
+    }
+
+    /// A released picture as the frame the pipeline gets.
+    fn deliver(&mut self, picture: Picture) -> Result<DecodedFrame> {
+        let (pixel_buffer, size, pts) = match picture {
+            Picture::Copied(f) => return Ok(DecodedFrame::Yuv(f)),
+            Picture::Kept { pixel_buffer, size, pts } => (pixel_buffer, size, pts),
+        };
+        let full_range = output_format(&pixel_buffer).is_some_and(|f| f.full_range);
+        let color = self.color(full_range);
+        if self.native {
+            return Ok(DecodedFrame::Native(NativeFrame::new(pixel_buffer, size.0, size.1, color, pts)));
+        }
+        if !self.gpu_failed {
+            match self.convert(&pixel_buffer, size, color, pts) {
+                Ok(frame) => return Ok(frame),
+                Err(e) => {
+                    log::warn!("VideoToolbox: converting on the GPU failed ({e}); converting on the CPU from now on");
+                    self.gpu_failed = true;
+                    self.transfer = None;
+                }
+            }
+        }
+        // SAFETY: a live pixel buffer.
+        let mut f = unsafe { copy_picture(&pixel_buffer, pts, Some(color.matrix), size.1, true) }.map_err(Error::Decode)?;
+        f.color = color;
+        Ok(DecodedFrame::Yuv(f))
+    }
+
+    /// A picture converted to SDR BGRA by `PixelTransfer`, at the size the hint allows. The first
+    /// one is compared with our CPU path (which tone maps HDR): if VideoToolbox's result differs
+    /// (e.g. it did not tone map: a dim picture), this fails and the stream continues on the CPU.
+    fn convert(&mut self, pixel_buffer: &CVPixelBuffer, size: (u32, u32), color: ColorInfo, pts: Duration) -> Result<DecodedFrame> {
+        if self.transfer.is_none() {
+            self.transfer = Some(PixelTransfer::new()?);
+        }
+        let transfer = self.transfer.as_mut().expect("created above");
+        if !self.checked {
+            self.checked = true;
+            let gpu = transfer.convert(pixel_buffer, size, &color)?;
+            // SAFETY: a live pixel buffer.
+            let mut cpu_frame = unsafe { copy_picture(pixel_buffer, pts, Some(color.matrix), size.1, true) }.map_err(Error::Decode)?;
+            cpu_frame.color = color;
+            let mut cpu = Vec::new();
+            crate::convert::frame_to_bgra(&cpu_frame, &mut cpu)?;
+            let db = luma_psnr(&gpu, &cpu);
+            log::info!("VideoToolbox → BGRA: {db:.1} dB (luma) against the CPU path");
+            if db < 30.0 {
+                return Err(Error::Decode(format!("VTPixelTransferSession output differs from the CPU path ({db:.1} dB)")));
+            }
+        }
+        let dst = self.hint.and_then(|h| fit_within(size.0, size.1, h)).unwrap_or(size);
+        let bgra = transfer.convert(pixel_buffer, dst, &color)?;
+        Ok(DecodedFrame::Bgra { width: dst.0, height: dst.1, bgra, transfer: color.transfer, pts })
     }
 
     /// Lets the session emit what it holds back, then collects it.
@@ -286,8 +415,8 @@ impl VideoDecoder for VtVideoDecoder {
         self.collect()?;
         if self.window.len() > self.depth || (self.eof && !self.window.is_empty()) {
             let f = self.window.remove(0);
-            self.last_out = Some(f.pts);
-            return Ok(Some(DecodedFrame::Yuv(f)));
+            self.last_out = Some(f.pts());
+            return self.deliver(f).map(Some);
         }
         Ok(None)
     }
@@ -308,6 +437,10 @@ impl VideoDecoder for VtVideoDecoder {
 
     fn set_output_hint(&mut self, max: Option<(u32, u32)>) {
         self.hint = max;
+    }
+
+    fn gpu_fallback(&self) -> bool {
+        self.gpu_bgra && self.gpu_failed
     }
 }
 
@@ -362,8 +495,15 @@ unsafe extern "C-unwind" fn on_output(
         if image.is_null() || flags.contains(VTDecodeInfoFlags::FrameDropped) {
             return Ok(None);
         }
+        let pts = cm_time(pts);
+        if sink.keep {
+            // SAFETY: a valid pixel buffer for the duration of the callback; retained here.
+            let pixel_buffer = unsafe { CFRetained::retain(NonNull::new_unchecked(image)) };
+            let size = (CVPixelBufferGetWidth(&pixel_buffer) as u32, CVPixelBufferGetHeight(&pixel_buffer) as u32);
+            return Ok(Some(Picture::Kept { pixel_buffer, size, pts }));
+        }
         // SAFETY: a valid pixel buffer for the duration of the callback.
-        unsafe { copy_out(&*image, pts, sink) }.map(Some)
+        unsafe { copy_picture(&*image, pts, sink.matrix, sink.display_height, sink.ten_bit) }.map(|f| Some(Picture::Copied(f)))
     }));
     let result = caught.unwrap_or_else(|_| Err("VideoToolbox: panic while copying a picture".into()));
     match result {
@@ -378,13 +518,49 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// The picture in `pb` (4:2:0 bi-planar, 8 or 10 bits) as an I420 frame.
+/// A `CMTime` as a duration (zero when invalid or negative).
+fn cm_time(t: CMTime) -> Duration {
+    if t.timescale > 0 && t.value >= 0 {
+        Duration::from_nanos((t.value as i128 * 1_000_000_000 / t.timescale as i128) as u64)
+    } else {
+        Duration::ZERO
+    }
+}
+
+/// The bi-planar YCbCr format of a picture, when it is one of ours.
+fn output_format(pb: &CVImageBuffer) -> Option<&'static OutputFormat> {
+    let code = CVPixelBufferGetPixelFormatType(pb);
+    FORMATS.iter().find(|f| f.code == code)
+}
+
+/// PSNR of the luma of two BGRA pictures. Luma only: chroma filtering legitimately differs
+/// between converters at hard colour edges; what this guards against (a picture not tone
+/// mapped, wrong matrix or range) shows in the brightness.
+fn luma_psnr(a: &[u8], b: &[u8]) -> f64 {
+    let luma = |p: &[u8; 4]| 0.0722 * p[0] as f64 + 0.7152 * p[1] as f64 + 0.2126 * p[2] as f64;
+    let (mut sum, mut n) = (0.0, 0usize);
+    for (x, y) in a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0) {
+        sum += (luma(x) - luma(y)).powi(2);
+        n += 1;
+    }
+    let mse = sum / n.max(1) as f64;
+    if mse == 0.0 { 99.0 } else { 10.0 * (255.0f64 * 255.0 / mse).log10() }
+}
+
+/// The picture in `pb` (bi-planar, 8 or 10 bits) as a planar frame: 16-bit samples when
+/// `ten_bit` and the picture has them. `matrix`: the stream's, else a guess from `display_height`.
 ///
 /// # Safety
 /// `pb` must be a valid pixel buffer.
-unsafe fn copy_out(pb: &CVImageBuffer, pts: CMTime, sink: &Sink) -> std::result::Result<YuvFrame, String> {
-    let code = CVPixelBufferGetPixelFormatType(pb);
-    let Some(format) = FORMATS.iter().find(|f| f.code == code) else {
+pub(super) unsafe fn copy_picture(
+    pb: &CVImageBuffer,
+    pts: Duration,
+    matrix: Option<ColorMatrix>,
+    display_height: u32,
+    ten_bit: bool,
+) -> std::result::Result<YuvFrame, String> {
+    let Some(format) = output_format(pb) else {
+        let code = CVPixelBufferGetPixelFormatType(pb);
         return Err(format!("VideoToolbox output format {:?} is not a bi-planar YCbCr one", code.to_be_bytes()));
     };
     let (bytes_per_sample, full_range, layout) = (if format.ten_bit { 2 } else { 1 }, format.full_range, format.layout);
@@ -408,26 +584,25 @@ unsafe fn copy_out(pb: &CVImageBuffer, pts: CMTime, sink: &Sink) -> std::result:
                 std::slice::from_raw_parts(uv_base as *const u8, uv_stride * uv_rows),
             )
         };
-        Some(biplanar_to_planar(y, y_stride, uv, uv_stride, w as u32, h as u32, bytes_per_sample, layout))
+        Some(if ten_bit && format.ten_bit {
+            crate::decode::YuvPlanes::U16(biplanar_to_planar_u16(y, y_stride, uv, uv_stride, w as u32, h as u32, layout))
+        } else {
+            crate::decode::YuvPlanes::U8(biplanar_to_planar(y, y_stride, uv, uv_stride, w as u32, h as u32, bytes_per_sample, layout))
+        })
     };
     // SAFETY: unlocks the lock taken above.
     unsafe { CVPixelBufferUnlockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly) };
     let planes = planes.ok_or("a VideoToolbox picture without planes")?;
     let (w, h) = (w as u32, h as u32);
     let (cw, _) = chroma_size(layout, w, h);
-    let pts = if pts.timescale > 0 && pts.value >= 0 {
-        Duration::from_nanos((pts.value as i128 * 1_000_000_000 / pts.timescale as i128) as u64)
-    } else {
-        Duration::ZERO
-    };
     Ok(YuvFrame {
         width: w,
         height: h,
         layout,
+        bit_depth: if matches!(planes, crate::decode::YuvPlanes::U16(_)) { 10 } else { 8 },
         planes,
         strides: [w as usize, cw as usize, cw as usize],
-        matrix: sink.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(sink.display_height)),
-        full_range,
+        color: ColorInfo::sdr(matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(display_height)), full_range),
         pts,
     })
 }

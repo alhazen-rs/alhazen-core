@@ -19,7 +19,8 @@ use crate::hw::select::HwCodec;
 pub struct Gpu {
     pub manager: IMFDXGIDeviceManager,
     profiles: HashSet<u128>,
-    _device: ID3D11Device,
+    /// The device the decoders use; the video processor converts on it too.
+    pub device: ID3D11Device,
 }
 
 // SAFETY: the device is created with multithread protection (`ID3D11Multithread`), and the
@@ -67,7 +68,7 @@ fn create() -> windows::core::Result<Gpu> {
         MFCreateDXGIDeviceManager(&mut token, &mut manager)?;
         let manager = manager.ok_or_else(|| windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL))?;
         manager.ResetDevice(&device, token)?;
-        Ok(Gpu { manager, profiles, _device: device })
+        Ok(Gpu { manager, profiles, device })
     }
 }
 

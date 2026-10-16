@@ -38,7 +38,7 @@ fn gpu() -> bool {
 fn decode(name: &str, hint: Option<(u32, u32)>) -> Vec<YuvFrame> {
     let mut d = demuxer(name);
     let s = video(d.as_ref());
-    let mut dec = NvdecVideoDecoder::new(&s).unwrap();
+    let mut dec = NvdecVideoDecoder::new(&s, Default::default()).unwrap();
     let mut frames = vec![];
     while let Some(p) = d.next_packet().unwrap() {
         if p.stream != s.id {
@@ -114,7 +114,7 @@ fn pictures_match_ffmpeg() {
         ("vp9_10bit.webm", 35.0),
     ] {
         let f = &decode(name, None)[0];
-        let ours: Vec<u8> = f.planes.concat();
+        let ours: Vec<u8> = f.u8_planes().unwrap().concat();
         let Some(reference) = ffmpeg_first_frame(name) else {
             eprintln!("skipped comparison: no ffmpeg");
             return;
@@ -144,7 +144,7 @@ fn dropping_mid_stream_then_decoding_again() {
     }
     let mut d = demuxer("hevc.mkv");
     let s = video(d.as_ref());
-    let mut dec = NvdecVideoDecoder::new(&s).unwrap();
+    let mut dec = NvdecVideoDecoder::new(&s, Default::default()).unwrap();
     for _ in 0..5 {
         let p = d.next_packet().unwrap().unwrap();
         dec.send_packet(&p).unwrap();
@@ -165,7 +165,7 @@ fn two_decoders_on_two_threads() {
     // Each thread got its own pictures, intact (bit-exact vs ffmpeg for these 8-bit streams).
     for (name, frames) in [("av1.webm", &a), ("h264_aac.mp4", &b)] {
         let Some(reference) = ffmpeg_first_frame(name) else { return };
-        assert_eq!(psnr(&frames[0].planes.concat(), &reference), f64::INFINITY, "{name}");
+        assert_eq!(psnr(&frames[0].u8_planes().unwrap().concat(), &reference), f64::INFINITY, "{name}");
     }
 }
 
@@ -176,7 +176,7 @@ fn flush_then_restart_from_the_first_keyframe() {
     }
     let mut d = demuxer("h264_aac.mp4");
     let s = video(d.as_ref());
-    let mut dec = NvdecVideoDecoder::new(&s).unwrap();
+    let mut dec = NvdecVideoDecoder::new(&s, Default::default()).unwrap();
     let packets: Vec<_> = std::iter::from_fn(|| d.next_packet().unwrap()).filter(|p| p.stream == s.id).collect();
     for p in &packets[..10] {
         dec.send_packet(p).unwrap();
@@ -240,7 +240,7 @@ fn output_hint_changes_apply_at_the_next_keyframe_with_intact_pictures() {
     for (name, full, keys, shrink, grow) in [("av1.webm", 320, [0, 30, 60], 10, 40), ("h264_aac.ts", 320, [0, 25, 50], 10, 40)] {
         let mut d = demuxer(name);
         let s = video(d.as_ref());
-        let mut dec = NvdecVideoDecoder::new(&s).unwrap();
+        let mut dec = NvdecVideoDecoder::new(&s, Default::default()).unwrap();
         let mut frames = vec![];
         let mut sent = 0;
         while let Some(p) = d.next_packet().unwrap() {
@@ -272,7 +272,7 @@ fn output_hint_changes_apply_at_the_next_keyframe_with_intact_pictures() {
         }
         for (i, f) in frames.iter().enumerate().step_by(3) {
             let Some(reference) = ffmpeg_frame(name, i, (f.width, f.height)) else { return };
-            let db = psnr(&f.planes.concat(), &reference);
+            let db = psnr(&f.u8_planes().unwrap().concat(), &reference);
             assert!(db >= 25.0, "{name} frame {i} at {}x{}: {db:.1} dB (corrupt?)", f.width, f.height);
         }
     }
@@ -414,7 +414,7 @@ fn recovers_after_a_part_the_gpu_cannot_decode() {
     }
     let mut d = demuxer("vp9_too_wide.webm");
     let s = video(d.as_ref());
-    let mut dec = NvdecVideoDecoder::new(&s).unwrap();
+    let mut dec = NvdecVideoDecoder::new(&s, Default::default()).unwrap();
     let (mut frames, mut errors, mut skip_to_keyframe) = (vec![], 0, false);
     while let Some(p) = d.next_packet().unwrap() {
         if p.stream != s.id || (skip_to_keyframe && !p.keyframe) {
@@ -458,3 +458,187 @@ fn timestamps_round_trip_exactly() {
     }
 }
 
+
+/// ffmpeg's first frame as 16-bit little-endian planar 4:2:0, or `None` without ffmpeg.
+fn ffmpeg_10bit(name: &str) -> Option<Vec<u16>> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i", &fixture(name), "-frames:v", "1", "-pix_fmt", "yuv420p10le", "-f", "rawvideo", "-"])
+        .output()
+        .ok()?;
+    out.status.success().then(|| out.stdout.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect())
+}
+
+#[test]
+fn hevc_10bit_planes_match_ffmpeg_exactly() {
+    if !gpu() {
+        return;
+    }
+    let mut d = demuxer("hdr_pq.mkv");
+    let s = video(d.as_ref());
+    let prefs = alhazen_core::OutputPrefs { ten_bit: true, ..Default::default() };
+    let mut dec = NvdecVideoDecoder::new(&s, prefs).unwrap();
+    let frame = loop {
+        let p = d.next_packet().unwrap().expect("a frame before the end");
+        if p.stream != s.id {
+            continue;
+        }
+        dec.send_packet(&p).unwrap();
+        if let Some(DecodedFrame::Yuv(f)) = dec.receive_frame().unwrap() {
+            break f;
+        }
+    };
+    assert_eq!(frame.bit_depth, 10);
+    let alhazen_core::decode::YuvPlanes::U16(p) = &frame.planes else { panic!("expected 16-bit planes") };
+    let Some(reference) = ffmpeg_10bit("hdr_pq.mkv") else { return eprintln!("no ffmpeg") };
+    let packed: Vec<u16> = p.iter().flatten().copied().collect();
+    assert_eq!(packed.len(), reference.len());
+    assert!(packed == reference, "NVDEC 10-bit samples differ from ffmpeg's");
+}
+
+// GPU conversion (`OutputPrefs::gpu_bgra`): the CUDA kernel against the CPU path.
+
+use alhazen_core::color::StreamColor;
+use alhazen_core::convert::frame_to_bgra;
+use alhazen_core::scale::fit_within;
+
+/// The reference for the kernel's output: the CPU path's full-size BGRA (converted, tone mapped
+/// when HDR), scaled to the hinted size in RGB. (The CPU path itself scales the Y, U and V planes
+/// separately, which fringes colour at hard edges; the kernel scales after converting chroma
+/// sample by sample, so that is not what it should match.)
+fn cpu_bgra(f: &YuvFrame, hint: Option<(u32, u32)>) -> Vec<u8> {
+    use fast_image_resize::images::{Image, ImageRef};
+    use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
+    let mut full = Vec::new();
+    frame_to_bgra(f, &mut full).unwrap();
+    let Some((w, h)) = hint.and_then(|h| fit_within(f.width, f.height, h)) else { return full };
+    let src = ImageRef::new(f.width, f.height, &full, PixelType::U8x4).unwrap();
+    let mut dst = Image::new(w, h, PixelType::U8x4);
+    let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear));
+    Resizer::new().resize(&src, &mut dst, &options).unwrap();
+    dst.into_vec()
+}
+
+/// The first frame of `name` through the kernel (with output hint `hint`) and through the CPU
+/// path at the same size: their PSNR.
+fn gpu_vs_cpu(name: &str, hint: Option<(u32, u32)>) -> f64 {
+    let (mut d, s) = { let d = demuxer(name); let s = video(d.as_ref()); (d, s) };
+    let gpu_prefs = alhazen_core::OutputPrefs { gpu_bgra: true, ten_bit: true, ..Default::default() };
+    let cpu_prefs = alhazen_core::OutputPrefs { ten_bit: true, ..Default::default() };
+    let mut gpu = NvdecVideoDecoder::new(&s, gpu_prefs).unwrap();
+    let mut cpu = NvdecVideoDecoder::new(&s, cpu_prefs).unwrap();
+    gpu.set_output_hint(hint);
+    let (mut g, mut c) = (None, None);
+    while g.is_none() || c.is_none() {
+        let p = d.next_packet().unwrap().expect("frames before the end");
+        if p.stream != s.id {
+            continue;
+        }
+        gpu.send_packet(&p).unwrap();
+        cpu.send_packet(&p).unwrap();
+        if g.is_none() {
+            g = gpu.receive_frame().unwrap();
+        }
+        if c.is_none() {
+            c = cpu.receive_frame().unwrap();
+        }
+    }
+    let Some(DecodedFrame::Bgra { width, height, bgra, .. }) = g else { panic!("{name}: the GPU path gave no BGRA frame") };
+    let Some(DecodedFrame::Yuv(mut y)) = c else { panic!("{name}: the CPU path gave no YUV frame") };
+    y.color.apply_stream(&StreamColor::of(&s));
+    let want = hint.and_then(|h| fit_within(y.width, y.height, h)).unwrap_or((y.width, y.height));
+    assert_eq!((width, height), want, "{name}: output size");
+    let reference = cpu_bgra(&y, hint);
+    let db = psnr(&bgra, &reference);
+    eprintln!("{name} at {want:?}: {db:.1} dB");
+    db
+}
+
+#[test]
+fn sdr_kernel_matches_cpu() {
+    if gpu() {
+        assert!(gpu_vs_cpu("h264_aac.mp4", None) >= 45.0);
+    }
+}
+
+#[test]
+fn hdr_kernel_matches_cpu_tone_mapping() {
+    if gpu() {
+        assert!(gpu_vs_cpu("hdr_pq.mkv", None) >= 40.0);
+    }
+}
+
+#[test]
+fn scaled_kernel_close_to_cpu() {
+    if gpu() {
+        assert!(gpu_vs_cpu("h264_aac.mp4", Some((160, 90))) >= 35.0);
+    }
+}
+
+#[test]
+fn odd_sizes_match_cpu() {
+    if gpu() {
+        assert!(gpu_vs_cpu("h264_aac.mp4", Some((159, 89))) >= 35.0);
+    }
+}
+
+#[test]
+fn kernel_scales_to_a_new_size_on_any_frame() {
+    if !gpu() {
+        return;
+    }
+    let mut d = demuxer("h264_aac.mp4");
+    let s = video(d.as_ref());
+    let mut gpu = NvdecVideoDecoder::new(&s, alhazen_core::OutputPrefs { gpu_bgra: true, ..Default::default() }).unwrap();
+    let mut cpu = NvdecVideoDecoder::new(&s, Default::default()).unwrap();
+    let sizes = [None, Some((200, 112)), Some((120, 68))];
+    let (mut packets, mut checked) = (0usize, 0);
+    while let Some(p) = d.next_packet().unwrap() {
+        if p.stream != s.id {
+            continue;
+        }
+        let hint = sizes[(packets / 5).min(2)]; // changes at packets 5 and 10, which are not keyframes
+        assert!(packets % 5 != 0 || packets == 0 || !p.keyframe, "the fixture's GOP must not line up with the changes");
+        gpu.set_output_hint(hint);
+        gpu.send_packet(&p).unwrap();
+        cpu.send_packet(&p).unwrap();
+        packets += 1;
+        while let (Some(DecodedFrame::Bgra { width, height, bgra, .. }), Some(DecodedFrame::Yuv(y))) =
+            (gpu.receive_frame().unwrap(), cpu.receive_frame().unwrap())
+        {
+            let want = hint.and_then(|h| fit_within(y.width, y.height, h)).unwrap_or((y.width, y.height));
+            assert_eq!((width, height), want, "frame after packet {packets}");
+            let db = psnr(&bgra, &cpu_bgra(&y, hint));
+            assert!(db >= 35.0, "packet {packets}: {db:.1} dB at {want:?}");
+            checked += 1;
+        }
+        if packets == 14 {
+            break;
+        }
+    }
+    assert!(checked >= 8, "{checked} frames checked");
+}
+
+#[test]
+fn the_player_converts_on_the_gpu() {
+    if !gpu() {
+        return;
+    }
+    let config = alhazen_core::PlayerConfig {
+        clock: Some(std::sync::Arc::new(alhazen_core::clock::MockClock::new())),
+        audio_output: alhazen_core::audio::AudioOutputConfig::Disabled,
+        backend_order: Some(vec!["nvdec"]),
+        ..Default::default()
+    };
+    let player = alhazen_core::Player::open(Source::parse(&fixture("hdr_pq.mkv")).unwrap(), config).unwrap();
+    let start = std::time::Instant::now();
+    let frame = loop {
+        if let Some(f) = player.current_frame() {
+            break f;
+        }
+        assert!(start.elapsed() < Duration::from_secs(5), "no frame");
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert!(matches!(frame, alhazen_core::VideoFrame::Bgra { .. }));
+    let stats = player.stats();
+    assert_eq!((stats.video_backend, stats.conversion, stats.hdr), (Some("nvdec"), "gpu", alhazen_core::Transfer::Pq));
+}

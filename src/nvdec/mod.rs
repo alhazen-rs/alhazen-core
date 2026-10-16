@@ -15,6 +15,8 @@ pub use backend::NvdecBackend;
 pub use decoder::NvdecVideoDecoder;
 #[cfg(all(target_os = "linux", feature = "nvdec"))]
 mod sys;
+// The source hash check runs everywhere; the kernel itself only with NVDEC.
+mod kernel;
 
 /// Whether NVDEC can be used on this machine (driver libraries present, a CUDA device exists).
 pub fn available() -> bool {

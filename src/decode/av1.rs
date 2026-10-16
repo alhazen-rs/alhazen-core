@@ -27,14 +27,17 @@ pub struct Av1Decoder {
     ctx: Option<Dav1dContext>,
     /// Pictures pulled out while making room for input (dav1d returned EAGAIN on send).
     ready: VecDeque<DecodedFrame>,
+    /// Keep 10/12-bit samples instead of shifting them to 8 bits.
+    ten_bit: bool,
 }
 
 // SAFETY: the dav1d context is only ever used through `&mut self`, i.e. from one thread at a time.
 unsafe impl Send for Av1Decoder {}
 
 impl Av1Decoder {
-    /// `threads == 0` lets rav1d pick based on the CPU count.
-    pub fn new(threads: usize) -> Result<Self> {
+    /// `threads == 0` lets rav1d pick based on the CPU count. `ten_bit` keeps high-bit-depth
+    /// samples (`YuvPlanes::U16`).
+    pub fn new(threads: usize, ten_bit: bool) -> Result<Self> {
         let mut ctx: Option<Dav1dContext> = None;
         // SAFETY: settings are initialized by `dav1d_default_settings` before use; pointers are valid.
         let result = unsafe {
@@ -47,7 +50,7 @@ impl Av1Decoder {
         if result.0 != 0 || ctx.is_none() {
             return Err(Error::Decode(format!("dav1d_open failed ({})", result.0)));
         }
-        Ok(Self { ctx, ready: VecDeque::new() })
+        Ok(Self { ctx, ready: VecDeque::new(), ten_bit })
     }
 
     fn get_picture(&mut self) -> Result<Option<DecodedFrame>> {
@@ -61,7 +64,7 @@ impl Av1Decoder {
             if r != 0 {
                 return Err(Error::Decode(format!("dav1d_get_picture failed ({r})")));
             }
-            let frame = copy_picture(&pic);
+            let frame = copy_picture(&pic, self.ten_bit);
             dav1d_picture_unref(NonNull::new(&mut pic));
             Ok(Some(DecodedFrame::Yuv(frame)))
         }
@@ -136,7 +139,7 @@ impl Drop for Av1Decoder {
 ///
 /// # Safety
 /// `pic` must be a valid picture returned by `dav1d_get_picture`.
-unsafe fn copy_picture(pic: &Dav1dPicture) -> YuvFrame {
+unsafe fn copy_picture(pic: &Dav1dPicture, ten_bit: bool) -> YuvFrame {
     let (w, h) = (pic.p.w as u32, pic.p.h as u32);
     let bpc = pic.p.bpc as u32;
     let layout = match pic.p.layout {
@@ -154,38 +157,70 @@ unsafe fn copy_picture(pic: &Dav1dPicture) -> YuvFrame {
         _ => ColorMatrix::guess_for_height(h),
     };
     let full_range = seq.is_some_and(|s| s.color_range != 0);
+    let mut color = crate::color::ColorInfo::sdr(matrix, full_range);
+    // AV1 uses the H.273 code points for primaries and transfer.
+    if let Some(p) = seq.and_then(|s| u8::try_from(s.pri).ok()).and_then(crate::color::Primaries::from_h273) {
+        color.primaries = p;
+    }
+    if let Some(t) = seq.and_then(|s| u8::try_from(s.trc).ok()).and_then(crate::color::Transfer::from_h273) {
+        color.transfer = t;
+    }
+    // SAFETY: when set, these point at the picture's metadata, alive as long as the picture.
+    let (light, mastering) = unsafe { (pic.content_light.map(|p| p.as_ref()), pic.mastering_display.map(|p| p.as_ref())) };
+    if light.is_some() || mastering.is_some() {
+        let mut hdr = crate::color::HdrMetadata::default();
+        if let Some(l) = light {
+            (hdr.max_cll, hdr.max_fall) = (Some(l.max_content_light_level), Some(l.max_frame_average_light_level));
+        }
+        if let Some(m) = mastering {
+            // Chromaticities in 0.16 fixed point (R, G, B); luminance 24.8 (max) and 18.14 (min).
+            let xy = |v: [u16; 2]| (v[0] as f32 / 65536.0, v[1] as f32 / 65536.0);
+            hdr.display_primaries = Some([xy(m.primaries[0]), xy(m.primaries[1]), xy(m.primaries[2])]);
+            hdr.white_point = Some(xy(m.white_point));
+            hdr.max_luminance = Some(m.max_luminance as f32 / 256.0);
+            hdr.min_luminance = Some(m.min_luminance as f32 / 16384.0);
+        }
+        color.hdr = Some(hdr);
+    }
     let (cw, ch) = chroma_size(layout, w, h);
     let dims = [(w, h), (cw, ch), (cw, ch)];
-    let mut planes: [Vec<u8>; 3] = Default::default();
-    for (i, plane) in planes.iter_mut().enumerate() {
+    let wide = ten_bit && bpc > 8;
+    let mut narrow: [Vec<u8>; 3] = Default::default();
+    let mut deep: [Vec<u16>; 3] = Default::default();
+    for i in 0..3 {
         let (pw, ph) = dims[i];
         let Some(src) = pic.data[i] else { continue };
         if pw == 0 {
             continue;
         }
         let stride = pic.stride[(i > 0) as usize];
-        plane.reserve_exact((pw * ph) as usize);
         for row in 0..ph as isize {
             // SAFETY: dav1d guarantees `ph` rows of `stride` bytes, each with `pw` samples.
             unsafe {
                 let row_ptr = (src.as_ptr() as *const u8).offset(row * stride);
                 if bpc > 8 {
                     let samples = std::slice::from_raw_parts(row_ptr as *const u16, pw as usize);
-                    plane.extend(samples.iter().map(|s| (s >> (bpc - 8)) as u8));
+                    if wide {
+                        deep[i].extend_from_slice(samples);
+                    } else {
+                        narrow[i].extend(samples.iter().map(|s| (s >> (bpc - 8)) as u8));
+                    }
                 } else {
-                    plane.extend_from_slice(std::slice::from_raw_parts(row_ptr, pw as usize));
+                    narrow[i].extend_from_slice(std::slice::from_raw_parts(row_ptr, pw as usize));
                 }
             }
         }
     }
+    let (planes, bit_depth) =
+        if wide { (crate::decode::YuvPlanes::U16(deep), bpc as u8) } else { (crate::decode::YuvPlanes::U8(narrow), 8) };
     YuvFrame {
         width: w,
         height: h,
         layout,
         planes,
         strides: [w as usize, cw as usize, cw as usize],
-        matrix,
-        full_range,
+        bit_depth,
+        color,
         pts: Duration::from_nanos(pic.m.timestamp.max(0) as u64),
     }
 }
@@ -197,7 +232,7 @@ mod tests {
     use crate::source::FileSource;
 
     fn decode_all(mut demuxer: Box<dyn Demuxer>) -> Vec<YuvFrame> {
-        let mut dec = Av1Decoder::new(2).unwrap();
+        let mut dec = Av1Decoder::new(2, false).unwrap();
         let mut frames = vec![];
         while let Some(p) = demuxer.next_packet().unwrap() {
             dec.send_packet(&p).unwrap();
@@ -218,9 +253,9 @@ mod tests {
         assert_eq!(frames.len(), 60);
         let f = &frames[0];
         assert_eq!((f.width, f.height, f.layout), (320, 240, PixelLayout::I420));
-        assert_eq!(f.planes[0].len(), 320 * 240);
-        assert_eq!(f.planes[1].len(), 160 * 120);
-        assert_eq!(f.matrix, ColorMatrix::Bt601);
+        assert_eq!(f.u8_planes().unwrap()[0].len(), 320 * 240);
+        assert_eq!(f.u8_planes().unwrap()[1].len(), 160 * 120);
+        assert_eq!(f.color.matrix, ColorMatrix::Bt601);
         assert!(frames.windows(2).all(|w| w[0].pts < w[1].pts), "frames come out in display order");
     }
 
@@ -232,7 +267,7 @@ mod tests {
 
     #[test]
     fn garbage_packet_is_an_error_not_a_crash() {
-        let mut dec = Av1Decoder::new(1).unwrap();
+        let mut dec = Av1Decoder::new(1, false).unwrap();
         let p = Packet {
             stream: 1,
             pts: Duration::ZERO,

@@ -8,7 +8,10 @@ use windows::core::{GUID, Interface};
 
 use crate::hw::select::HwCodec;
 use super::mft::{self, Output, err};
+use super::processor::Processor;
 use super::{codecs, device, runtime};
+use crate::color::{ColorInfo, StreamColor};
+use crate::scale::fit_within;
 use crate::decode::{ColorMatrix, DecodedFrame, PixelLayout, VideoDecoder, YuvFrame, chroma_size};
 use crate::demux::{Packet, StreamInfo};
 use crate::nal::{AnnexB, ParamSetFormat};
@@ -39,8 +42,52 @@ pub struct MfVideoDecoder {
     allow_gpu: bool,
     annexb: Option<AnnexB>,
     state: Option<State>,
-    ready: VecDeque<YuvFrame>,
+    ready: VecDeque<DecodedFrame>,
     scratch: Vec<u8>,
+    conversion: Conversion,
+}
+
+/// How output pictures are handed out: as YUV (10-bit when `ten_bit`), or converted to BGRA by
+/// the D3D11 video processor when decoding on the GPU and `gpu_bgra` is asked for.
+struct Conversion {
+    ten_bit: bool,
+    gpu_bgra: bool,
+    hint: Option<(u32, u32)>,
+    processor: Option<Processor>,
+    /// The video processor failed: YUV for the CPU path from now on.
+    failed: bool,
+    stream: StreamColor,
+}
+
+impl Conversion {
+    fn frame(&mut self, sample: &IMFSample, out: &OutFormat, on_gpu: bool) -> Result<DecodedFrame> {
+        if self.gpu_bgra && on_gpu && !self.failed {
+            match self.convert(sample, out) {
+                Ok(frame) => return Ok(frame),
+                Err(e) => {
+                    log::warn!("Media Foundation: converting on the GPU failed ({e}); converting on the CPU from now on");
+                    self.failed = true;
+                    self.processor = None;
+                }
+            }
+        }
+        read_frame(sample, out, self.ten_bit).map(DecodedFrame::Yuv)
+    }
+
+    fn convert(&mut self, sample: &IMFSample, out: &OutFormat) -> Result<DecodedFrame> {
+        let gpu = device::gpu().ok_or(Error::Unsupported("D3D11 video device"))?;
+        let src = out.visible;
+        let dst = self.hint.and_then(|h| fit_within(src.0, src.1, h)).unwrap_or(src);
+        if !self.processor.as_ref().is_some_and(|p| p.fits(src, dst)) {
+            self.processor = Some(Processor::new(&gpu.device, src, dst)?);
+        }
+        let mut color = ColorInfo::sdr(out.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(src.1)), out.full_range);
+        color.apply_stream(&self.stream);
+        let bgra = self.processor.as_mut().expect("created above").convert(sample, &color)?;
+        // SAFETY: COM call on a live sample.
+        let pts = mft::from_mf_time(unsafe { sample.GetSampleTime() }.unwrap_or(0));
+        Ok(DecodedFrame::Bgra { width: dst.0, height: dst.1, bgra, transfer: color.transfer, pts })
+    }
 }
 
 // SAFETY: the transform is created lazily on the first packet, on the decode thread that owns
@@ -58,7 +105,22 @@ impl MfVideoDecoder {
             }
             _ => None,
         };
-        Ok(Self { codec, stream: stream.clone(), allow_gpu, annexb, state: None, ready: VecDeque::new(), scratch: Vec::new() })
+        let conversion =
+            Conversion { ten_bit: false, gpu_bgra: false, hint: None, processor: None, failed: false, stream: StreamColor::of(stream) };
+        Ok(Self { codec, stream: stream.clone(), allow_gpu, annexb, state: None, ready: VecDeque::new(), scratch: Vec::new(), conversion })
+    }
+
+    /// Keeps 10-bit samples of 10-bit streams (`YuvPlanes::U16`).
+    pub fn with_ten_bit(mut self, ten_bit: bool) -> Self {
+        self.conversion.ten_bit = ten_bit;
+        self
+    }
+
+    /// Converts GPU-decoded pictures to BGRA with the D3D11 video processor (scaled to the
+    /// output hint, tone mapped by the driver for HDR).
+    pub fn with_gpu_bgra(mut self, gpu_bgra: bool) -> Self {
+        self.conversion.gpu_bgra = gpu_bgra;
+        self
     }
 
     /// The transform's name and whether it decodes on the GPU (after the first packet).
@@ -106,7 +168,7 @@ impl MfVideoDecoder {
             let state = self.state.as_mut().unwrap();
             match mft::process_output(&state.mft)? {
                 Output::Sample(s) => {
-                    let f = read_frame(&s, &state.out)?;
+                    let f = self.conversion.frame(&s, &state.out, state.gpu)?;
                     self.ready.push_back(f);
                 }
                 Output::NeedMoreInput => return Ok(()),
@@ -152,7 +214,7 @@ impl VideoDecoder for MfVideoDecoder {
             loop {
                 match mft::process_output(&state.mft)? {
                     Output::Sample(s) => {
-                        self.ready.push_back(read_frame(&s, &state.out)?);
+                        self.ready.push_back(self.conversion.frame(&s, &state.out, state.gpu)?);
                         break;
                     }
                     Output::NeedMoreInput => break,
@@ -160,7 +222,15 @@ impl VideoDecoder for MfVideoDecoder {
                 }
             }
         }
-        Ok(self.ready.pop_front().map(DecodedFrame::Yuv))
+        Ok(self.ready.pop_front())
+    }
+
+    fn set_output_hint(&mut self, max: Option<(u32, u32)>) {
+        self.conversion.hint = max;
+    }
+
+    fn gpu_fallback(&self) -> bool {
+        self.conversion.gpu_bgra && self.conversion.failed
     }
 
     fn send_eof(&mut self) {
@@ -233,7 +303,41 @@ fn negotiate_output(mft: &IMFTransform, stream: &StreamInfo) -> Result<OutFormat
 }
 
 /// Copies an NV12/P010 output sample into an 8-bit I420 `YuvFrame`.
-fn read_frame(sample: &IMFSample, out: &OutFormat) -> Result<YuvFrame> {
+/// Copies the visible picture out of an NV12/P010 buffer at `base` (`pitch` bytes per row),
+/// converting each sample with `sample_at(row, index)`.
+///
+/// # Safety
+/// `base` must point at `pitch × coded height` luma rows followed by the chroma rows.
+unsafe fn read_planes<T: Copy + Default>(
+    base: *const u8,
+    pitch: usize,
+    out: &OutFormat,
+    sample_at: impl Fn(*const u8, usize) -> T,
+) -> [Vec<T>; 3] {
+    let (w, h) = out.visible;
+    let (cw, ch) = chroma_size(PixelLayout::I420, w, h);
+    let (mut y, mut u, mut v) = (vec![T::default(); (w * h) as usize], vec![T::default(); (cw * ch) as usize], vec![T::default(); (cw * ch) as usize]);
+    // SAFETY: rows within the layout described by the caller's contract.
+    unsafe {
+        for r in 0..h as usize {
+            let row = base.add(r * pitch);
+            for c in 0..w as usize {
+                y[r * w as usize + c] = sample_at(row, c);
+            }
+        }
+        let uv = base.add(pitch * out.coded.1 as usize);
+        for r in 0..ch as usize {
+            let row = uv.add(r * pitch);
+            for c in 0..cw as usize {
+                u[r * cw as usize + c] = sample_at(row, 2 * c);
+                v[r * cw as usize + c] = sample_at(row, 2 * c + 1);
+            }
+        }
+    }
+    [y, u, v]
+}
+
+fn read_frame(sample: &IMFSample, out: &OutFormat, ten_bit: bool) -> Result<YuvFrame> {
     // SAFETY: the buffer is locked while read and unlocked after; reads stay within the
     // locked pitch × coded-height layout the format describes.
     unsafe {
@@ -241,45 +345,38 @@ fn read_frame(sample: &IMFSample, out: &OutFormat) -> Result<YuvFrame> {
         let buffer = sample.ConvertToContiguousBuffer().map_err(err("output buffer"))?;
         let bps = if out.p010 { 2 } else { 1 };
         let (w, h) = out.visible;
-        let (cw, ch) = chroma_size(PixelLayout::I420, w, h);
-        let (mut y, mut u, mut v) = (vec![0u8; (w * h) as usize], vec![0u8; (cw * ch) as usize], vec![0u8; (cw * ch) as usize]);
-        let mut read = |base: *const u8, pitch: usize| {
-            let sample_at = |row: *const u8, i: usize| if out.p010 { *row.add(2 * i + 1) } else { *row.add(i) };
-            for r in 0..h as usize {
-                let row = base.add(r * pitch);
-                for c in 0..w as usize {
-                    y[r * w as usize + c] = sample_at(row, c);
-                }
-            }
-            let uv = base.add(pitch * out.coded.1 as usize);
-            for r in 0..ch as usize {
-                let row = uv.add(r * pitch);
-                for c in 0..cw as usize {
-                    u[r * cw as usize + c] = sample_at(row, 2 * c);
-                    v[r * cw as usize + c] = sample_at(row, 2 * c + 1);
-                }
+        let (cw, _) = chroma_size(PixelLayout::I420, w, h);
+        let wide = ten_bit && out.p010;
+        let read = |base: *const u8, pitch: usize| {
+            if wide {
+                // P010: little-endian 16-bit, the 10 bits at the top.
+                crate::decode::YuvPlanes::U16(read_planes(base, pitch, out, |row, i| u16::from_le_bytes([*row.add(2 * i), *row.add(2 * i + 1)]) >> 6))
+            } else {
+                crate::decode::YuvPlanes::U8(read_planes(base, pitch, out, |row, i| if out.p010 { *row.add(2 * i + 1) } else { *row.add(i) }))
             }
         };
+        let planes;
         if let Ok(b2) = buffer.cast::<IMF2DBuffer>() {
             let (mut ptr, mut pitch) = (std::ptr::null_mut(), 0i32);
             b2.Lock2D(&mut ptr, &mut pitch).map_err(err("lock"))?;
-            read(ptr, pitch as usize);
+            planes = read(ptr, pitch as usize);
             b2.Unlock2D().map_err(err("unlock"))?;
         } else {
             let mut ptr = std::ptr::null_mut();
             buffer.Lock(&mut ptr, None, None).map_err(err("lock"))?;
-            read(ptr, out.coded.0 as usize * bps);
+            planes = read(ptr, out.coded.0 as usize * bps);
             buffer.Unlock().map_err(err("unlock"))?;
         }
         Ok(YuvFrame {
             width: w,
             height: h,
             layout: PixelLayout::I420,
-            planes: [y, u, v],
+            planes,
             strides: [w as usize, cw as usize, cw as usize],
-            matrix: out.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(h)),
-            full_range: out.full_range,
+            bit_depth: if wide { 10 } else { 8 },
+            color: crate::color::ColorInfo::sdr(out.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(h)), out.full_range),
             pts,
         })
     }
 }
+

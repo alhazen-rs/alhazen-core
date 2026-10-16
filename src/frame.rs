@@ -5,24 +5,97 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crate::decode::YuvFrame;
+
 #[derive(Clone, Debug)]
 pub enum VideoFrame {
-    /// Tightly packed BGRA, `width * 4` bytes per row.
-    Cpu { width: u32, height: u32, bgra: Arc<[u8]>, pts: Duration },
-    // Phase 4 (macOS): MacSurface(CVPixelBuffer)
+    /// Tightly packed BGRA, `width * 4` bytes per row. Always SDR.
+    Bgra { width: u32, height: u32, bgra: Arc<[u8]>, pts: Duration },
+    /// Planar YUV: 8-bit, or 10-bit when `FrameFormat::Yuv10` was asked for.
+    Yuv(Arc<YuvFrame>),
+    /// macOS: VideoToolbox's pixel buffer, for drawing without a copy (`FrameFormat::Native`).
+    #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+    Native(crate::apple::NativeFrame),
 }
 
 impl VideoFrame {
     pub fn pts(&self) -> Duration {
         match self {
-            VideoFrame::Cpu { pts, .. } => *pts,
+            VideoFrame::Bgra { pts, .. } => *pts,
+            VideoFrame::Yuv(f) => f.pts,
+            #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+            VideoFrame::Native(f) => f.pts,
         }
     }
     pub fn size(&self) -> (u32, u32) {
         match self {
-            VideoFrame::Cpu { width, height, .. } => (*width, *height),
+            VideoFrame::Bgra { width, height, .. } => (*width, *height),
+            VideoFrame::Yuv(f) => (f.width, f.height),
+            #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+            VideoFrame::Native(f) => (f.width, f.height),
         }
     }
+}
+
+/// Buffers for pictures coming back from a GPU, reused once the renderer has let go of them.
+/// A 4K BGRA picture is 33 MB: allocating one per frame costs thousands of page faults each
+/// time, while refilling memory already mapped is a plain copy.
+#[derive(Default)]
+#[cfg_attr(
+    not(any(
+        all(target_os = "linux", feature = "nvdec"),
+        all(windows, feature = "media-foundation"),
+        all(target_os = "macos", feature = "videotoolbox")
+    )),
+    allow(dead_code)
+)]
+pub(crate) struct FramePool {
+    buffers: VecDeque<Arc<[u8]>>,
+}
+
+#[cfg_attr(
+    not(any(
+        all(target_os = "linux", feature = "nvdec"),
+        all(windows, feature = "media-foundation"),
+        all(target_os = "macos", feature = "videotoolbox")
+    )),
+    allow(dead_code)
+)]
+impl FramePool {
+    /// Buffers kept for reuse (the frame queue and the renderer hold a few at a time).
+    const KEEP: usize = 8;
+
+    /// A `len`-byte buffer written by `write`: a released one of that size when there is one.
+    pub fn fill(&mut self, len: usize, write: impl FnOnce(&mut [u8])) -> Arc<[u8]> {
+        if let Some(i) = self.buffers.iter().position(|b| b.len() == len && Arc::strong_count(b) == 1) {
+            let mut buffer = self.buffers.remove(i).expect("found above");
+            write(Arc::get_mut(&mut buffer).expect("only the pool holds it"));
+            self.buffers.push_back(buffer.clone());
+            return buffer;
+        }
+        let buffer = Arc::<[u8]>::new_zeroed_slice(len);
+        // SAFETY: zeroed bytes are valid `u8`s.
+        let mut buffer = unsafe { buffer.assume_init() };
+        write(Arc::get_mut(&mut buffer).expect("just allocated"));
+        if self.buffers.len() >= Self::KEEP {
+            self.buffers.pop_front();
+        }
+        self.buffers.push_back(buffer.clone());
+        buffer
+    }
+}
+
+/// A frame format the renderer can draw (`PlayerConfig::frame_formats`, most preferred first).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameFormat {
+    /// BGRA, always SDR; always available as the fallback.
+    Bgra,
+    /// 8-bit planar YUV with its colour description.
+    Yuv,
+    /// Planar YUV keeping 10-bit samples (16-bit planes) and HDR metadata.
+    Yuv10,
+    /// macOS: VideoToolbox's own pixel buffer, for zero-copy drawing (SDR sources only).
+    Native,
 }
 
 struct Inner {
@@ -131,12 +204,52 @@ impl FrameQueue {
 }
 
 #[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    fn fill(pool: &mut FramePool, len: usize, byte: u8) -> Arc<[u8]> {
+        pool.fill(len, |dst| dst.fill(byte))
+    }
+
+    #[test]
+    fn a_released_buffer_is_reused() {
+        let mut pool = FramePool::default();
+        let a = fill(&mut pool, 64, 1);
+        let at = a.as_ptr();
+        drop(a);
+        let b = fill(&mut pool, 64, 2);
+        assert_eq!(b.as_ptr(), at, "the released buffer is filled again");
+        assert!(b.iter().all(|&x| x == 2));
+    }
+
+    #[test]
+    fn a_buffer_still_held_is_never_overwritten() {
+        let mut pool = FramePool::default();
+        let held: Vec<_> = (0..10).map(|i| fill(&mut pool, 64, i)).collect();
+        for (i, h) in held.iter().enumerate() {
+            assert!(h.iter().all(|&x| x == i as u8), "buffer {i} was overwritten");
+        }
+    }
+
+    #[test]
+    fn only_buffers_of_the_same_size_are_reused() {
+        let mut pool = FramePool::default();
+        let a = fill(&mut pool, 64, 1);
+        let at = a.as_ptr();
+        drop(a);
+        let b = fill(&mut pool, 128, 2);
+        assert_eq!(b.len(), 128);
+        assert_ne!(b.as_ptr(), at);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::thread;
 
     fn frame(ms: u64) -> VideoFrame {
-        VideoFrame::Cpu { width: 1, height: 1, bgra: Arc::from(vec![0u8; 4]), pts: Duration::from_millis(ms) }
+        VideoFrame::Bgra { width: 1, height: 1, bgra: Arc::from(vec![0u8; 4]), pts: Duration::from_millis(ms) }
     }
 
     #[test]

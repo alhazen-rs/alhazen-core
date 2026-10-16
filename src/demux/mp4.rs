@@ -149,6 +149,12 @@ impl Mp4Demuxer {
                     _ => StreamKind::Other,
                 };
             }
+            if info.kind == StreamKind::Video
+                && let Some((_, entry)) = sample_entry(&moov, track.track_id)
+            {
+                // VisualSampleEntry: 78 bytes of fields before its child boxes.
+                visual_colour(entry.get(78..).unwrap_or_default(), &mut info);
+            }
             let track_samples = track.samples.iter().map(|s| SampleRef {
                 stream: track.track_id,
                 offset: s.offset,
@@ -382,6 +388,41 @@ fn handler_type(moov: &[u8], track_id: u32) -> Option<&[u8; 4]> {
 /// `track_id`'s first sample entry as (FourCC, payload).
 fn sample_entry(moov: &[u8], track_id: u32) -> Option<(&[u8], &[u8])> {
     boxes(sample_entries(moov, track_id)?).next()
+}
+
+/// Colour description and HDR10 metadata from a visual sample entry's child boxes: `colr`
+/// (`nclx`: primaries, transfer, matrix, full-range flag), `mdcv` (mastering display: G, B, R
+/// primaries and white point in 0.00002 units, luminance in 0.0001 nits) and `clli`.
+fn visual_colour(kids: &[u8], info: &mut StreamInfo) {
+    let u16_at = |d: &[u8], at: usize| d.get(at..at + 2).map(|b| u16::from_be_bytes([b[0], b[1]]));
+    let u32_at = |d: &[u8], at: usize| d.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    if let Some(colr) = child(kids, b"colr")
+        && colr.get(..4) == Some(b"nclx")
+        && let (Some(p), Some(t), Some(m), Some(&flags)) = (u16_at(colr, 4), u16_at(colr, 6), u16_at(colr, 8), colr.get(10))
+    {
+        let code = |v: u16| (v != 2 && v < 256).then_some(v as u8);
+        info.primaries = info.primaries.or(code(p));
+        info.transfer = info.transfer.or(code(t));
+        info.color_matrix = info.color_matrix.or(code(m));
+        info.full_range = info.full_range.or(Some(flags & 0x80 != 0));
+    }
+    if let Some(mdcv) = child(kids, b"mdcv")
+        && mdcv.len() >= 24
+    {
+        let xy = |at: usize| (u16_at(mdcv, at).unwrap() as f32 * 0.00002, u16_at(mdcv, at + 2).unwrap() as f32 * 0.00002);
+        let hdr = info.hdr.get_or_insert_default();
+        let (g, b, r) = (xy(0), xy(4), xy(8));
+        hdr.display_primaries = Some([r, g, b]);
+        hdr.white_point = Some(xy(12));
+        hdr.max_luminance = u32_at(mdcv, 16).map(|v| v as f32 * 0.0001);
+        hdr.min_luminance = u32_at(mdcv, 20).map(|v| v as f32 * 0.0001);
+    }
+    if let Some(clli) = child(kids, b"clli")
+        && let (Some(cll), Some(fall)) = (u16_at(clli, 0), u16_at(clli, 2))
+    {
+        let hdr = info.hdr.get_or_insert_default();
+        (hdr.max_cll, hdr.max_fall) = (Some(cll), Some(fall));
+    }
 }
 
 /// Codec and codec setup data of an ISO audio sample entry re_mp4 does not know: ALAC (the
@@ -733,5 +774,24 @@ mod tests {
         esds.extend(es);
         assert_eq!(parse_esds_asc(&esds), Some(asc.to_vec()));
         assert_eq!(parse_esds_asc(&[0, 0, 0, 0, 0x03, 0x05, 0x00]), None, "truncated");
+    }
+}
+
+#[cfg(test)]
+mod hdr_tests {
+    use super::*;
+    use crate::source::FileSource;
+
+    #[test]
+    fn colr_mdcv_and_clli() {
+        let d = Mp4Demuxer::open(Box::new(FileSource::open("tests/fixtures/hdr_pq.mp4").unwrap())).unwrap();
+        let s = d.streams().iter().find(|s| s.kind == StreamKind::Video).unwrap();
+        assert_eq!((s.primaries, s.transfer, s.color_matrix, s.full_range), (Some(9), Some(16), Some(9), Some(false)));
+        let hdr = s.hdr.expect("mdcv/clli");
+        assert_eq!((hdr.max_cll, hdr.max_fall), (Some(1000), Some(400)));
+        assert!((hdr.max_luminance.unwrap() - 1000.0).abs() < 0.5);
+        assert!((hdr.min_luminance.unwrap() - 0.005).abs() < 0.001);
+        let [r, g, b] = hdr.display_primaries.expect("primaries");
+        assert!((r.0 - 0.68).abs() < 1e-3 && (g.1 - 0.69).abs() < 1e-3 && (b.0 - 0.15).abs() < 1e-3, "{r:?} {g:?} {b:?}");
     }
 }

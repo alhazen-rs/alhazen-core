@@ -8,7 +8,10 @@ use std::time::Duration;
 use super::device::{self, Device, check};
 use super::size::target_size;
 use super::sys::*;
+use super::kernel::{Converter, Source};
+use crate::color::{ColorInfo, StreamColor};
 use crate::decode::{ColorMatrix, DecodedFrame, PixelLayout, VideoDecoder, YuvFrame, chroma_size};
+use crate::scale::fit_within;
 use crate::demux::{Codec, Packet, StreamInfo};
 use crate::hw::select::HwCodec;
 use crate::nal::{AnnexB, ParamSetFormat};
@@ -50,12 +53,22 @@ struct Inner {
     hint: Option<(u32, u32)>,
     /// The hint changed since the decoder's target size was set.
     retarget: bool,
-    frames: VecDeque<YuvFrame>,
+    frames: VecDeque<DecodedFrame>,
     host: Host,
     /// The first error raised inside a callback (callbacks can only return 0).
     error: Option<Error>,
     stream_matrix: Option<u8>,
     stream_full_range: Option<bool>,
+    /// Keep 10-bit samples (`YuvPlanes::U16`) instead of shifting them to 8 bits.
+    ten_bit: bool,
+    /// Convert to BGRA with the CUDA kernel (`OutputPrefs::gpu_bgra`); the decoder then always
+    /// decodes at the display size and the kernel scales, on any picture.
+    gpu_bgra: bool,
+    converter: Option<Converter>,
+    /// The kernel failed: YUV for the CPU path from now on.
+    gpu_failed: bool,
+    /// Primaries, transfer and HDR metadata the stream signals (for the kernel's tone mapping).
+    stream_color: StreamColor,
 }
 
 pub struct NvdecVideoDecoder {
@@ -80,7 +93,7 @@ const FORMAT_WITHIN_PACKETS: u32 = 3;
 unsafe impl Send for NvdecVideoDecoder {}
 
 impl NvdecVideoDecoder {
-    pub fn new(stream: &StreamInfo) -> Result<Self> {
+    pub fn new(stream: &StreamInfo, prefs: crate::output::OutputPrefs) -> Result<Self> {
         let dev = device::get().ok_or(Error::Unsupported("NVDEC"))?;
         let hw = HwCodec::of(stream).ok_or(Error::Unsupported("codec for NVDEC"))?;
         let codec = device::cuda_codec(hw).ok_or(Error::Unsupported("codec for NVDEC"))?;
@@ -104,6 +117,11 @@ impl NvdecVideoDecoder {
             error: None,
             stream_matrix: stream.color_matrix,
             stream_full_range: stream.full_range,
+            ten_bit: prefs.ten_bit,
+            gpu_bgra: prefs.gpu_bgra,
+            converter: None,
+            gpu_failed: false,
+            stream_color: StreamColor::of(stream),
         }));
         Ok(Self {
             inner,
@@ -233,7 +251,13 @@ impl VideoDecoder for NvdecVideoDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Option<DecodedFrame>> {
-        Ok(self.inner().frames.pop_front().map(DecodedFrame::Yuv))
+        Ok(self.inner().frames.pop_front())
+    }
+
+    fn gpu_fallback(&self) -> bool {
+        // SAFETY: `inner` is only reached through `&self`/`&mut self` outside parse calls.
+        let inner = unsafe { &*self.inner };
+        inner.gpu_bgra && inner.gpu_failed
     }
 
     fn flush(&mut self) {
@@ -263,7 +287,9 @@ impl VideoDecoder for NvdecVideoDecoder {
         let inner = self.inner();
         if inner.hint != max {
             inner.hint = max;
-            inner.retarget = true;
+            // The kernel scales each picture to the hint; only the decoder's own scaler needs a
+            // keyframe to change size.
+            inner.retarget = !inner.gpu_active();
         }
     }
 }
@@ -275,6 +301,7 @@ impl Drop for NvdecVideoDecoder {
         if current.is_ok() {
             self.destroy_parser();
             let inner = self.inner();
+            inner.converter = None; // frees its CUDA memory while the context is current
             inner.destroy_decoder();
             if !inner.host.ptr.is_null() {
                 // SAFETY: allocated by `cuMemAllocHost`, freed once.
@@ -282,12 +309,18 @@ impl Drop for NvdecVideoDecoder {
             }
         }
         drop(current);
+        // Without the context its memory can't be freed: leak it rather than call CUDA without one.
+        std::mem::forget(self.inner().converter.take());
         // SAFETY: created by `Box::into_raw` in `new`; the parser that referenced it is gone.
         drop(unsafe { Box::from_raw(self.inner) });
     }
 }
 
 impl Inner {
+    fn gpu_active(&self) -> bool {
+        self.gpu_bgra && !self.gpu_failed
+    }
+
     /// Destroys the decoder and forgets its setup, so the next format announcement creates a new
     /// one (also after a failed creation).
     fn destroy_decoder(&mut self) {
@@ -317,7 +350,7 @@ impl Inner {
         let a = fmt.display_area;
         let display = Rect16 { left: a.left as i16, top: a.top as i16, right: a.right as i16, bottom: a.bottom as i16 };
         let display_size = ((a.right - a.left) as u32, (a.bottom - a.top) as u32);
-        let target = target_size(display_size, self.hint);
+        let target = if self.gpu_active() { display_size } else { target_size(display_size, self.hint) };
         let surfaces = fmt.min_num_decode_surfaces as u32 + 3; // headroom so mapping never stalls decoding
         let signal = fmt.video_signal_description;
         let matrix = ColorMatrix::from_h273(signal.matrix_coefficients)
@@ -392,14 +425,46 @@ impl Inner {
             unsafe { (api.cuvidMapVideoFrame64)(decoder, disp.picture_index, &mut dptr, &mut pitch, &mut proc) },
             "map frame",
         )?;
+        let pts = Duration::from_nanos(disp.timestamp.max(0) as u64);
+        if self.gpu_active() {
+            match self.convert_on_gpu(dptr, pitch as usize, &s, pts) {
+                Ok(frame) => {
+                    // SAFETY: unmaps the frame mapped above.
+                    unsafe { (api.cuvidUnmapVideoFrame64)(decoder, dptr) };
+                    self.frames.push_back(frame);
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::warn!("NVDEC: converting on the GPU failed ({e}); converting on the CPU from now on");
+                    self.gpu_failed = true;
+                    self.converter = None;
+                    // Size the pictures with the decoder from the next keyframe on.
+                    self.retarget = true;
+                }
+            }
+        }
         let copied = self.copy_out(dptr, pitch as usize, &s);
         // SAFETY: unmaps the frame mapped above.
         unsafe { (api.cuvidUnmapVideoFrame64)(decoder, dptr) };
         copied?;
-        let pts = Duration::from_nanos(disp.timestamp.max(0) as u64);
         let frame = self.to_frame(&s, pts);
-        self.frames.push_back(frame);
+        self.frames.push_back(DecodedFrame::Yuv(frame));
         Ok(())
+    }
+
+    /// The mapped picture converted to BGRA by the kernel, at the size the hint allows.
+    fn convert_on_gpu(&mut self, dptr: CUdeviceptr, pitch: usize, s: &Setup, pts: Duration) -> Result<DecodedFrame> {
+        if self.converter.is_none() {
+            self.converter = Some(Converter::load(self.dev.api())?);
+        }
+        let (w, h) = s.target;
+        let mut color = ColorInfo::sdr(s.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(h)), s.full_range);
+        color.apply_stream(&self.stream_color);
+        let dst = self.hint.and_then(|hint| fit_within(w, h, hint)).unwrap_or((w, h));
+        // The chroma plane starts after the (even) luma rows, as in `copy_out`.
+        let source = Source { ptr: dptr, pitch, size: (w, h), chroma_offset: pitch * ((h as usize + 1) & !1), ten_bit: s.bit_depth > 8 };
+        let bgra = self.converter.as_mut().expect("loaded above").convert(&source, &color, dst)?;
+        Ok(DecodedFrame::Bgra { width: dst.0, height: dst.1, bgra, transfer: color.transfer, pts })
     }
 
     /// Copies the mapped picture (NV12/P016, luma then interleaved chroma at `pitch`) into the
@@ -443,8 +508,12 @@ impl Inner {
         copy(chroma_src, unsafe { self.host.ptr.add(row * h) }, chroma_rows)
     }
 
-    /// The pinned buffer as an 8-bit I420 frame (P016: the high byte of each sample).
+    /// The pinned buffer as an I420 frame: 8-bit (P016: the high byte of each sample), or with
+    /// `ten_bit` and a 10-bit stream, LSB-aligned 16-bit samples.
     fn to_frame(&self, s: &Setup, pts: Duration) -> YuvFrame {
+        if self.ten_bit && s.bit_depth > 8 {
+            return self.to_frame_16(s, pts);
+        }
         let bps = if s.bit_depth > 8 { 2 } else { 1 };
         let (w, h) = s.target;
         let (cw, ch) = chroma_size(PixelLayout::I420, w, h);
@@ -468,10 +537,42 @@ impl Inner {
             width: w,
             height: h,
             layout: PixelLayout::I420,
-            planes: [y, u, v],
+            planes: crate::decode::YuvPlanes::U8([y, u, v]),
             strides: [w as usize, cw, cw],
-            matrix: s.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(display_height)),
-            full_range: s.full_range,
+            bit_depth: 8,
+            color: crate::color::ColorInfo::sdr(s.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(display_height)), s.full_range),
+            pts,
+        }
+    }
+
+    /// The pinned P016 buffer as a 16-bit I420 frame, samples shifted to the low bits.
+    fn to_frame_16(&self, s: &Setup, pts: Duration) -> YuvFrame {
+        let (w, h) = s.target;
+        let (cw, ch) = chroma_size(PixelLayout::I420, w, h);
+        let row = w as usize * 2;
+        // SAFETY: `copy_out` filled `row * (h + ch)` bytes of the buffer.
+        let buf = unsafe { std::slice::from_raw_parts(self.host.ptr, row * (h + ch) as usize) };
+        let (luma, chroma) = buf.split_at(row * h as usize);
+        let shift = 16 - s.bit_depth;
+        let sample = |c: &[u8; 2]| u16::from_le_bytes(*c) >> shift;
+        let y: Vec<u16> = luma.as_chunks::<2>().0.iter().map(sample).collect();
+        let cw = cw as usize;
+        let (mut u, mut v) = (vec![0u16; cw * ch as usize], vec![0u16; cw * ch as usize]);
+        for ((src, u), v) in chroma.chunks_exact(row).zip(u.chunks_exact_mut(cw)).zip(v.chunks_exact_mut(cw)) {
+            for ((pair, u), v) in src[..cw * 4].as_chunks::<4>().0.iter().zip(u).zip(v) {
+                *u = sample(&[pair[0], pair[1]]);
+                *v = sample(&[pair[2], pair[3]]);
+            }
+        }
+        let display_height = s.display_size().1;
+        YuvFrame {
+            width: w,
+            height: h,
+            layout: PixelLayout::I420,
+            planes: crate::decode::YuvPlanes::U16([y, u, v]),
+            strides: [w as usize, cw, cw],
+            bit_depth: s.bit_depth as u8,
+            color: crate::color::ColorInfo::sdr(s.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(display_height)), s.full_range),
             pts,
         }
     }

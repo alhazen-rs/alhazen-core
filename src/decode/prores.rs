@@ -109,10 +109,10 @@ fn decode(data: &[u8], pts: Duration) -> Result<YuvFrame> {
         width: w as u32,
         height: h as u32,
         layout,
-        planes: [crop(planes[0], w)?, crop(planes[1], cw)?, crop(planes[2], cw)?],
+        planes: crate::decode::YuvPlanes::U8([crop(planes[0], w)?, crop(planes[1], cw)?, crop(planes[2], cw)?]),
         strides: [w, cw, cw],
-        matrix,
-        full_range: false,
+        bit_depth: 8,
+        color: crate::color::ColorInfo::sdr(matrix, false),
         pts,
     })
 }
@@ -183,7 +183,7 @@ mod tests {
         assert_eq!(frames.len(), 6);
         let f = &frames[0];
         assert_eq!((f.width, f.height, f.layout), (192, 128, PixelLayout::I422));
-        assert_eq!((f.planes[0].len(), f.planes[1].len()), (192 * 128, 96 * 128));
+        assert_eq!((f.u8_planes().unwrap()[0].len(), f.u8_planes().unwrap()[1].len()), (192 * 128, 96 * 128));
         assert!(frames.windows(2).all(|w| w[0].pts < w[1].pts));
     }
 
@@ -192,7 +192,7 @@ mod tests {
         let frames = decode_file("prores_4444.mov");
         assert_eq!(frames.len(), 6);
         assert_eq!(frames[0].layout, PixelLayout::I444);
-        assert_eq!(frames[0].planes[2].len(), 192 * 128);
+        assert_eq!(frames[0].u8_planes().unwrap()[2].len(), 192 * 128);
     }
 
     #[test]

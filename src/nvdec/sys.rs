@@ -12,6 +12,9 @@ pub const CUDA_SUCCESS: CUresult = 0;
 pub type CUdevice = c_int;
 pub type CUcontext = *mut c_void;
 pub type CUdeviceptr = c_ulonglong;
+pub type CUmodule = *mut c_void;
+pub type CUfunction = *mut c_void;
+pub type CUstream = *mut c_void;
 pub type CUvideoparser = *mut c_void;
 pub type CUvideodecoder = *mut c_void;
 pub type CUvideoctxlock = *mut c_void;
@@ -277,6 +280,25 @@ pub struct Api {
     pub cuMemAllocHost: unsafe extern "C" fn(*mut *mut c_void, usize) -> CUresult,
     pub cuMemFreeHost: unsafe extern "C" fn(*mut c_void) -> CUresult,
     pub cuMemcpy2D: unsafe extern "C" fn(*const CUDA_MEMCPY2D) -> CUresult,
+    pub cuMemAlloc: unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult,
+    pub cuMemFree: unsafe extern "C" fn(CUdeviceptr) -> CUresult,
+    pub cuModuleLoadData: unsafe extern "C" fn(*mut CUmodule, *const c_void) -> CUresult,
+    pub cuModuleGetFunction: unsafe extern "C" fn(*mut CUfunction, CUmodule, *const std::ffi::c_char) -> CUresult,
+    pub cuModuleUnload: unsafe extern "C" fn(CUmodule) -> CUresult,
+    #[allow(clippy::type_complexity)]
+    pub cuLaunchKernel: unsafe extern "C" fn(
+        CUfunction,
+        c_uint,
+        c_uint,
+        c_uint,
+        c_uint,
+        c_uint,
+        c_uint,
+        c_uint,
+        CUstream,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> CUresult,
     pub cuvidGetDecoderCaps: unsafe extern "C" fn(*mut CUVIDDECODECAPS) -> CUresult,
     pub cuvidCreateVideoParser: unsafe extern "C" fn(*mut CUvideoparser, *mut CUVIDPARSERPARAMS) -> CUresult,
     pub cuvidParseVideoData: unsafe extern "C" fn(CUvideoparser, *mut CUVIDSOURCEDATAPACKET) -> CUresult,
@@ -325,6 +347,12 @@ impl Api {
                 cuMemAllocHost: sym!(cuda, "cuMemAllocHost_v2"),
                 cuMemFreeHost: sym!(cuda, "cuMemFreeHost"),
                 cuMemcpy2D: sym!(cuda, "cuMemcpy2D_v2"),
+                cuMemAlloc: sym!(cuda, "cuMemAlloc_v2"),
+                cuMemFree: sym!(cuda, "cuMemFree_v2"),
+                cuModuleLoadData: sym!(cuda, "cuModuleLoadData"),
+                cuModuleGetFunction: sym!(cuda, "cuModuleGetFunction"),
+                cuModuleUnload: sym!(cuda, "cuModuleUnload"),
+                cuLaunchKernel: sym!(cuda, "cuLaunchKernel"),
                 cuvidGetDecoderCaps: sym!(cuvid, "cuvidGetDecoderCaps"),
                 cuvidCreateVideoParser: sym!(cuvid, "cuvidCreateVideoParser"),
                 cuvidParseVideoData: sym!(cuvid, "cuvidParseVideoData"),

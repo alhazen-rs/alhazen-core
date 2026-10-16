@@ -250,3 +250,156 @@ fn aac_padding_is_trimmed() {
     let worst = ours[..n].iter().zip(&reference[..n]).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
     assert!(worst < 0.01, "not aligned with ffmpeg: worst {worst}");
 }
+
+#[test]
+fn ten_bit_hevc_keeps_its_samples() {
+    let mut d = demuxer("hdr_pq.mkv");
+    let s = track(d.as_ref(), StreamKind::Video);
+    let mut dec = MfVideoDecoder::new(HwCodec::Hevc, &s, true).unwrap().with_ten_bit(true);
+    let frame = loop {
+        let Some(p) = d.next_packet().unwrap() else { panic!("no frame") };
+        if p.stream != s.id {
+            continue;
+        }
+        if let Err(e) = dec.send_packet(&p) {
+            if e.to_string().contains("no Media Foundation decoder") {
+                return eprintln!("skipped: {e}");
+            }
+            panic!("{e}");
+        }
+        if let Some(DecodedFrame::Yuv(f)) = dec.receive_frame().unwrap() {
+            break f;
+        }
+    };
+    assert_eq!(frame.bit_depth, 10);
+    let alhazen_core::decode::YuvPlanes::U16(p) = &frame.planes else { panic!("expected 16-bit planes") };
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i", &fixture("hdr_pq.mkv"), "-frames:v", "1", "-pix_fmt", "yuv420p10le", "-f", "rawvideo", "-"])
+        .output();
+    let Ok(out) = out else { return eprintln!("no ffmpeg") };
+    let reference: Vec<u16> = out.stdout.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
+    assert!(p.iter().flatten().copied().eq(reference), "10-bit samples differ from ffmpeg's");
+}
+
+// GPU conversion (`OutputPrefs::gpu_bgra`): the D3D11 video processor against the CPU path.
+
+/// The first frame of `name` through Media Foundation, once converted by the video processor
+/// (with `hint`) and once as YUV for the CPU path; `None` when that can't run here.
+fn processor_and_cpu(name: &str, hint: Option<(u32, u32)>) -> Option<(Vec<u8>, (u32, u32), alhazen_core::decode::YuvFrame)> {
+    let mut d = demuxer(name);
+    let s = track(d.as_ref(), StreamKind::Video);
+    let codec = HwCodec::of(&s).unwrap();
+    let mut gpu = MfVideoDecoder::new(codec, &s, true).unwrap().with_ten_bit(true).with_gpu_bgra(true);
+    let mut cpu = MfVideoDecoder::new(codec, &s, true).unwrap().with_ten_bit(true);
+    gpu.set_output_hint(hint);
+    let (mut g, mut c) = (None, None);
+    while g.is_none() || c.is_none() {
+        let Some(p) = d.next_packet().unwrap() else { break };
+        if p.stream != s.id {
+            continue;
+        }
+        if let Err(e) = gpu.send_packet(&p).and_then(|()| cpu.send_packet(&p)) {
+            if e.to_string().contains("no Media Foundation decoder") {
+                eprintln!("skipped {name}: {e}");
+                return None;
+            }
+            panic!("{name}: {e}");
+        }
+        g = g.or(gpu.receive_frame().unwrap());
+        c = c.or(cpu.receive_frame().unwrap());
+    }
+    let mut y = match c {
+        Some(DecodedFrame::Yuv(y)) => y,
+        other => panic!("{name}: CPU path gave {other:?}"),
+    };
+    y.color.apply_stream(&alhazen_core::color::StreamColor::of(&s));
+    match g {
+        Some(DecodedFrame::Bgra { width, height, bgra, .. }) => Some((bgra.to_vec(), (width, height), y)),
+        _ if gpu.gpu_fallback() || gpu.description().is_some_and(|(_, on_gpu)| !on_gpu) => {
+            eprintln!("skipped {name}: no D3D11 video processor here");
+            None
+        }
+        other => panic!("{name}: GPU path gave {other:?}"),
+    }
+}
+
+/// The CPU path's full-size BGRA, scaled to `size` in RGB (see `tests/nvdec.rs`).
+fn cpu_reference(y: &alhazen_core::decode::YuvFrame, size: (u32, u32)) -> Vec<u8> {
+    use fast_image_resize::images::{Image, ImageRef};
+    use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
+    let mut full = Vec::new();
+    alhazen_core::convert::frame_to_bgra(y, &mut full).unwrap();
+    if size == (y.width, y.height) {
+        return full;
+    }
+    let src = ImageRef::new(y.width, y.height, &full, PixelType::U8x4).unwrap();
+    let mut dst = Image::new(size.0, size.1, PixelType::U8x4);
+    let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear));
+    Resizer::new().resize(&src, &mut dst, &options).unwrap();
+    dst.into_vec()
+}
+
+fn psnr(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    let mse = a.iter().zip(b).map(|(&x, &y)| (x as f64 - y as f64).powi(2)).sum::<f64>() / a.len() as f64;
+    if mse == 0.0 { f64::INFINITY } else { 10.0 * (255.0 * 255.0 / mse).log10() }
+}
+
+#[test]
+fn sdr_video_processor_matches_cpu() {
+    for hint in [None, Some((160, 90))] {
+        let Some((bgra, size, y)) = processor_and_cpu("h264_aac.mp4", hint) else { return };
+        let want = hint.and_then(|h| alhazen_core::scale::fit_within(y.width, y.height, h)).unwrap_or((y.width, y.height));
+        assert_eq!(size, want);
+        let db = psnr(&bgra, &cpu_reference(&y, size));
+        eprintln!("h264 at {size:?}: {db:.1} dB");
+        assert!(db >= if hint.is_none() { 45.0 } else { 35.0 }, "{db:.1} dB at {size:?}");
+    }
+}
+
+#[test]
+fn hdr_video_processor_tone_maps() {
+    let Some((bgra, size, y)) = processor_and_cpu("hdr_pq.mkv", None) else { return };
+    let reference = cpu_reference(&y, size);
+    let db = psnr(&bgra, &reference);
+    // Drivers tone map their own way: close to ours, and black and white where they should be.
+    let luma = |p: &[u8]| (p[2] as u32 * 2126 + p[1] as u32 * 7152 + p[0] as u32 * 722) / 10000;
+    let (lo, hi) = bgra.chunks(4).map(luma).fold((255, 0), |(lo, hi), l| (lo.min(l), hi.max(l)));
+    eprintln!("hdr_pq: {db:.1} dB, luma {lo}..{hi}");
+    assert!(db >= 30.0, "{db:.1} dB");
+    assert!(lo <= 8 && hi >= 240, "black {lo}, white {hi}");
+}
+
+#[test]
+fn blit_failure_falls_back_to_cpu_tone_mapped() {
+    // The 3rd blit fails on purpose (debug builds): playback goes on through the CPU path.
+    // SAFETY: test-only switch, read when the video processor is created.
+    unsafe { std::env::set_var("ALHAZEN_TEST_BREAK_VPBLT", "3") };
+    let mut d = demuxer("hdr_pq.mkv");
+    let s = track(d.as_ref(), StreamKind::Video);
+    let mut dec = MfVideoDecoder::new(HwCodec::Hevc, &s, true).unwrap().with_ten_bit(true).with_gpu_bgra(true);
+    let mut kinds = Vec::new();
+    while let Some(p) = d.next_packet().unwrap() {
+        if p.stream != s.id {
+            continue;
+        }
+        if let Err(e) = dec.send_packet(&p) {
+            unsafe { std::env::remove_var("ALHAZEN_TEST_BREAK_VPBLT") };
+            if e.to_string().contains("no Media Foundation decoder") {
+                return eprintln!("skipped: {e}");
+            }
+            panic!("{e}");
+        }
+        while let Some(f) = dec.receive_frame().unwrap() {
+            kinds.push(matches!(f, DecodedFrame::Bgra { .. }));
+        }
+    }
+    unsafe { std::env::remove_var("ALHAZEN_TEST_BREAK_VPBLT") };
+    if kinds.first() != Some(&true) {
+        return eprintln!("skipped: no D3D11 video processor here");
+    }
+    assert_eq!(&kinds[..3], &[true, true, false], "two blits, then the CPU path");
+    assert!(kinds[2..].iter().all(|&gpu| !gpu), "stays on the CPU path");
+    assert!(dec.gpu_fallback());
+    assert!(kinds.len() >= 40, "{} frames", kinds.len());
+}

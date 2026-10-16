@@ -59,9 +59,9 @@ impl Backend for MfBackend {
     fn supports_video(&self, stream: &StreamInfo) -> bool {
         select::claims(stream, &Installed, self.prefer_hardware)
     }
-    fn open_video_decoder(&self, stream: &StreamInfo, _threads: usize) -> Result<Box<dyn VideoDecoder>> {
+    fn open_video_decoder(&self, stream: &StreamInfo, _threads: usize, prefs: crate::output::OutputPrefs) -> Result<Box<dyn VideoDecoder>> {
         let codec = HwCodec::of(stream).ok_or(Error::Unsupported("codec"))?;
-        Ok(Box::new(super::MfVideoDecoder::new(codec, stream, true)?))
+        Ok(Box::new(super::MfVideoDecoder::new(codec, stream, true)?.with_ten_bit(prefs.ten_bit).with_gpu_bgra(prefs.gpu_bgra)))
     }
     fn supports_audio(&self, stream: &StreamInfo) -> bool {
         select::claims(stream, &Installed, self.prefer_hardware)

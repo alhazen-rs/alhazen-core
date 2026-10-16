@@ -58,7 +58,7 @@ impl Backend for LateAudio {
     fn supports_video(&self, _: &StreamInfo) -> bool {
         false
     }
-    fn open_video_decoder(&self, _: &StreamInfo, _: usize) -> alhazen_core::Result<Box<dyn VideoDecoder>> {
+    fn open_video_decoder(&self, _: &StreamInfo, _: usize, _prefs: alhazen_core::OutputPrefs) -> alhazen_core::Result<Box<dyn VideoDecoder>> {
         unreachable!()
     }
     fn supports_audio(&self, s: &StreamInfo) -> bool {
