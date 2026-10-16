@@ -278,7 +278,7 @@ fn h264_aac_plays_to_the_end_in_sync() {
             // machine) delivers its first frames late, and catch-up takes a few frames.
             if pos > Duration::from_millis(500) && pos < Duration::from_millis(900) {
                 let diff = pos.abs_diff(f.pts());
-                assert!(diff <= Duration::from_millis(45), "A/V offset {diff:?} at {pos:?}");
+                assert!(diff <= Duration::from_millis(45), "A/V offset {diff:?} at {pos:?} ({:?})", player.stats());
                 checked += 1;
             }
         }
