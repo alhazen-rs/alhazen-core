@@ -2,6 +2,8 @@
 #![cfg(feature = "http")]
 
 use std::io::{Read, Seek, SeekFrom};
+#[cfg(feature = "native")]
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use alhazen_core::source::{HttpSource, MediaSource};
@@ -37,6 +39,33 @@ fn fixture_bytes() -> Vec<u8> {
     std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/av1.webm")).unwrap()
 }
 
+/// Range-capable server that records the start offset of every request.
+#[cfg(feature = "native")]
+fn serve_counting(bytes: Vec<u8>) -> (String, Arc<Mutex<Vec<u64>>>) {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let addr = server.server_addr().to_ip().unwrap();
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let log = starts.clone();
+    thread::spawn(move || {
+        for req in server.incoming_requests() {
+            let start = req
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv("Range"))
+                .and_then(|h| h.value.as_str().strip_prefix("bytes=")?.trim_end_matches('-').parse::<usize>().ok())
+                .unwrap_or(0);
+            log.lock().unwrap().push(start as u64);
+            let body = bytes[start.min(bytes.len())..].to_vec();
+            let range = format!("bytes {start}-{}/{}", bytes.len() - 1, bytes.len());
+            let mut resp = tiny_http::Response::from_data(body);
+            resp.add_header(tiny_http::Header::from_bytes("Accept-Ranges", "bytes").unwrap());
+            resp.add_header(tiny_http::Header::from_bytes("Content-Range", range).unwrap());
+            let _ = req.respond(resp.with_status_code(206));
+        }
+    });
+    (format!("http://{addr}/movie.mp4"), starts)
+}
+
 #[test]
 fn range_server_is_seekable_with_known_length() {
     let bytes = fixture_bytes();
@@ -50,6 +79,75 @@ fn range_server_is_seekable_with_known_length() {
     src.seek(SeekFrom::Start(4)).unwrap();
     src.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, &bytes[4..20]);
+}
+
+#[cfg(feature = "native")]
+fn large_interleaved_mp4() -> Option<Vec<u8>> {
+    // Larger than HttpSource's 256 KiB head cache, so pre-fix every backward seek reconnects.
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("http_interleaved.mp4");
+    if !path.exists() {
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc2=size=1920x1080:rate=30:duration=3")
+            .args(["-f", "lavfi", "-i"])
+            .arg("sine=frequency=440:sample_rate=48000:duration=3")
+            .args([
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-ac",
+                "2",
+                "-movflags",
+                "+faststart",
+            ])
+            .arg(&path)
+            .status()
+            .ok()?
+            .success();
+        if !ok {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    if bytes.len() <= 300_000 {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    Some(bytes)
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn mp4_over_http_does_not_reconnect_for_every_packet() {
+    // Interleaved audio/video makes the MP4 demuxer seek backwards between samples; without a
+    // read window each one drops the body and connects again (issue #1).
+    use alhazen_core::demux::{Demuxer, Mp4Demuxer};
+    let Some(bytes) = large_interleaved_mp4() else {
+        eprintln!("skipped: no ffmpeg or libx264");
+        return;
+    };
+    let (url, requests) = serve_counting(bytes);
+    let src = alhazen_core::Source::parse(&url).unwrap().open().unwrap();
+    let mut d = Mp4Demuxer::open(src).unwrap();
+    let at_open = requests.lock().unwrap().len();
+    assert!(at_open >= 1, "opening reads the moov");
+    let mut packets = 0;
+    while d.next_packet().unwrap().is_some() {
+        packets += 1;
+    }
+    assert!(packets > 100, "{packets} packets");
+    let reconnects = requests.lock().unwrap().len() - at_open;
+    assert!(reconnects < 25, "{reconnects} reconnects while reading {packets} packets");
 }
 
 #[test]

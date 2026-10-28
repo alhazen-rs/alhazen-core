@@ -4,7 +4,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::time::Duration;
 
 use super::{Codec, Demuxer, Metadata, Packet, PcmFormat, StreamInfo, StreamKind};
-use crate::source::MediaSource;
+use crate::source::{CachedSource, MediaSource};
 use crate::{Error, Result};
 
 struct SampleRef {
@@ -28,11 +28,16 @@ pub struct Mp4Demuxer {
 }
 
 impl Mp4Demuxer {
-    pub fn open(mut src: Box<dyn MediaSource>) -> Result<Self> {
+    pub fn open(src: Box<dyn MediaSource>) -> Result<Self> {
         if !src.is_seekable() {
             return Err(Error::Unsupported("MP4 from a non-seekable source"));
         }
         let size = src.byte_len().ok_or(Error::Unsupported("MP4 from a source of unknown length"))?;
+        // Samples are read in decode order, and interleaved audio/video makes consecutive
+        // samples seek backwards a few KiB. Keep a sliding window so network sources do not
+        // reconnect for every packet (a reconnect per seek is ~150 ms over TLS).
+        let mut src: Box<dyn MediaSource> =
+            if src.is_local() { src } else { Box::new(CachedSource::new(src)) };
         // re_mp4 keeps only three fields of the AAC config; read the real bytes ourselves.
         let (moov_start, moov) = read_moov(src.as_mut(), size).unwrap_or_default();
         let mut meta = Metadata::default();
@@ -600,7 +605,73 @@ fn ticks(t: i64, timescale: u64) -> Duration {
 mod tests {
     use super::*;
     use crate::source::FileSource;
+    use std::io::{self, Read, Seek, SeekFrom};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// A source seen as non-local, counting backward seeks: over HTTP each one is a reconnect.
+    struct Counting {
+        src: FileSource,
+        pos: u64,
+        backward: Arc<AtomicUsize>,
+    }
+
+    impl Read for Counting {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.src.read(buf)?;
+            self.pos += n as u64;
+            Ok(n)
+        }
+    }
+
+    impl Seek for Counting {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            let new = self.src.seek(pos)?;
+            if new < self.pos {
+                self.backward.fetch_add(1, Ordering::Relaxed);
+            }
+            self.pos = new;
+            Ok(new)
+        }
+    }
+
+    impl MediaSource for Counting {
+        fn byte_len(&self) -> Option<u64> {
+            self.src.byte_len()
+        }
+        fn is_seekable(&self) -> bool {
+            true
+        }
+        fn is_live(&self) -> bool {
+            false
+        }
+        fn description(&self) -> String {
+            "counting".into()
+        }
+    }
+
+    #[test]
+    fn reading_interleaved_audio_and_video_does_not_seek_backwards() {
+        // Interleaved storage: decode order jumps back in the file for most packets. Without a
+        // read window each jump is a new HTTP connection (see issue #1).
+        let backward = Arc::new(AtomicUsize::new(0));
+        let src = Counting {
+            src: FileSource::open("tests/fixtures/av1_aac.mp4").unwrap(),
+            pos: 0,
+            backward: backward.clone(),
+        };
+        let mut d = Mp4Demuxer::open(Box::new(src)).unwrap();
+        let jumps = d.samples.windows(2).filter(|w| w[1].offset < w[0].offset).count();
+        assert!(jumps > 10, "fixture should be interleaved, found {jumps} backward jumps");
+        let at_open = backward.load(Ordering::Relaxed);
+        let mut packets = 0;
+        while d.next_packet().unwrap().is_some() {
+            packets += 1;
+        }
+        assert!(packets > 20, "{packets} packets");
+        assert_eq!(backward.load(Ordering::Relaxed), at_open, "every sample should come from the window");
+    }
 
     #[test]
     fn min_composition_is_the_earliest_presented_sample() {
