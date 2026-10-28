@@ -1,5 +1,7 @@
 //! Byte-level media inputs.
 
+#[cfg(feature = "native")]
+mod cache;
 mod file;
 mod memory;
 #[cfg(feature = "http")]
@@ -8,6 +10,8 @@ mod http;
 use std::io::{Read, Seek};
 use std::path::PathBuf;
 
+#[cfg(feature = "native")]
+pub(crate) use cache::CachedSource;
 pub use file::FileSource;
 pub use memory::MemorySource;
 #[cfg(feature = "http")]
