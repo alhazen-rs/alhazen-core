@@ -6,7 +6,7 @@ Usage: scripts/fetch_aac_vectors.py [DIR]   (default: target/aac-vectors)
 Then:  AAC_VECTORS_DIR=DIR cargo test --test aac_conformance
 Files already present are kept, so CI can cache DIR.
 """
-import os, sys, urllib.request
+import os, sys, time, urllib.request
 
 BASE = "https://fate-suite.ffmpeg.org/aac/"
 FILES = [
@@ -24,8 +24,17 @@ def main():
         if os.path.exists(path):
             continue
         req = urllib.request.Request(BASE + name, headers={"User-Agent": "alhazen-core-tests"})
-        with urllib.request.urlopen(req, timeout=60) as r, open(path + ".part", "wb") as f:
-            f.write(r.read())
+        # The server drops connections now and then: a few tries before giving up.
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r, open(path + ".part", "wb") as f:
+                    f.write(r.read())
+                break
+            except OSError as e:
+                if attempt == 2:
+                    sys.exit(f"could not fetch {name}: {e}")
+                print(f"retrying {name} ({e})")
+                time.sleep(15 * (attempt + 1))
         os.replace(path + ".part", path)
         print("fetched", name)
 

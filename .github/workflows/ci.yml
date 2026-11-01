@@ -43,15 +43,22 @@ jobs:
         with:
           path: target/aac-vectors
           key: aac-vectors-${{ hashFiles('scripts/fetch_aac_vectors.py') }}
-      - run: python3 scripts/fetch_aac_vectors.py target/aac-vectors
+      # The FATE server is sometimes unreachable: then the AAC conformance test is skipped (with
+      # a warning) instead of failing every job.
+      - name: AAC conformance vectors (fetch)
+        shell: bash
+        run: |
+          if python3 scripts/fetch_aac_vectors.py target/aac-vectors; then
+            echo "AAC_VECTORS_DIR=target/aac-vectors" >> "$GITHUB_ENV"
+          else
+            echo "::warning::fate-suite.ffmpeg.org unreachable: AAC conformance test skipped"
+          fi
       # --no-fail-fast: one failing test binary must not hide the others' results.
       # A watchdog stops hung test binaries after 30 minutes so the step ends on its own (GitHub
       # discards the log of a step it times out); the output also goes up as an artifact.
       - name: cargo test
         shell: bash
         timeout-minutes: 40
-        env:
-          AAC_VECTORS_DIR: target/aac-vectors
         run: |
           cargo test --locked --no-fail-fast > test-output.log 2>&1 &
           tests=$!
