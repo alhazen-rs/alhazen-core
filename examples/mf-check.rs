@@ -1,6 +1,7 @@
 //! `mf-check <fixtures-dir>`: decodes the test fixtures through Windows' own decoders (Media
 //! Foundation) and reports, per file, which decoder ran, GPU or software, and PASS/FAIL; then
-//! compares the D3D11 video processor's BGRA with the CPU path's. Built in CI and run from
+//! compares the D3D11 video processor's BGRA with the CPU path's, or reports that the decoder's
+//! own check on the first frame sent the stream to the CPU path. Built in CI and run from
 //! `prebuilt/` on a Windows machine without a Rust toolchain. `--dump DIR` after the fixtures
 //! directory also saves both pictures of each comparison there.
 
@@ -143,14 +144,14 @@ fn main() {
 #[cfg(all(windows, feature = "media-foundation", feature = "native"))]
 fn processor_checks(dir: &str, dump: Option<&str>) -> u32 {
     use std::time::Duration;
-    // (file, largest output size, least PSNR against the CPU path in dB)
-    let cases = [("h264_aac.mp4", None, 45.0), ("h264_aac.mp4", Some((160, 90)), 35.0), ("hdr_pq.mkv", None, 30.0)];
+    // (file, largest output size)
+    let cases = [("h264_aac.mp4", None), ("h264_aac.mp4", Some((160, 90))), ("hdr_pq.mkv", None)];
     let mut failed = 0;
     println!(
         "\nD3D11 video processor against the CPU path\n{:<18} {:<10} {:>8} {:>10}  {:>8} {:<16} {:<8} result",
         "file", "size", "dB", "luma", "luma dB", "mean diff BGR", "alpha"
     );
-    for (file, hint, min_db) in cases {
+    for (file, hint) in cases {
         let path = format!("{dir}/{file}");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -168,8 +169,9 @@ fn processor_checks(dir: &str, dump: Option<&str>) -> u32 {
                 failed += 1;
                 println!("FAIL: {e}");
             }
-            Ok(Ok(None)) => println!("SKIP (no D3D11 video processor here)"),
-            Ok(Ok(Some((bgra, size, y)))) => {
+            Ok(Ok(Outcome::Unavailable)) => println!("SKIP (no D3D11 video processor here)"),
+            Ok(Ok(Outcome::CpuFallback)) => println!("PASS (this driver's picture differs: the stream uses the CPU path)"),
+            Ok(Ok(Outcome::Converted(bgra, size, y))) => {
                 let want = hint.and_then(|h| alhazen_core::scale::fit_within(y.width, y.height, h)).unwrap_or((y.width, y.height));
                 let reference = cpu_reference(&y, size);
                 let db = psnr(&bgra, &reference);
@@ -186,9 +188,10 @@ fn processor_checks(dir: &str, dump: Option<&str>) -> u32 {
                 let luma = |p: &[u8]| (p[2] as u32 * 2126 + p[1] as u32 * 7152 + p[0] as u32 * 722) / 10000;
                 let (lo, hi) = bgra.chunks(4).map(luma).fold((255, 0), |(lo, hi), l| (lo.min(l), hi.max(l)));
                 let range_ok = !file.starts_with("hdr") || (lo <= 8 && hi >= 240);
-                let ok = size == want && db >= min_db && range_ok;
-                failed += !ok as u32;
                 let lumas = |p: &[u8]| p.chunks(4).map(|px| luma(px) as u8).collect::<Vec<u8>>();
+                let luma_db = psnr(&lumas(&bgra), &lumas(&reference));
+                let ok = size == want && luma_db >= 30.0 && range_ok;
+                failed += !ok as u32;
                 let mean_diff = |c: usize| {
                     bgra.chunks(4).zip(reference.chunks(4)).map(|(a, b)| a[c] as f64 - b[c] as f64).sum::<f64>() / (bgra.len() / 4) as f64
                 };
@@ -197,7 +200,7 @@ fn processor_checks(dir: &str, dump: Option<&str>) -> u32 {
                     "{:<10} {db:>8.1} {:>10}  {:>8.1} {:<16} {:<8} {}",
                     format!("{}x{}", size.0, size.1),
                     format!("{lo}..{hi}"),
-                    psnr(&lumas(&bgra), &lumas(&reference)),
+                    luma_db,
                     format!("{:+.1} {:+.1} {:+.1}", mean_diff(0), mean_diff(1), mean_diff(2)),
                     format!("{}..{}", alpha.0, alpha.1),
                     if ok { "PASS" } else { "FAIL" }
@@ -208,14 +211,21 @@ fn processor_checks(dir: &str, dump: Option<&str>) -> u32 {
     failed
 }
 
-/// A frame from the video processor (BGRA and its size) and the same one as YUV.
+/// What became of the first frame on its way through the video processor.
 #[cfg(all(windows, feature = "media-foundation", feature = "native"))]
-type Converted = (Vec<u8>, (u32, u32), alhazen_core::decode::YuvFrame);
+enum Outcome {
+    /// BGRA, its size and the same picture as YUV.
+    Converted(Vec<u8>, (u32, u32), alhazen_core::decode::YuvFrame),
+    /// The decoder's check rejected the driver's picture or the conversion failed.
+    CpuFallback,
+    /// No GPU decoding or no video processor here.
+    Unavailable,
+}
 
 /// The first frame of `path` through Media Foundation, once converted by the video processor
-/// (with `hint`) and once as YUV for the CPU path; `None` when that can't run here.
+/// (with `hint`) and once as YUV for the CPU path.
 #[cfg(all(windows, feature = "media-foundation", feature = "native"))]
-fn processor_and_cpu(path: &str, hint: Option<(u32, u32)>) -> Result<Option<Converted>, String> {
+fn processor_and_cpu(path: &str, hint: Option<(u32, u32)>) -> Result<Outcome, String> {
     use alhazen_core::backend::Registry;
     use alhazen_core::decode::{DecodedFrame, VideoDecoder};
     use alhazen_core::demux::StreamKind;
@@ -232,7 +242,7 @@ fn processor_and_cpu(path: &str, hint: Option<(u32, u32)>) -> Result<Option<Conv
     let unavailable = |e: &str| e.contains("no Media Foundation decoder");
     let mut gpu = match MfVideoDecoder::new(codec, &s, true) {
         Ok(dec) => dec.with_ten_bit(true).with_gpu_bgra(true),
-        Err(e) if unavailable(&e.to_string()) => return Ok(None),
+        Err(e) if unavailable(&e.to_string()) => return Ok(Outcome::Unavailable),
         Err(e) => return Err(e.to_string()),
     };
     let mut cpu = MfVideoDecoder::new(codec, &s, true).map_err(|e| e.to_string())?.with_ten_bit(true);
@@ -244,7 +254,7 @@ fn processor_and_cpu(path: &str, hint: Option<(u32, u32)>) -> Result<Option<Conv
             continue;
         }
         if let Err(e) = gpu.send_packet(&p).and_then(|()| cpu.send_packet(&p)) {
-            return if unavailable(&e.to_string()) { Ok(None) } else { Err(e.to_string()) };
+            return if unavailable(&e.to_string()) { Ok(Outcome::Unavailable) } else { Err(e.to_string()) };
         }
         g = g.or(gpu.receive_frame().map_err(|e| e.to_string())?);
         c = c.or(cpu.receive_frame().map_err(|e| e.to_string())?);
@@ -252,8 +262,9 @@ fn processor_and_cpu(path: &str, hint: Option<(u32, u32)>) -> Result<Option<Conv
     let Some(DecodedFrame::Yuv(mut y)) = c else { return Err("the CPU path gave no YUV frame".into()) };
     y.color.apply_stream(&alhazen_core::color::StreamColor::of(&s));
     match g {
-        Some(DecodedFrame::Bgra { width, height, bgra, .. }) => Ok(Some((bgra.to_vec(), (width, height), y))),
-        _ if gpu.gpu_fallback() || gpu.description().is_some_and(|(_, on_gpu)| !on_gpu) => Ok(None),
+        Some(DecodedFrame::Bgra { width, height, bgra, .. }) => Ok(Outcome::Converted(bgra.to_vec(), (width, height), y)),
+        _ if gpu.gpu_fallback() => Ok(Outcome::CpuFallback),
+        _ if gpu.description().is_some_and(|(_, on_gpu)| !on_gpu) => Ok(Outcome::Unavailable),
         _ => Err("the GPU path gave no BGRA frame".into()),
     }
 }

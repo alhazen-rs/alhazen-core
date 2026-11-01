@@ -56,6 +56,8 @@ struct Conversion {
     processor: Option<Processor>,
     /// The video processor failed: YUV for the CPU path from now on.
     failed: bool,
+    /// The first converted picture has been checked against the CPU path.
+    checked: bool,
     stream: StreamColor,
 }
 
@@ -74,16 +76,41 @@ impl Conversion {
         read_frame(sample, out, self.ten_bit).map(DecodedFrame::Yuv)
     }
 
+    /// A picture converted to BGRA by the video processor, at the size the hint allows. The first
+    /// one is compared with our CPU path (which tone maps HDR): drivers tone map their own way, and
+    /// if the result differs this fails and the stream continues on the CPU.
     fn convert(&mut self, sample: &IMFSample, out: &OutFormat) -> Result<DecodedFrame> {
         let gpu = device::gpu().ok_or(Error::Unsupported("D3D11 video device"))?;
         let src = out.visible;
         let dst = self.hint.and_then(|h| fit_within(src.0, src.1, h)).unwrap_or(src);
-        if !self.processor.as_ref().is_some_and(|p| p.fits(src, dst)) {
-            self.processor = Some(Processor::new(&gpu.device, src, dst)?);
-        }
         let mut color = ColorInfo::sdr(out.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(src.1)), out.full_range);
         color.apply_stream(&self.stream);
-        let bgra = self.processor.as_mut().expect("created above").convert(sample, &color)?;
+        let mut first = None;
+        if !self.checked {
+            self.checked = true;
+            let mut processor = Processor::new(&gpu.device, src, src)?;
+            let converted = processor.convert(sample, &color)?;
+            let mut frame = read_frame(sample, out, true)?;
+            frame.color = color;
+            let mut cpu = Vec::new();
+            crate::convert::frame_to_bgra(&frame, &mut cpu)?;
+            let db = crate::convert::luma_psnr(&converted, &cpu);
+            log::info!("D3D11 video processor → BGRA: {db:.1} dB (luma) against the CPU path");
+            if db < crate::convert::MIN_GPU_LUMA_DB {
+                return Err(Error::Decode(format!("the D3D11 video processor's output differs from the CPU path ({db:.1} dB)")));
+            }
+            self.processor = Some(processor);
+            first = (dst == src).then_some(converted);
+        }
+        let bgra = match first {
+            Some(bgra) => bgra,
+            None => {
+                if !self.processor.as_ref().is_some_and(|p| p.fits(src, dst)) {
+                    self.processor = Some(Processor::new(&gpu.device, src, dst)?);
+                }
+                self.processor.as_mut().expect("created above").convert(sample, &color)?
+            }
+        };
         // SAFETY: COM call on a live sample.
         let pts = mft::from_mf_time(unsafe { sample.GetSampleTime() }.unwrap_or(0));
         Ok(DecodedFrame::Bgra { width: dst.0, height: dst.1, bgra, transfer: color.transfer, pts })
@@ -106,7 +133,7 @@ impl MfVideoDecoder {
             _ => None,
         };
         let conversion =
-            Conversion { ten_bit: false, gpu_bgra: false, hint: None, processor: None, failed: false, stream: StreamColor::of(stream) };
+            Conversion { ten_bit: false, gpu_bgra: false, hint: None, processor: None, failed: false, checked: false, stream: StreamColor::of(stream) };
         Ok(Self { codec, stream: stream.clone(), allow_gpu, annexb, state: None, ready: VecDeque::new(), scratch: Vec::new(), conversion })
     }
 

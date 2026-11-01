@@ -67,6 +67,25 @@ pub fn to_8bit(frame: &YuvFrame) -> YuvFrame {
     YuvFrame { planes: YuvPlanes::U8([narrow(&planes[0]), narrow(&planes[1]), narrow(&planes[2])]), bit_depth: 8, ..frame.clone() }
 }
 
+/// Below this (see [`luma_psnr`]), a GPU converter's picture is too far from the CPU path's.
+#[cfg(any(all(target_os = "macos", feature = "videotoolbox"), all(windows, feature = "media-foundation")))]
+pub(crate) const MIN_GPU_LUMA_DB: f64 = 30.0;
+
+/// PSNR of the luma of two BGRA pictures. Luma only: chroma filtering legitimately differs
+/// between converters at hard colour edges; what this guards against (a picture not tone
+/// mapped, wrong matrix or range) shows in the brightness.
+#[cfg(any(all(target_os = "macos", feature = "videotoolbox"), all(windows, feature = "media-foundation")))]
+pub(crate) fn luma_psnr(a: &[u8], b: &[u8]) -> f64 {
+    let luma = |p: &[u8; 4]| 0.0722 * p[0] as f64 + 0.7152 * p[1] as f64 + 0.2126 * p[2] as f64;
+    let (mut sum, mut n) = (0.0, 0usize);
+    for (x, y) in a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0) {
+        sum += (luma(x) - luma(y)).powi(2);
+        n += 1;
+    }
+    let mse = sum / n.max(1) as f64;
+    if mse == 0.0 { 99.0 } else { 10.0 * (255.0f64 * 255.0 / mse).log10() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
