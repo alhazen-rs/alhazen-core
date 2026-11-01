@@ -1,7 +1,8 @@
 //! `mf-check <fixtures-dir>`: decodes the test fixtures through Windows' own decoders (Media
 //! Foundation) and reports, per file, which decoder ran, GPU or software, and PASS/FAIL; then
 //! compares the D3D11 video processor's BGRA with the CPU path's. Built in CI and run from
-//! `prebuilt/` on a Windows machine without a Rust toolchain.
+//! `prebuilt/` on a Windows machine without a Rust toolchain. `--dump DIR` after the fixtures
+//! directory also saves both pictures of each comparison there.
 
 #[cfg(not(all(windows, feature = "media-foundation", feature = "native")))]
 fn main() {
@@ -132,19 +133,23 @@ fn main() {
             }
         }
     }
-    failed += processor_checks(&dir);
+    let dump = std::env::args().skip_while(|a| a != "--dump").nth(1);
+    failed += processor_checks(&dir, dump.as_deref());
     std::process::exit(if failed == 0 { 0 } else { 1 });
 }
 
 /// The D3D11 video processor against the CPU path, as in `tests/media_foundation.rs`. Returns
 /// how many checks failed; a machine without a video processor skips them.
 #[cfg(all(windows, feature = "media-foundation", feature = "native"))]
-fn processor_checks(dir: &str) -> u32 {
+fn processor_checks(dir: &str, dump: Option<&str>) -> u32 {
     use std::time::Duration;
     // (file, largest output size, least PSNR against the CPU path in dB)
     let cases = [("h264_aac.mp4", None, 45.0), ("h264_aac.mp4", Some((160, 90)), 35.0), ("hdr_pq.mkv", None, 30.0)];
     let mut failed = 0;
-    println!("\nD3D11 video processor against the CPU path\n{:<18} {:<10} {:>8} {:>10}  result", "file", "size", "dB", "luma");
+    println!(
+        "\nD3D11 video processor against the CPU path\n{:<18} {:<10} {:>8} {:>10}  {:>8} {:<16} {:<8} result",
+        "file", "size", "dB", "luma", "luma dB", "mean diff BGR", "alpha"
+    );
     for (file, hint, min_db) in cases {
         let path = format!("{dir}/{file}");
         let (tx, rx) = std::sync::mpsc::channel();
@@ -166,17 +171,35 @@ fn processor_checks(dir: &str) -> u32 {
             Ok(Ok(None)) => println!("SKIP (no D3D11 video processor here)"),
             Ok(Ok(Some((bgra, size, y)))) => {
                 let want = hint.and_then(|h| alhazen_core::scale::fit_within(y.width, y.height, h)).unwrap_or((y.width, y.height));
-                let db = psnr(&bgra, &cpu_reference(&y, size));
+                let reference = cpu_reference(&y, size);
+                let db = psnr(&bgra, &reference);
+                if let Some(dump) = dump {
+                    let name = format!("{dump}/{}-{}x{}", file.split('.').next().unwrap_or(file), size.0, size.1);
+                    let saved = std::fs::create_dir_all(dump)
+                        .and_then(|()| write_ppm(&format!("{name}-gpu.ppm"), &bgra, size))
+                        .and_then(|()| write_ppm(&format!("{name}-cpu.ppm"), &reference, size));
+                    if let Err(e) = saved {
+                        println!("(could not save {name}: {e})");
+                    }
+                }
                 // Drivers tone map their own way: HDR must also reach black and white.
                 let luma = |p: &[u8]| (p[2] as u32 * 2126 + p[1] as u32 * 7152 + p[0] as u32 * 722) / 10000;
                 let (lo, hi) = bgra.chunks(4).map(luma).fold((255, 0), |(lo, hi), l| (lo.min(l), hi.max(l)));
                 let range_ok = !file.starts_with("hdr") || (lo <= 8 && hi >= 240);
                 let ok = size == want && db >= min_db && range_ok;
                 failed += !ok as u32;
+                let lumas = |p: &[u8]| p.chunks(4).map(|px| luma(px) as u8).collect::<Vec<u8>>();
+                let mean_diff = |c: usize| {
+                    bgra.chunks(4).zip(reference.chunks(4)).map(|(a, b)| a[c] as f64 - b[c] as f64).sum::<f64>() / (bgra.len() / 4) as f64
+                };
+                let alpha = bgra.chunks(4).map(|px| px[3]).fold((255, 0), |(lo, hi), a| (a.min(lo), a.max(hi)));
                 println!(
-                    "{:<10} {db:>8.1} {:>10}  {}",
+                    "{:<10} {db:>8.1} {:>10}  {:>8.1} {:<16} {:<8} {}",
                     format!("{}x{}", size.0, size.1),
                     format!("{lo}..{hi}"),
+                    psnr(&lumas(&bgra), &lumas(&reference)),
+                    format!("{:+.1} {:+.1} {:+.1}", mean_diff(0), mean_diff(1), mean_diff(2)),
+                    format!("{}..{}", alpha.0, alpha.1),
                     if ok { "PASS" } else { "FAIL" }
                 );
             }
@@ -250,6 +273,14 @@ fn cpu_reference(y: &alhazen_core::decode::YuvFrame, size: (u32, u32)) -> Vec<u8
     let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear));
     Resizer::new().resize(&src, &mut dst, &options).unwrap();
     dst.into_vec()
+}
+
+/// A BGRA picture as a binary PPM (RGB, no alpha).
+#[cfg(all(windows, feature = "media-foundation", feature = "native"))]
+fn write_ppm(path: &str, bgra: &[u8], (width, height): (u32, u32)) -> std::io::Result<()> {
+    let mut out = format!("P6\n{width} {height}\n255\n").into_bytes();
+    out.extend(bgra.chunks(4).flat_map(|p| [p[2], p[1], p[0]]));
+    std::fs::write(path, out)
 }
 
 #[cfg(all(windows, feature = "media-foundation", feature = "native"))]

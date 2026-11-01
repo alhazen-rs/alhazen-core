@@ -151,6 +151,8 @@ impl Processor {
             let vc = &self.video_context;
             let p = &self.processor;
             vc.VideoProcessorSetStreamFrameFormat(p, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+            // On by default: drivers may then "enhance" the picture on their own.
+            vc.VideoProcessorSetStreamAutoProcessingMode(p, 0, false);
             vc.VideoProcessorSetStreamColorSpace1(p, 0, input_color_space(color));
             vc.VideoProcessorSetOutputColorSpace1(p, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
             if let Ok(vc2) = vc.cast::<ID3D11VideoContext2>() {
