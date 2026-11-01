@@ -307,10 +307,16 @@ fn audio_after_a_seek_onto_a_keyframe_is_already_converged() {
     let (player, null) = open("av1_with_audio.webm");
     player.seek(Duration::from_millis(1000));
     player.play();
-    // Playback starts once the first video frame after the seek is ready; then let the ring
-    // buffer fill and take 20 ms in one pull so no underrun can land inside it.
+    // Playback starts once the first video frame after the seek is ready; then wait until the
+    // ring buffer holds 20 ms and take it in one pull so no underrun can land inside it.
     until("playing after seek", 10, || (player.state() == PlayerState::Playing).then_some(()));
-    std::thread::sleep(Duration::from_millis(100));
+    let buffered = || {
+        // A pull of nothing drops what the seek made stale (first) and reads the ring's fill (second).
+        null.pull(0);
+        null.pull(0);
+        player.debug_snapshot().split(" ring ").nth(1).and_then(|s| s.split(' ').next()).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0)
+    };
+    until("audio buffered", 10, || (buffered() >= 960).then_some(()));
     let after: Vec<f32> = null.pull(960).chunks(2).map(|f| f[0]).collect();
     // Matroska timestamps have 1 ms resolution, so the seek may land up to ±0.5 ms off; that is
     // inaudible. What must hold is that the waveform is the converged one: within one period of
@@ -322,5 +328,10 @@ fn audio_after_a_seek_onto_a_keyframe_is_already_converged() {
             rms(&d)
         })
         .fold(f32::MAX, f32::min);
-    assert!(best < rms(&reference) * 0.02, "post-seek audio is not converged: best rms diff {best} vs signal {}", rms(&reference));
+    let silent = after.iter().filter(|x| **x == 0.0).count();
+    assert!(
+        best < rms(&reference) * 0.02,
+        "post-seek audio is not converged: best rms diff {best} vs signal {}; {silent}/960 silent",
+        rms(&reference)
+    );
 }
