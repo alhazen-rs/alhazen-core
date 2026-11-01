@@ -215,7 +215,7 @@ fn processor_checks(dir: &str, dump: Option<&str>) -> u32 {
 #[cfg(all(windows, feature = "media-foundation", feature = "native"))]
 enum Outcome {
     /// BGRA, its size and the same picture as YUV.
-    Converted(Vec<u8>, (u32, u32), alhazen_core::decode::YuvFrame),
+    Converted(Vec<u8>, (u32, u32), Box<alhazen_core::decode::YuvFrame>),
     /// The decoder's check rejected the driver's picture or the conversion failed.
     CpuFallback,
     /// No GPU decoding or no video processor here.
@@ -262,7 +262,7 @@ fn processor_and_cpu(path: &str, hint: Option<(u32, u32)>) -> Result<Outcome, St
     let Some(DecodedFrame::Yuv(mut y)) = c else { return Err("the CPU path gave no YUV frame".into()) };
     y.color.apply_stream(&alhazen_core::color::StreamColor::of(&s));
     match g {
-        Some(DecodedFrame::Bgra { width, height, bgra, .. }) => Ok(Outcome::Converted(bgra.to_vec(), (width, height), y)),
+        Some(DecodedFrame::Bgra { width, height, bgra, .. }) => Ok(Outcome::Converted(bgra.to_vec(), (width, height), Box::new(y))),
         _ if gpu.gpu_fallback() => Ok(Outcome::CpuFallback),
         _ if gpu.description().is_some_and(|(_, on_gpu)| !on_gpu) => Ok(Outcome::Unavailable),
         _ => Err("the GPU path gave no BGRA frame".into()),
