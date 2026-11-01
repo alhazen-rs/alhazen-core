@@ -263,6 +263,9 @@ fn h264_aac_plays_to_the_end_in_sync() {
         decoder_threads: 2,
         audio_output: AudioOutputConfig::Null(null.clone()),
         backend_order: Some(vec!["ffmpeg-cli"]),
+        // Software, like `backend()`: this checks sync, and on CI's virtual Macs VideoToolbox
+        // shared with the tests running alongside stalls for hundreds of milliseconds.
+        ffmpeg: FfmpegConfig { hwaccel: false, ..Default::default() },
         ..Default::default()
     };
     let player = Player::open(Source::parse(&fixture_path("h264_aac.mp4")).unwrap(), config).unwrap();
