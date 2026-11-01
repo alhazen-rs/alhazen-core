@@ -1,6 +1,7 @@
 //! `mf-check <fixtures-dir>`: decodes the test fixtures through Windows' own decoders (Media
-//! Foundation) and reports, per file, which decoder ran, GPU or software, and PASS/FAIL. Built in
-//! CI and run from `prebuilt/` on a Windows machine without a Rust toolchain.
+//! Foundation) and reports, per file, which decoder ran, GPU or software, and PASS/FAIL; then
+//! compares the D3D11 video processor's BGRA with the CPU path's. Built in CI and run from
+//! `prebuilt/` on a Windows machine without a Rust toolchain.
 
 #[cfg(not(all(windows, feature = "media-foundation", feature = "native")))]
 fn main() {
@@ -40,7 +41,7 @@ fn main() {
         ("eac3.mkv", StreamKind::Audio, 24_000, 4096),
         ("alac.m4a", StreamKind::Audio, 24_000, 4096),
     ];
-    let mut failed = 0;
+    let mut failed = 0u32;
     println!("{:<18} {:<6} {:<8} {:<44} {:>8} {:>8}  result", "file", "track", "decoder", "", "count", "ms");
     for &(file, kind, expect, tolerance) in cases {
         let path = format!("{dir}/{file}");
@@ -131,7 +132,125 @@ fn main() {
             }
         }
     }
+    failed += processor_checks(&dir);
     std::process::exit(if failed == 0 { 0 } else { 1 });
+}
+
+/// The D3D11 video processor against the CPU path, as in `tests/media_foundation.rs`. Returns
+/// how many checks failed; a machine without a video processor skips them.
+#[cfg(all(windows, feature = "media-foundation", feature = "native"))]
+fn processor_checks(dir: &str) -> u32 {
+    use std::time::Duration;
+    // (file, largest output size, least PSNR against the CPU path in dB)
+    let cases: [(&str, Option<(u32, u32)>, f64); 3] =
+        [("h264_aac.mp4", None, 45.0), ("h264_aac.mp4", Some((160, 90)), 35.0), ("hdr_pq.mkv", None, 30.0)];
+    let mut failed = 0;
+    println!("\nD3D11 video processor against the CPU path\n{:<18} {:<10} {:>8} {:>10}  result", "file", "size", "dB", "luma");
+    for (file, hint, min_db) in cases {
+        let path = format!("{dir}/{file}");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(processor_and_cpu(&path, hint)));
+        // Printed before converting so a driver that hangs or crashes the process is named.
+        print!("{file:<18} ");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        match rx.recv_timeout(Duration::from_secs(20)) {
+            Err(_) => {
+                failed += 1;
+                println!("FAIL: hung or crashed");
+            }
+            Ok(Err(e)) => {
+                failed += 1;
+                println!("FAIL: {e}");
+            }
+            Ok(Ok(None)) => println!("SKIP (no D3D11 video processor here)"),
+            Ok(Ok(Some((bgra, size, y)))) => {
+                let want = hint.and_then(|h| alhazen_core::scale::fit_within(y.width, y.height, h)).unwrap_or((y.width, y.height));
+                let db = psnr(&bgra, &cpu_reference(&y, size));
+                // Drivers tone map their own way: HDR must also reach black and white.
+                let luma = |p: &[u8]| (p[2] as u32 * 2126 + p[1] as u32 * 7152 + p[0] as u32 * 722) / 10000;
+                let (lo, hi) = bgra.chunks(4).map(luma).fold((255, 0), |(lo, hi), l| (lo.min(l), hi.max(l)));
+                let range_ok = !file.starts_with("hdr") || (lo <= 8 && hi >= 240);
+                let ok = size == want && db >= min_db && range_ok;
+                failed += !ok as u32;
+                println!(
+                    "{:<10} {db:>8.1} {:>10}  {}",
+                    format!("{}x{}", size.0, size.1),
+                    format!("{lo}..{hi}"),
+                    if ok { "PASS" } else { "FAIL" }
+                );
+            }
+        }
+    }
+    failed
+}
+
+/// The first frame of `path` through Media Foundation, once converted by the video processor
+/// (with `hint`) and once as YUV for the CPU path; `None` when that can't run here.
+#[cfg(all(windows, feature = "media-foundation", feature = "native"))]
+fn processor_and_cpu(path: &str, hint: Option<(u32, u32)>) -> Result<Option<(Vec<u8>, (u32, u32), alhazen_core::decode::YuvFrame)>, String> {
+    use alhazen_core::backend::Registry;
+    use alhazen_core::decode::{DecodedFrame, VideoDecoder};
+    use alhazen_core::demux::StreamKind;
+    use alhazen_core::hw::select::HwCodec;
+    use alhazen_core::mf::MfVideoDecoder;
+    use alhazen_core::Source;
+
+    let source = Source::parse(path).map_err(|e| e.to_string())?;
+    let mut src = source.open().map_err(|e| e.to_string())?;
+    let format = alhazen_core::demux::probe(src.as_mut()).map_err(|e| e.to_string())?.ok_or("not a media file")?;
+    let mut d = Registry::empty_with_native().open_demuxer(&source, format, src, None).map_err(|e| e.to_string())?;
+    let s = d.streams().iter().find(|s| s.kind == StreamKind::Video).cloned().ok_or("no video track")?;
+    let codec = HwCodec::of(&s).ok_or("not a Media Foundation codec")?;
+    let unavailable = |e: &str| e.contains("no Media Foundation decoder");
+    let mut gpu = match MfVideoDecoder::new(codec, &s, true) {
+        Ok(dec) => dec.with_ten_bit(true).with_gpu_bgra(true),
+        Err(e) if unavailable(&e.to_string()) => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut cpu = MfVideoDecoder::new(codec, &s, true).map_err(|e| e.to_string())?.with_ten_bit(true);
+    gpu.set_output_hint(hint);
+    let (mut g, mut c) = (None, None);
+    while g.is_none() || c.is_none() {
+        let Some(p) = d.next_packet().map_err(|e| e.to_string())? else { break };
+        if p.stream != s.id {
+            continue;
+        }
+        if let Err(e) = gpu.send_packet(&p).and_then(|()| cpu.send_packet(&p)) {
+            return if unavailable(&e.to_string()) { Ok(None) } else { Err(e.to_string()) };
+        }
+        g = g.or(gpu.receive_frame().map_err(|e| e.to_string())?);
+        c = c.or(cpu.receive_frame().map_err(|e| e.to_string())?);
+    }
+    let Some(DecodedFrame::Yuv(mut y)) = c else { return Err("the CPU path gave no YUV frame".into()) };
+    y.color.apply_stream(&alhazen_core::color::StreamColor::of(&s));
+    match g {
+        Some(DecodedFrame::Bgra { width, height, bgra, .. }) => Ok(Some((bgra.to_vec(), (width, height), y))),
+        _ if gpu.gpu_fallback() || gpu.description().is_some_and(|(_, on_gpu)| !on_gpu) => Ok(None),
+        _ => Err("the GPU path gave no BGRA frame".into()),
+    }
+}
+
+/// The CPU path's full-size BGRA, scaled to `size` in RGB (see `tests/nvdec.rs`).
+#[cfg(all(windows, feature = "media-foundation", feature = "native"))]
+fn cpu_reference(y: &alhazen_core::decode::YuvFrame, size: (u32, u32)) -> Vec<u8> {
+    use fast_image_resize::images::{Image, ImageRef};
+    use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
+    let mut full = Vec::new();
+    alhazen_core::convert::frame_to_bgra(y, &mut full).unwrap();
+    if size == (y.width, y.height) {
+        return full;
+    }
+    let src = ImageRef::new(y.width, y.height, &full, PixelType::U8x4).unwrap();
+    let mut dst = Image::new(size.0, size.1, PixelType::U8x4);
+    let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear));
+    Resizer::new().resize(&src, &mut dst, &options).unwrap();
+    dst.into_vec()
+}
+
+#[cfg(all(windows, feature = "media-foundation", feature = "native"))]
+fn psnr(a: &[u8], b: &[u8]) -> f64 {
+    let mse = a.iter().zip(b).map(|(&x, &y)| (x as f64 - y as f64).powi(2)).sum::<f64>() / a.len() as f64;
+    if mse == 0.0 { f64::INFINITY } else { 10.0 * (255.0 * 255.0 / mse).log10() }
 }
 
 /// `mf-check --native-type <file>`: the media types Windows' own demuxer (Source Reader) reports

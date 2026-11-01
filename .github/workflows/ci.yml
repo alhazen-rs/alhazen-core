@@ -105,8 +105,12 @@ jobs:
         run: |
           cargo build --release --locked --example mf-check
           target/release/examples/mf-check.exe tests/fixtures
+          # To run elsewhere: `mf-check.exe fixtures` from the unpacked folder.
+          mkdir mf-check-windows
+          cp target/release/examples/mf-check.exe mf-check-windows/
+          cp -r tests/fixtures mf-check-windows/fixtures
       - uses: actions/upload-artifact@v4
         if: always() && runner.os == 'Windows'
         with:
           name: mf-check-windows
-          path: target/release/examples/mf-check.exe
+          path: mf-check-windows
