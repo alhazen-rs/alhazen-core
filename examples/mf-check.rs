@@ -142,14 +142,15 @@ fn main() {
 fn processor_checks(dir: &str) -> u32 {
     use std::time::Duration;
     // (file, largest output size, least PSNR against the CPU path in dB)
-    let cases: [(&str, Option<(u32, u32)>, f64); 3] =
-        [("h264_aac.mp4", None, 45.0), ("h264_aac.mp4", Some((160, 90)), 35.0), ("hdr_pq.mkv", None, 30.0)];
+    let cases = [("h264_aac.mp4", None, 45.0), ("h264_aac.mp4", Some((160, 90)), 35.0), ("hdr_pq.mkv", None, 30.0)];
     let mut failed = 0;
     println!("\nD3D11 video processor against the CPU path\n{:<18} {:<10} {:>8} {:>10}  result", "file", "size", "dB", "luma");
     for (file, hint, min_db) in cases {
         let path = format!("{dir}/{file}");
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || tx.send(processor_and_cpu(&path, hint)));
+        std::thread::spawn(move || {
+            let _ = tx.send(processor_and_cpu(&path, hint));
+        });
         // Printed before converting so a driver that hangs or crashes the process is named.
         print!("{file:<18} ");
         let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -184,10 +185,14 @@ fn processor_checks(dir: &str) -> u32 {
     failed
 }
 
+/// A frame from the video processor (BGRA and its size) and the same one as YUV.
+#[cfg(all(windows, feature = "media-foundation", feature = "native"))]
+type Converted = (Vec<u8>, (u32, u32), alhazen_core::decode::YuvFrame);
+
 /// The first frame of `path` through Media Foundation, once converted by the video processor
 /// (with `hint`) and once as YUV for the CPU path; `None` when that can't run here.
 #[cfg(all(windows, feature = "media-foundation", feature = "native"))]
-fn processor_and_cpu(path: &str, hint: Option<(u32, u32)>) -> Result<Option<(Vec<u8>, (u32, u32), alhazen_core::decode::YuvFrame)>, String> {
+fn processor_and_cpu(path: &str, hint: Option<(u32, u32)>) -> Result<Option<Converted>, String> {
     use alhazen_core::backend::Registry;
     use alhazen_core::decode::{DecodedFrame, VideoDecoder};
     use alhazen_core::demux::StreamKind;
