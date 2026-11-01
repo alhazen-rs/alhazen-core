@@ -270,15 +270,28 @@ fn h264_aac_plays_to_the_end_in_sync() {
     assert_eq!(player.stats().video_backend, Some("ffmpeg-cli"));
     player.play();
     let mut checked = 0;
+    // (wall ms since play, clock ms, pts ms of the frame shown, frames queued) at every change of frame, so a
+    // failure shows whether frames arrived late or the clock jumped.
+    let (start, mut timeline, mut last) = (Instant::now(), Vec::new(), None);
     until("end of playback", 20, || {
         play_ms(&null, 10);
         if let Some(f) = player.current_frame() {
             let pos = player.position();
+            if last != Some(f.pts()) {
+                last = Some(f.pts());
+                let snapshot = player.debug_snapshot();
+                let queued = snapshot.split(" queue ").nth(1).and_then(|s| s.split(' ').next()).unwrap_or("?").to_owned();
+                timeline.push((start.elapsed().as_millis(), pos.as_millis(), f.pts().as_millis(), queued));
+            }
             // Steady state, after a 500 ms warm-up: a cold ffmpeg (first run on a fresh CI
             // machine) delivers its first frames late, and catch-up takes a few frames.
             if pos > Duration::from_millis(500) && pos < Duration::from_millis(900) {
                 let diff = pos.abs_diff(f.pts());
-                assert!(diff <= Duration::from_millis(45), "A/V offset {diff:?} at {pos:?} ({:?})", player.stats());
+                assert!(
+                    diff <= Duration::from_millis(45),
+                    "A/V offset {diff:?} at {pos:?} ({:?})\n(wall, clock, pts) ms and frames queued at each new frame: {timeline:?}",
+                    player.stats()
+                );
                 checked += 1;
             }
         }
