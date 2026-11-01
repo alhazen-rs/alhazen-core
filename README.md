@@ -72,7 +72,7 @@ if let Some(frame) = player.current_frame() { /* draw it */ }
 
 ```toml
 [dependencies]
-alhazen-core = "0.5"
+alhazen-core = "0.6"
 
 # Decoding unoptimized is many times slower than real time: optimize the decoders even in
 # debug builds.
