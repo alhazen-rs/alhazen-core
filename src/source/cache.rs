@@ -14,6 +14,8 @@ use super::MediaSource;
 const WINDOW: usize = 1 << 20;
 /// Granularity of reads while filling or sliding the window.
 const CHUNK: usize = 64 * 1024;
+/// A jump this far past the window reads through the gap and keeps the window; further is a seek.
+const READ_THROUGH: u64 = 256 * 1024;
 
 pub(crate) struct CachedSource {
     src: Box<dyn MediaSource>,
@@ -41,40 +43,52 @@ impl CachedSource {
         if self.eof && self.pos == end {
             return Ok(());
         }
-        if self.pos == end && !self.buf.is_empty() {
-            // Reading on from the end of the window: slide it instead of seeking.
-            if self.buf.len() + CHUNK > WINDOW {
-                let drop = self.buf.len() + CHUNK - WINDOW;
-                self.buf.drain(..drop);
-                self.start += drop as u64;
-            }
-        } else {
-            // A seek outside the window: start a new one at the read position.
-            if self.src_pos != Some(self.pos) {
-                self.src.seek(SeekFrom::Start(self.pos))?;
-                self.src_pos = Some(self.pos);
-            }
-            self.buf.clear();
-            self.start = self.pos;
-            self.eof = false;
-        }
-        while self.buf.len() < WINDOW && !self.eof {
-            let old = self.buf.len();
-            let want = (old + CHUNK).min(WINDOW);
-            self.buf.resize(want, 0);
-            let n = match self.src.read(&mut self.buf[old..want]) {
-                Ok(n) => n,
-                Err(e) => {
-                    self.buf.truncate(old);
-                    return Err(e);
+        let gap = self.pos.checked_sub(end);
+        if !self.buf.is_empty() && !self.eof && gap.is_some_and(|g| g <= READ_THROUGH) {
+            // Reading on from the end of the window, or from just past it: slide it instead of
+            // seeking. Interleaved tracks read just past the end and then back inside the window,
+            // which would be a new connection if the window were dropped here.
+            while self.start + self.buf.len() as u64 <= self.pos && !self.eof {
+                if self.buf.len() + CHUNK > WINDOW {
+                    let drop = self.buf.len() + CHUNK - WINDOW;
+                    self.buf.drain(..drop);
+                    self.start += drop as u64;
                 }
-            };
-            self.buf.truncate(old + n);
-            if n == 0 {
-                self.eof = true;
-            } else {
-                self.src_pos = Some(self.start + self.buf.len() as u64);
+                self.read_chunk()?;
             }
+            return Ok(());
+        }
+        // A seek outside the window: start a new one at the read position.
+        if self.src_pos != Some(self.pos) {
+            self.src.seek(SeekFrom::Start(self.pos))?;
+            self.src_pos = Some(self.pos);
+        }
+        self.buf.clear();
+        self.start = self.pos;
+        self.eof = false;
+        while self.buf.len() < WINDOW && !self.eof {
+            self.read_chunk()?;
+        }
+        Ok(())
+    }
+
+    /// Appends up to one [`CHUNK`] from the source to the window.
+    fn read_chunk(&mut self) -> io::Result<()> {
+        let old = self.buf.len();
+        let want = (old + CHUNK).min(WINDOW);
+        self.buf.resize(want, 0);
+        let n = match self.src.read(&mut self.buf[old..want]) {
+            Ok(n) => n,
+            Err(e) => {
+                self.buf.truncate(old);
+                return Err(e);
+            }
+        };
+        self.buf.truncate(old + n);
+        if n == 0 {
+            self.eof = true;
+        } else {
+            self.src_pos = Some(self.start + self.buf.len() as u64);
         }
         Ok(())
     }
@@ -218,6 +232,39 @@ mod tests {
         src.read_exact(&mut start).unwrap();
         assert_eq!(start, bytes[..16]);
         assert!(seeks.load(Ordering::Relaxed) > before, "a seek outside the window must reach the source");
+    }
+
+    #[test]
+    fn small_forward_jump_past_the_window_keeps_it() {
+        // Interleaved tracks: one sample lies just past the window, the next one back inside it.
+        let bytes = data(2 << 20);
+        let (mut src, seeks) = cached(bytes.clone());
+        src.read_exact(&mut [0u8; 16]).unwrap();
+        let before = seeks.load(Ordering::Relaxed);
+        src.seek(SeekFrom::Start(WINDOW as u64 + 10_000)).unwrap();
+        let mut ahead = [0u8; 32];
+        src.read_exact(&mut ahead).unwrap();
+        assert_eq!(ahead, bytes[WINDOW + 10_000..][..32]);
+        src.seek(SeekFrom::Start(WINDOW as u64 - 5_000)).unwrap();
+        let mut back = [0u8; 32];
+        src.read_exact(&mut back).unwrap();
+        assert_eq!(back, bytes[WINDOW - 5_000..][..32]);
+        assert_eq!(seeks.load(Ordering::Relaxed), before, "neither jump may reach the source");
+        assert!(src.buf.len() <= WINDOW, "window grew to {}", src.buf.len());
+    }
+
+    #[test]
+    fn far_forward_jump_seeks_instead_of_downloading_the_gap() {
+        let bytes = data(4 << 20);
+        let (mut src, seeks) = cached(bytes.clone());
+        src.read_exact(&mut [0u8; 16]).unwrap();
+        let before = seeks.load(Ordering::Relaxed);
+        let far = (3 << 20) + 1;
+        src.seek(SeekFrom::Start(far as u64)).unwrap();
+        let mut got = [0u8; 32];
+        src.read_exact(&mut got).unwrap();
+        assert_eq!(got, bytes[far..][..32]);
+        assert!(seeks.load(Ordering::Relaxed) > before, "a far jump must reach the source");
     }
 
     #[test]

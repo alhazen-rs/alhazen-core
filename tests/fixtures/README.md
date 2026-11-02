@@ -170,13 +170,15 @@ ffmpeg -v error -y -f lavfi -i "color=c=black:s=320x240:r=30:d=2,drawbox=x=0:y=0
 ffmpeg -v error -y -ss 0.5 -i sync.mp4 -c copy sync_cut.mp4
 ffmpeg -v error -y -i sync.mp4 -c copy sync.mkv
 ffmpeg -v error -y -i sync.mp4 -map 0:a -map 0:v -c copy audio_first.mp4
+ffmpeg -v error -y -i h264_aac.mp4 -itsoffset 0.5 -i h264_aac.mp4 -map 0:v -map 1:a -c copy delayed_audio.mp4
 ```
 
 - A white frame and a 1 kHz beep both start at 1.0 s. `sync.mp4`: audio edit list 1024 (AAC
   priming), video 0. `sync_cut.mp4`: a stream-copy cut at 0.5 s; both tracks' edit lists skip
   0.5 s (video 7680/15360, audio 24000/48000), so the flash and beep are at 0.5 s of playback.
   `sync.mkv`: AAC with Matroska CodecDelay. `audio_first.mp4`: `sync.mp4` with the audio as
-  track 1 and the video as track 2, so at decode time 0 the audio packet comes before the keyframe.
+  track 1 and the video as track 2, so at decode time 0 the audio packet comes before the keyframe. `delayed_audio.mp4`: the audio
+  starts late through an empty edit (0.4768 s), as in screen recordings.
 
 ## Audio files (alhazen-core 0.5)
 

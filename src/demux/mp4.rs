@@ -72,6 +72,12 @@ impl Mp4Demuxer {
             // Fragmented files (fMP4, HLS/DASH segments): re_mp4 does not normalise fragment
             // times, so a video edit list (the B-frame delay) is applied here, to every sample.
             let fragmented = trak.mdia.minf.stbl.stsz.sample_count == 0 && !track.samples.is_empty();
+            // Nothing plays on this track until its leading empty edits end (a recording's audio
+            // often starts late); re_mp4 does not apply them. Fragments keep the timing their
+            // `tfdt` gives them (HLS lines segments up by it).
+            let start_delay = trak.edts.as_ref().and_then(|e| e.elst.as_ref()).filter(|_| !fragmented).map_or(Duration::ZERO, |elst| {
+                leading_empty_edits(elst.entries.iter().map(|e| (e.segment_duration, e.media_time)), mp4.moov.mvhd.timescale)
+            });
             let shift = match (kind, edit_skip) {
                 (StreamKind::Video, Some(skip)) if fragmented => skip as i64,
                 _ => 0,
@@ -92,7 +98,7 @@ impl Mp4Demuxer {
             let mut info = StreamInfo::new(track.track_id, kind, codec);
             info.width = track.width as u32;
             info.height = track.height as u32;
-            info.duration = Some(ticks(track.duration as i64, timescale));
+            info.duration = Some(ticks(track.duration as i64, timescale) + start_delay);
             info.extradata = track.raw_codec_config(&mp4);
             if let re_mp4::StsdBoxContent::Mp4a(mp4a) = &track.trak(&mp4).mdia.minf.stbl.stsd.contents {
                 // re_mp4 gives no codec string for mp4a; the esds object type tells AAC from MP3.
@@ -164,8 +170,8 @@ impl Mp4Demuxer {
                 stream: track.track_id,
                 offset: s.offset,
                 size: s.size,
-                pts: ticks(s.composition_timestamp - shift, s.timescale.max(1)),
-                dts: ticks(s.decode_timestamp - shift, s.timescale.max(1)),
+                pts: ticks(s.composition_timestamp - shift, s.timescale.max(1)) + start_delay,
+                dts: ticks(s.decode_timestamp - shift, s.timescale.max(1)) + start_delay,
                 keyframe: s.is_sync,
             });
             match info.codec {
@@ -541,6 +547,17 @@ fn leading_skip(media_times: impl IntoIterator<Item = u64>) -> Option<u64> {
     media_times.into_iter().find(|&t| t != u32::MAX as u64 && t != u64::MAX).filter(|&t| t > 0)
 }
 
+/// How long a track's leading empty edits (`media_time` -1) last. Their durations are in the
+/// movie's timescale, not the track's.
+fn leading_empty_edits(edits: impl IntoIterator<Item = (u64, u64)>, movie_timescale: u32) -> Duration {
+    let empty: u64 = edits
+        .into_iter()
+        .take_while(|&(_, media_time)| media_time == u32::MAX as u64 || media_time == u64::MAX)
+        .map(|(duration, _)| duration)
+        .sum();
+    ticks(empty as i64, movie_timescale.max(1) as u64)
+}
+
 fn parse_esds_asc(esds: &[u8]) -> Option<Vec<u8>> {
     parse_esds(esds)?.1
 }
@@ -700,6 +717,21 @@ mod tests {
         assert_eq!(audio.codec_delay, ticks(1024, 44_100), "same rounding as every MP4 timestamp");
         let video = d.streams().iter().find(|s| s.kind == StreamKind::Video).unwrap();
         assert_eq!(video.codec_delay, Duration::ZERO, "video is unchanged");
+    }
+
+    #[test]
+    fn an_empty_edit_delays_its_track() {
+        // Screen recorders start the audio late with an empty edit: nothing plays on that track
+        // until the edit ends. `delayed_audio.mp4`: 5382656 ticks of its 11289600 Hz movie clock.
+        let mut d = Mp4Demuxer::open(Box::new(FileSource::open("tests/fixtures/delayed_audio.mp4").unwrap())).unwrap();
+        let audio = d.streams().iter().find(|s| s.kind == StreamKind::Audio).unwrap().id;
+        let (mut first_audio, mut first_video) = (None, None);
+        while let Some(p) = d.next_packet().unwrap() {
+            let first = if p.stream == audio { &mut first_audio } else { &mut first_video };
+            first.get_or_insert(p.pts);
+        }
+        assert_eq!(first_video, Some(Duration::ZERO), "the video has no edit");
+        assert_eq!(first_audio, Some(ticks(5_382_656, 11_289_600)));
     }
 
     #[test]
