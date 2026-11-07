@@ -36,6 +36,10 @@ if let Some(frame) = player.current_frame() { /* draw it */ }
 - **Apple's decoders on macOS:** H.264 and HEVC (8- and 10-bit) on the GPU through
   VideoToolbox, plus AV1, VP9 and ProRes on Macs with hardware for them; ALAC, AC-3, E-AC-3 and
   xHE-AAC through AudioToolbox. Nothing to install (Apple Silicon, macOS 12 or later).
+- **AMD and Intel GPUs on Linux:** H.264 (8-bit 4:2:0, progressive and MBAFF) decodes on the
+  GPU through VA-API, libva loaded at runtime. VA-API leaves the stream's headers, picture
+  order and references to the application; ours are checked picture by picture against a
+  software decoder. HEVC, VP9 and AV1 next.
 - **NVIDIA GPUs on Linux:** H.264, HEVC, VP8, VP9 and AV1 (8- and 10-bit) decode on the GPU
   through NVDEC, scaled to your display size on the GPU. Loaded from the driver at runtime:
   nothing to install or build.
@@ -264,6 +268,7 @@ Each stream is offered to the backends in priority order; the first that claims 
 | `media-foundation` | Windows | H.264/HEVC/audio whenever Windows has a decoder. VP9/AV1 only with a GPU decoder (Windows' software ones are no faster than ours). |
 | `videotoolbox` | macOS | H.264/HEVC always; AV1/VP9/ProRes only with a hardware decoder. Audio only where the pure-Rust decoders have none (ALAC, AC-3, E-AC-3, xHE-AAC). |
 | `nvdec` | Linux, NVIDIA | Video the GPU decodes at the stream's size. VP8/VP9/AV1 only with `prefer_hardware` (otherwise after `native`). |
+| `vaapi` | Linux, AMD/Intel | H.264 the GPU decodes (8-bit 4:2:0, frames). NVIDIA's VA-API driver is left to `nvdec`. |
 | `native` | all | The pure-Rust decoders. |
 | `ffmpeg-cli` | all | Whatever the user's `ffmpeg -decoders` lists. GPU decoding with `-hwaccel auto`. |
 
@@ -296,6 +301,7 @@ ffmpeg behind a Chocolatey/Scoop shim.
 | `media-foundation` | ✅ | Windows' decoders. Compiles to nothing on other platforms. |
 | `videotoolbox` | ✅ | Apple's decoders on macOS (VideoToolbox, AudioToolbox). Compiles to nothing on other platforms. |
 | `nvdec` | ✅ | NVIDIA GPU decoding on Linux (NVDEC), loaded from the driver at runtime. Compiles to nothing on other platforms. |
+| `vaapi` | ✅ | AMD and Intel GPU decoding on Linux (VA-API), libva loaded at runtime. Compiles to nothing on other platforms. |
 | `native-aac` | ✅ | AAC (LC, Main, LTP, HE-AAC v1/v2) through rusty_aac (pure Rust, Apache-2.0). |
 | `native-mp3` | ✅ | MP3 (MPEG-1/2/2.5 Layer III) through rusty_mp3 (pure Rust, Apache-2.0). |
 
@@ -338,6 +344,7 @@ point. Seeking passes through `Buffering`.
 |---|---|
 | `ALHAZEN_FFMPEG=/path/to/ffmpeg` | The ffmpeg program to use (when `PlayerConfig::ffmpeg.path` isn't set). |
 | `RUST_LOG=alhazen_core=debug` | Library logging through the `log` crate, with any logger. |
+| `ALHAZEN_VAAPI_ANY_DRIVER=1` | Use any VA-API driver, NVIDIA's too (to test the `vaapi` backend on an NVIDIA machine). |
 
 ## Platform requirements
 

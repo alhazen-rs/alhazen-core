@@ -60,7 +60,11 @@ impl Registry {
         if crate::nvdec::available() {
             r.register(Arc::new(crate::nvdec::NvdecBackend::new(prefer_hardware)));
         }
-        #[cfg(not(any(all(windows, feature = "media-foundation"), all(target_os = "linux", feature = "nvdec"), all(target_os = "macos", feature = "videotoolbox"))))]
+        #[cfg(all(target_os = "linux", feature = "vaapi"))]
+        if crate::vaapi::available() {
+            r.register(Arc::new(crate::vaapi::VaapiBackend::new(prefer_hardware)));
+        }
+        #[cfg(not(any(all(windows, feature = "media-foundation"), all(target_os = "linux", any(feature = "nvdec", feature = "vaapi")), all(target_os = "macos", feature = "videotoolbox"))))]
         let _ = prefer_hardware;
         #[cfg(feature = "native")]
         r.register(Arc::new(NativeBackend));

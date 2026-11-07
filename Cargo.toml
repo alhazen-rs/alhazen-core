@@ -15,7 +15,7 @@ categories = ["multimedia::video", "multimedia::audio", "multimedia"]
 include = ["src/**", "examples/**", "LICENSE", "NOTICE", "README.md"]
 
 [features]
-default = ["native", "http", "hls", "audio-output", "ffmpeg-cli", "media-foundation", "nvdec", "videotoolbox", "native-aac", "native-mp3"]
+default = ["native", "http", "hls", "audio-output", "ffmpeg-cli", "media-foundation", "nvdec", "vaapi", "videotoolbox", "native-aac", "native-mp3"]
 # Pure-Rust, permissively licensed decoders: AV1 (rav1d), VP9 (vp9-mt), VP8 (oximedia-codec),
 # ProRes (oxideav-prores), Opus, Vorbis, FLAC (claxon); MP4/MOV demuxing.
 native = ["dep:rav1d", "dep:vp9-mt", "dep:oximedia-codec", "dep:oxideav-prores", "dep:re_mp4", "dep:opus-pure", "dep:lewton", "dep:claxon"]
@@ -36,6 +36,8 @@ media-foundation = ["dep:windows"]
 # NVIDIA's GPU decoders on Linux (NVDEC): H.264, HEVC, VP8, VP9, AV1. Loaded at runtime from the
 # driver (nothing linked, no build requirements); nothing on other platforms.
 nvdec = ["dep:libloading"]
+# AMD and Intel GPU decoding on Linux (VA-API), libva loaded at runtime.
+vaapi = ["dep:libloading"]
 # Apple's decoders on macOS (Apple Silicon): VideoToolbox for H.264 and HEVC (plus AV1, VP9 and
 # ProRes where the Mac has hardware for them), AudioToolbox for ALAC, AC-3, E-AC-3 and xHE-AAC.
 # Nothing on other platforms.

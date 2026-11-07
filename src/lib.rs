@@ -18,6 +18,7 @@ mod player;
 pub mod mf;
 pub mod nal;
 pub mod nvdec;
+pub mod vaapi;
 pub mod output;
 pub mod scale;
 pub mod source;
