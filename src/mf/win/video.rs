@@ -2,6 +2,7 @@
 //! transform accepts our D3D11 device.
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use windows::Win32::Media::MediaFoundation::*;
 use windows::core::{GUID, Interface};
@@ -45,6 +46,10 @@ pub struct MfVideoDecoder {
     ready: VecDeque<DecodedFrame>,
     scratch: Vec<u8>,
     conversion: Conversion,
+    /// send_eof が呼ばれた。遅延パイプラインのドレインはこのときだけ行う
+    /// （入力の一時的な枯渇で強制回収するとリングが埋まらずパイプライン化の
+    /// 意味がなくなる — スパイクの計測で判明）。
+    eof_sent: bool,
 }
 
 /// How output pictures are handed out: as YUV (10-bit when `ten_bit`), or converted to BGRA by
@@ -59,10 +64,20 @@ struct Conversion {
     /// The first converted picture has been checked against the CPU path.
     checked: bool,
     stream: StreamColor,
+    /// GPU 変換を提出済みで未回収のもの（pts・スロット・出力サイズの順）。
+    /// 読み戻しの同期をパイプライン化するためのリング。（240fps では毎フレームの
+    /// 全体同期が律速だった。）
+    pending: VecDeque<(Duration, usize, (u32, u32))>,
 }
 
+/// 読み戻しの遅延量（= ステージングのリング数。processor.rs の RING と合わせる）。
+const PENDING_RING: usize = 6;
+
 impl Conversion {
-    fn frame(&mut self, sample: &IMFSample, out: &OutFormat, on_gpu: bool) -> Result<DecodedFrame> {
+    /// 1 サンプル分の変換を進める。GPU 経路では読み戻しを遅延させるため、
+    /// パイプラインが満たされる間は None を返す（フレームは失われず、あとの
+    /// サンプルや drain_pending で順に出てくる）。
+    fn frame(&mut self, sample: &IMFSample, out: &OutFormat, on_gpu: bool) -> Result<Option<DecodedFrame>> {
         if self.gpu_bgra && on_gpu && !self.failed {
             match self.convert(sample, out) {
                 Ok(frame) => return Ok(frame),
@@ -70,26 +85,55 @@ impl Conversion {
                     log::warn!("Media Foundation: converting on the GPU failed ({e}); converting on the CPU from now on");
                     self.failed = true;
                     self.processor = None;
+                    self.pending.clear();
                 }
             }
         }
-        read_frame(sample, out, self.ten_bit).map(DecodedFrame::Yuv)
+        read_frame(sample, out, self.ten_bit).map(|f| Some(DecodedFrame::Yuv(f)))
+    }
+
+    /// 遅延分を 1 枚強制回収する（EOF や入力枯渇時のドレイン用）。
+    fn drain_pending(&mut self) -> Option<DecodedFrame> {
+        let (pts, slot, size) = self.pending.pop_front()?;
+        let processor = self.processor.as_mut()?;
+        match processor.reap(slot) {
+            Ok(bgra) => Some(DecodedFrame::Bgra {
+                width: size.0,
+                height: size.1,
+                bgra,
+                transfer: crate::color::Transfer::Sdr,
+                pts,
+            }),
+            Err(e) => {
+                log::warn!("Media Foundation: reaping a converted picture failed ({e})");
+                None
+            }
+        }
+    }
+
+    /// 遅延分が残っているか。
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
     }
 
     /// A picture converted to BGRA by the video processor, at the size the hint allows. The first
     /// one is compared with our CPU path (which tone maps HDR): drivers tone map their own way, and
     /// if the result differs this fails and the stream continues on the CPU.
-    fn convert(&mut self, sample: &IMFSample, out: &OutFormat) -> Result<DecodedFrame> {
+    ///
+    /// 2 枚目以降は読み戻しを遅延させる: 変換の提出だけして、リングが一杯なら最古を
+    /// 回収して返す。None は「フレームはパイプラインの中」（失われない）。
+    fn convert(&mut self, sample: &IMFSample, out: &OutFormat) -> Result<Option<DecodedFrame>> {
         let gpu = device::gpu().ok_or(Error::Unsupported("D3D11 video device"))?;
         let src = out.visible;
         let dst = self.hint.and_then(|h| fit_within(src.0, src.1, h)).unwrap_or(src);
         let mut color = ColorInfo::sdr(out.matrix.unwrap_or_else(|| ColorMatrix::guess_for_height(src.1)), out.full_range);
         color.apply_stream(&self.stream);
-        let mut first = None;
+        // SAFETY: COM call on a live sample.
+        let pts = mft::from_mf_time(unsafe { sample.GetSampleTime() }.unwrap_or(0));
         if !self.checked {
             self.checked = true;
             let mut processor = Processor::new(&gpu.device, src, src)?;
-            let converted = processor.convert(sample, &color)?;
+            let converted = processor.convert_sync(sample, &color)?;
             let mut frame = read_frame(sample, out, true)?;
             frame.color = color;
             let mut cpu = Vec::new();
@@ -100,20 +144,42 @@ impl Conversion {
                 return Err(Error::Decode(format!("the D3D11 video processor's output differs from the CPU path ({db:.1} dB)")));
             }
             self.processor = Some(processor);
-            first = (dst == src).then_some(converted);
-        }
-        let bgra = match first {
-            Some(bgra) => bgra,
-            None => {
-                if !self.processor.as_ref().is_some_and(|p| p.fits(src, dst)) {
-                    self.processor = Some(Processor::new(&gpu.device, src, dst)?);
-                }
-                self.processor.as_mut().expect("created above").convert(sample, &color)?
+            if dst == src {
+                return Ok(Some(DecodedFrame::Bgra { width: src.0, height: src.1, bgra: converted, transfer: color.transfer, pts }));
             }
-        };
-        // SAFETY: COM call on a live sample.
-        let pts = mft::from_mf_time(unsafe { sample.GetSampleTime() }.unwrap_or(0));
-        Ok(DecodedFrame::Bgra { width: dst.0, height: dst.1, bgra, transfer: color.transfer, pts })
+            // 縮小が必要なら、チェック用のフルサイズの1枚は使わず、通常どおり
+            // パイプラインに提出する（サイズ違いの1枚が混ざるのを防ぐ）。
+        }
+        if !self.processor.as_ref().is_some_and(|p| p.fits(src, dst)) {
+            // 出力サイズの変更（ウィンドウのリサイズなど）。遅延分は古いサイズの
+            // フレームなので回収して捨て、プロセッサを作り直す。ウィンドウの
+            // リサイズは連発されるが、回収は GPU の完了を待たずに済む。
+            while let Some((_, slot, _)) = self.pending.pop_front() {
+                if let Some(processor) = self.processor.as_mut() {
+                    let _ = processor.reap(slot);
+                }
+            }
+            self.processor = Some(Processor::new(&gpu.device, src, dst)?);
+        }
+        let processor = self.processor.as_mut().expect("created above");
+        // リングが一杯なら先に最古を回収する（提出から一周分の時間が経っているので
+        // 完了待ちは実質発生しない）。
+        let mut reaped = None;
+        if self.pending.len() >= PENDING_RING - 1 || !processor.has_free_slot() {
+            if let Some((old_pts, slot, size)) = self.pending.pop_front() {
+                let bgra = processor.reap(slot)?;
+                reaped = Some((old_pts, bgra, size));
+            }
+        }
+        let slot = processor.submit(sample, &color)?;
+        self.pending.push_back((pts, slot, dst));
+        Ok(reaped.map(|(old_pts, bgra, size)| DecodedFrame::Bgra {
+            width: size.0,
+            height: size.1,
+            bgra,
+            transfer: color.transfer,
+            pts: old_pts,
+        }))
     }
 }
 
@@ -133,8 +199,8 @@ impl MfVideoDecoder {
             _ => None,
         };
         let conversion =
-            Conversion { ten_bit: false, gpu_bgra: false, hint: None, processor: None, failed: false, checked: false, stream: StreamColor::of(stream) };
-        Ok(Self { codec, stream: stream.clone(), allow_gpu, annexb, state: None, ready: VecDeque::new(), scratch: Vec::new(), conversion })
+            Conversion { ten_bit: false, gpu_bgra: false, hint: None, processor: None, failed: false, checked: false, stream: StreamColor::of(stream), pending: VecDeque::new() };
+        Ok(Self { codec, stream: stream.clone(), allow_gpu, annexb, state: None, ready: VecDeque::new(), scratch: Vec::new(), conversion, eof_sent: false })
     }
 
     /// Keeps 10-bit samples of 10-bit streams (`YuvPlanes::U16`).
@@ -195,8 +261,9 @@ impl MfVideoDecoder {
             let state = self.state.as_mut().unwrap();
             match mft::process_output(&state.mft)? {
                 Output::Sample(s) => {
-                    let f = self.conversion.frame(&s, &state.out, state.gpu)?;
-                    self.ready.push_back(f);
+                    if let Some(f) = self.conversion.frame(&s, &state.out, state.gpu)? {
+                        self.ready.push_back(f);
+                    }
                 }
                 Output::NeedMoreInput => return Ok(()),
                 Output::StreamChange => state.out = negotiate_output(&state.mft, &self.stream)?,
@@ -241,12 +308,23 @@ impl VideoDecoder for MfVideoDecoder {
             loop {
                 match mft::process_output(&state.mft)? {
                     Output::Sample(s) => {
-                        self.ready.push_back(self.conversion.frame(&s, &state.out, state.gpu)?);
-                        break;
+                        if let Some(f) = self.conversion.frame(&s, &state.out, state.gpu)? {
+                            self.ready.push_back(f);
+                            break;
+                        }
+                        // While the conversion pipeline primes, a sample does not yield a
+                        // frame yet; pull the next output.
                     }
                     Output::NeedMoreInput => break,
                     Output::StreamChange => state.out = negotiate_output(&state.mft, &self.stream)?,
                 }
+            }
+        }
+        if self.ready.is_empty() && self.eof_sent && self.conversion.has_pending() {
+            // End of stream: the transform has no more output, so force-reap the
+            // conversion pipeline to play out the tail.
+            if let Some(f) = self.conversion.drain_pending() {
+                self.ready.push_back(f);
             }
         }
         Ok(self.ready.pop_front())
@@ -261,13 +339,21 @@ impl VideoDecoder for MfVideoDecoder {
     }
 
     fn send_eof(&mut self) {
+        self.eof_sent = true;
         if let Some(s) = &self.state {
             mft::drain(&s.mft);
         }
     }
 
     fn flush(&mut self) {
+        self.eof_sent = false;
         self.ready.clear();
+        // 遅延分は内容が不要なので、スロットを空きに戻すためだけに回収する。
+        while let Some((_, slot, _)) = self.conversion.pending.pop_front() {
+            if let Some(p) = self.conversion.processor.as_mut() {
+                let _ = p.reap(slot);
+            }
+        }
         if let Some(s) = &self.state {
             mft::flush(&s.mft);
             let _ = mft::begin_streaming(&s.mft);
@@ -406,4 +492,3 @@ fn read_frame(sample: &IMFSample, out: &OutFormat, ten_bit: bool) -> Result<YuvF
         })
     }
 }
-

@@ -41,7 +41,9 @@ pub(crate) struct Processor {
     processor: ID3D11VideoProcessor,
     output: ID3D11Texture2D,
     output_view: ID3D11VideoProcessorOutputView,
-    staging: ID3D11Texture2D,
+    staging: Vec<ID3D11Texture2D>,
+    /// リングの空きスロット。
+    free_slots: Vec<usize>,
     src: (u32, u32),
     dst: (u32, u32),
     /// Test switch (debug builds): this blit fails (`ALHAZEN_TEST_BREAK_VPBLT`).
@@ -89,7 +91,15 @@ impl Processor {
                 t.ok_or_else(|| Error::Decode("video processor: no texture".into()))
             };
             let output = texture(D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET.0 as u32, 0)?;
-            let staging = texture(D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ.0 as u32)?;
+            // 読み戻しをパイプライン化するためのステージングのリング。
+            // Map が古いスロットにだけかかるようにして、GPU の仕事が終わってから
+            // 読む（毎フレームの全体同期を避ける。240fps 級で律速だった）。
+            const RING: usize = 6;
+            let mut staging = Vec::with_capacity(RING);
+            for _ in 0..RING {
+                staging.push(texture(D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ.0 as u32)?);
+            }
+            let free_slots = (0..RING).collect();
             let view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
                 ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
                 Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 { Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 } },
@@ -111,6 +121,7 @@ impl Processor {
                 output,
                 output_view,
                 staging,
+                free_slots,
                 src,
                 dst,
                 break_at,
@@ -124,8 +135,14 @@ impl Processor {
         self.src == src && self.dst == dst
     }
 
-    /// `sample`'s picture (a D3D11 texture) converted to BGRA.
-    pub fn convert(&mut self, sample: &IMFSample, color: &ColorInfo) -> Result<std::sync::Arc<[u8]>> {
+    /// 空きスロットがあるか（なければ先に reap で回収する）。
+    pub fn has_free_slot(&self) -> bool {
+        !self.free_slots.is_empty()
+    }
+
+    /// `sample`'s picture converted to BGRA on the GPU, with the copy into a ring slot
+    /// queued but NOT waited for. Returns the slot; read it later with `reap`.
+    pub fn submit(&mut self, sample: &IMFSample, color: &ColorInfo) -> Result<usize> {
         self.blits += 1;
         if self.break_at == Some(self.blits) {
             return Err(Error::Decode("video processor: broken on purpose (ALHAZEN_TEST_BREAK_VPBLT)".into()));
@@ -177,9 +194,19 @@ impl Processor {
             let blit = vc.VideoProcessorBlt(p, &self.output_view, 0, std::slice::from_ref(&stream));
             ManuallyDrop::drop(&mut stream.pInputSurface);
             blit.map_err(err("blit"))?;
-            self.context.CopyResource(&self.staging, &self.output);
+            let slot = self.free_slots.pop().expect("caller ensures a free slot");
+            self.context.CopyResource(&self.staging[slot], &self.output);
+            Ok(slot)
+        }
+    }
+
+    /// スロットの内容を読み出して空きに戻す。提出からリング一周分の時間が経った
+    /// スロットにだけ使う想定で、GPU の完了待ちは実質発生しない。
+    pub fn reap(&mut self, slot: usize) -> Result<std::sync::Arc<[u8]>> {
+        // SAFETY: the staging texture is mapped only between Map and Unmap.
+        unsafe {
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.context.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).map_err(err("map"))?;
+            self.context.Map(&self.staging[slot], 0, D3D11_MAP_READ, 0, Some(&mut mapped)).map_err(err("map"))?;
             let row = self.dst.0 as usize * 4;
             let (base, pitch) = (mapped.pData as *const u8, mapped.RowPitch as usize);
             let out = self.pool.fill(row * self.dst.1 as usize, |dst| {
@@ -187,9 +214,16 @@ impl Processor {
                     line.copy_from_slice(std::slice::from_raw_parts(base.add(y * pitch), row));
                 }
             });
-            self.context.Unmap(&self.staging, 0);
+            self.context.Unmap(&self.staging[slot], 0);
+            self.free_slots.push(slot);
             Ok(out)
         }
+    }
+
+    /// 従来どおりの同期変換（初フレームの PSNR 照合用）。
+    pub fn convert_sync(&mut self, sample: &IMFSample, color: &ColorInfo) -> Result<std::sync::Arc<[u8]>> {
+        let slot = self.submit(sample, color)?;
+        self.reap(slot)
     }
 }
 
