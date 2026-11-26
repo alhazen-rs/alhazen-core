@@ -68,7 +68,11 @@ impl TimeStretcher {
 
     #[inline]
     fn avail(&self) -> usize {
-        self.input.len() / self.channels - self.head
+        // At speeds above 1x the consumption position outruns the input that has
+        // physically arrived so far (the frames in between arrive later, landing at
+        // exactly the positions the stream timeline already assigns them). Saturate:
+        // what is not here yet is simply unavailable.
+        (self.input.len() / self.channels).saturating_sub(self.head)
     }
 
     /// Cross-correlation of the candidate window's first `hop` frames with the
@@ -159,10 +163,13 @@ impl TimeStretcher {
             self.prev = w;
             self.advance();
         }
-        // Compact the consumed input once in a while.
+        // Compact the consumed input once in a while. Only what has physically
+        // arrived can be drained (see avail): the rest of `head` is future frames.
         if self.head > 4096 {
-            self.input.drain(..self.head * ch);
-            self.head = 0;
+            let frames_present = self.input.len() / ch;
+            let drain_frames = self.head.min(frames_present);
+            self.input.drain(..drain_frames * ch);
+            self.head -= drain_frames;
         }
         out
     }
@@ -204,6 +211,24 @@ mod tests {
             let err = (frames as f64 - expect).abs() / expect;
             assert!(err < 0.05, "speed {speed}: {frames} frames vs {expect}");
         }
+    }
+
+    #[test]
+    fn fast_speed_with_chunked_feeding_does_not_panic() {
+        let rate = 48_000u32;
+        let input = sine(rate, 440.0, rate as usize);
+        let mut ts = TimeStretcher::new(2, rate, 4.0);
+        // Small irregular chunks, as the resampler delivers them.
+        let mut total = 0usize;
+        for chunk in input.chunks(777) {
+            let out = ts.process(chunk);
+            total += out.len();
+        }
+        total += ts.flush().len();
+        let frames = total / 2;
+        let expect = rate as f64 / 4.0;
+        let err = (frames as f64 - expect).abs() / expect;
+        assert!(err < 0.10, "4x: {frames} frames vs {expect}");
     }
 
     #[test]
