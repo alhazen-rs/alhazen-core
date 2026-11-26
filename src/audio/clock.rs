@@ -13,6 +13,9 @@ struct Base {
     epoch: u64,
     /// Running on wall time (audio failed or ran out).
     wall: bool,
+    /// Playback speed: frames in the ring are time-stretched, so each covers
+    /// `speed / rate` seconds of content instead of `1 / rate`.
+    speed: f64,
 }
 
 /// Time = base + frames heard since `set` / rate, interpolated through the device buffer that is
@@ -32,7 +35,7 @@ impl AudioClock {
         let epoch = out.epoch();
         Self {
             out,
-            base: Mutex::new(Base { time: Duration::ZERO, epoch, wall: false }),
+            base: Mutex::new(Base { time: Duration::ZERO, epoch, wall: false, speed: 1.0 }),
             fallback: SystemClock::new(),
         }
     }
@@ -49,7 +52,7 @@ impl AudioClock {
             let into = now_ns().saturating_sub(a.at_ns);
             a.frames_before + (into as u128 * rate as u128 / 1_000_000_000).min(a.len as u128) as u64
         };
-        base.time + Duration::from_nanos(heard * 1_000_000_000 / rate)
+        base.time + Duration::from_nanos((heard as f64 * base.speed * 1_000_000_000.0 / rate as f64) as u64)
     }
 
     fn audio_gone(&self) -> bool {
@@ -96,6 +99,13 @@ impl Clock for AudioClock {
     }
     fn is_paused(&self) -> bool {
         self.out.paused.load(Ordering::Relaxed)
+    }
+    fn set_speed(&self, speed: f64) {
+        let now = self.now();
+        self.set(now);
+        let mut base = self.base.lock().unwrap();
+        base.speed = speed;
+        self.fallback.set_speed(speed);
     }
 }
 

@@ -4,6 +4,7 @@ mod clock;
 mod mix;
 mod output;
 mod resample;
+mod stretch;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -13,6 +14,7 @@ pub use output::NullOutput;
 pub use output::AudioOutputConfig;
 pub(crate) use output::{OutputShared, open_output, push_frames};
 pub(crate) use resample::Resampler;
+pub use stretch::TimeStretcher;
 
 /// Whether this build can play sound on a real device (the `audio-output` feature).
 pub fn output_available() -> bool {

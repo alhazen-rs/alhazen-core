@@ -8,7 +8,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError};
 
 use super::pipeline::{AudioPipe, Msg, Reopen};
 use super::Shared;
-use crate::audio::{OutputShared, Resampler, push_frames, remix};
+use crate::audio::{OutputShared, Resampler, TimeStretcher, push_frames, remix};
 use crate::decode::{AudioBuffer, AudioDecoder};
 use crate::demux::StreamInfo;
 
@@ -52,6 +52,8 @@ pub(super) struct AudioLoop {
     producer: rtrb::Producer<f32>,
     out: Arc<OutputShared>,
     resampler: Option<Resampler>,
+    stretcher: Option<TimeStretcher>,
+    stretcher_speed: f64,
     generation: u64,
     /// Where the next sample belongs on the timeline (the seek target right after a seek).
     /// Buffers are trimmed or preceded by silence to match it, so gaps, overlaps and skipped
@@ -73,6 +75,8 @@ impl AudioLoop {
             producer: pipe.producer,
             out: pipe.out,
             resampler: None,
+            stretcher: None,
+            stretcher_speed: 1.0,
             generation: 0,
             expected: Duration::ZERO,
             last_pts: None,
@@ -110,6 +114,9 @@ impl AudioLoop {
                     self.decoder.flush();
                     if let Some(r) = &mut self.resampler {
                         r.reset();
+                    }
+                    if let Some(t) = &mut self.stretcher {
+                        t.reset();
                     }
                     self.generation = generation;
                     self.expected = target;
@@ -225,6 +232,22 @@ impl AudioLoop {
             }
         }
         let samples = self.resampler.as_mut().unwrap().process(&samples);
+        let speed = f64::from_bits(shared.speed.load(Ordering::SeqCst));
+        if self.stretcher.is_some() || speed != 1.0 {
+            // Once engaged, the stretcher stays in the pipe (at 1.0 it is transparent);
+            // bypassing it again would drop the audio it still holds.
+            if self.stretcher.is_none() {
+                self.stretcher = Some(TimeStretcher::new(ch, self.out.rate, speed));
+            }
+            let cur = self.stretcher_speed;
+            let t = self.stretcher.as_mut().unwrap();
+            if (cur - speed).abs() > 1e-9 {
+                t.set_speed(speed);
+                self.stretcher_speed = speed;
+            }
+            let stretched = t.process(&samples);
+            return self.push(shared, &stretched);
+        }
         self.push(shared, &samples)
     }
 
@@ -274,7 +297,19 @@ impl AudioLoop {
         // The resampler still holds the last few milliseconds.
         if let Some(r) = self.resampler.as_mut() {
             let tail = r.flush();
-            if !self.push(shared, &tail) {
+            if let Some(t) = self.stretcher.as_mut() {
+                let tail = t.process(&tail);
+                if !self.push(shared, &tail) {
+                    return false;
+                }
+            } else if !self.push(shared, &tail) {
+                return false;
+            }
+        }
+        // And the stretcher holds its final window.
+        if let Some(t) = self.stretcher.as_mut() {
+            let tail = t.flush();
+            if !tail.is_empty() && !self.push(shared, &tail) {
                 return false;
             }
         }

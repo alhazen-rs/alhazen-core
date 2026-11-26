@@ -9,11 +9,14 @@ pub trait Clock: Send + Sync {
     fn resume(&self);
     fn set(&self, t: Duration);
     fn is_paused(&self) -> bool;
+    /// Playback speed multiplier; clocks that cannot scale ignore it.
+    fn set_speed(&self, _speed: f64) {}
 }
 
 struct State {
     base: Duration,
     started: Option<Instant>,
+    speed: f64,
 }
 
 /// Wall-clock based clock. Starts paused at zero.
@@ -23,7 +26,7 @@ pub struct SystemClock {
 
 impl SystemClock {
     pub fn new() -> Self {
-        Self { state: Mutex::new(State { base: Duration::ZERO, started: None }) }
+        Self { state: Mutex::new(State { base: Duration::ZERO, started: None, speed: 1.0 }) }
     }
 }
 
@@ -36,12 +39,13 @@ impl Default for SystemClock {
 impl Clock for SystemClock {
     fn now(&self) -> Duration {
         let s = self.state.lock().unwrap();
-        s.base + s.started.map(|t| t.elapsed()).unwrap_or_default()
+        s.base + s.started.map(|t| t.elapsed().mul_f64(s.speed)).unwrap_or_default()
     }
     fn pause(&self) {
         let mut s = self.state.lock().unwrap();
         if let Some(t) = s.started.take() {
-            s.base += t.elapsed();
+            let speed = s.speed;
+            s.base += t.elapsed().mul_f64(speed);
         }
     }
     fn resume(&self) {
@@ -59,6 +63,15 @@ impl Clock for SystemClock {
     }
     fn is_paused(&self) -> bool {
         self.state.lock().unwrap().started.is_none()
+    }
+    fn set_speed(&self, speed: f64) {
+        let mut s = self.state.lock().unwrap();
+        if let Some(t) = s.started.take() {
+            let old = s.speed;
+            s.base += t.elapsed().mul_f64(old);
+            s.started = Some(Instant::now());
+        }
+        s.speed = speed;
     }
 }
 
