@@ -32,6 +32,9 @@ fn err(what: &'static str) -> impl Fn(windows::core::Error) -> Error {
     move |e| Error::Decode(format!("video processor: {what}: {e}"))
 }
 
+/// Staging textures per processor (`video.rs` delays readback by `RING - 1` pictures).
+pub(crate) const RING: usize = 6;
+
 /// A video processor for one input size, output size and bit depth (recreated when they change).
 pub(crate) struct Processor {
     context: ID3D11DeviceContext,
@@ -94,7 +97,6 @@ impl Processor {
             // 読み戻しをパイプライン化するためのステージングのリング。
             // Map が古いスロットにだけかかるようにして、GPU の仕事が終わってから
             // 読む（毎フレームの全体同期を避ける。240fps 級で律速だった）。
-            const RING: usize = 6;
             let mut staging = Vec::with_capacity(RING);
             for _ in 0..RING {
                 staging.push(texture(D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ.0 as u32)?);
@@ -206,7 +208,11 @@ impl Processor {
         // SAFETY: the staging texture is mapped only between Map and Unmap.
         unsafe {
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.context.Map(&self.staging[slot], 0, D3D11_MAP_READ, 0, Some(&mut mapped)).map_err(err("map"))?;
+            if let Err(e) = self.context.Map(&self.staging[slot], 0, D3D11_MAP_READ, 0, Some(&mut mapped)) {
+                // A failed read must not shrink the ring: the slot is free again either way.
+                self.free_slots.push(slot);
+                return Err(err("map")(e));
+            }
             let row = self.dst.0 as usize * 4;
             let (base, pitch) = (mapped.pData as *const u8, mapped.RowPitch as usize);
             let out = self.pool.fill(row * self.dst.1 as usize, |dst| {
@@ -218,6 +224,13 @@ impl Processor {
             self.free_slots.push(slot);
             Ok(out)
         }
+    }
+
+    /// Frees every slot without reading it back (its picture is no longer wanted). No wait is
+    /// needed: the device context orders a later copy into the slot after the earlier one.
+    pub fn free_all(&mut self) {
+        self.free_slots.clear();
+        self.free_slots.extend(0..RING);
     }
 
     /// 従来どおりの同期変換（初フレームの PSNR 照合用）。

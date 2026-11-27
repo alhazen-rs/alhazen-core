@@ -9,9 +9,9 @@ use windows::core::{GUID, Interface};
 
 use crate::hw::select::HwCodec;
 use super::mft::{self, Output, err};
-use super::processor::Processor;
+use super::processor::{Processor, RING};
 use super::{codecs, device, runtime};
-use crate::color::{ColorInfo, StreamColor};
+use crate::color::{ColorInfo, StreamColor, Transfer};
 use crate::scale::fit_within;
 use crate::decode::{ColorMatrix, DecodedFrame, PixelLayout, VideoDecoder, YuvFrame, chroma_size};
 use crate::demux::{Packet, StreamInfo};
@@ -67,11 +67,23 @@ struct Conversion {
     /// GPU 変換を提出済みで未回収のもの（pts・スロット・出力サイズの順）。
     /// 読み戻しの同期をパイプライン化するためのリング。（240fps では毎フレームの
     /// 全体同期が律速だった。）
-    pending: VecDeque<(Duration, usize, (u32, u32))>,
+    pending: VecDeque<Pending>,
 }
 
-/// 読み戻しの遅延量（= ステージングのリング数。processor.rs の RING と合わせる）。
-const PENDING_RING: usize = 6;
+/// A converted picture waiting in a staging slot, with what its frame needs (its own transfer:
+/// not the one of whichever sample happens to push it out of the ring).
+struct Pending {
+    pts: Duration,
+    slot: usize,
+    size: (u32, u32),
+    transfer: Transfer,
+}
+
+impl Pending {
+    fn into_frame(self, bgra: std::sync::Arc<[u8]>) -> DecodedFrame {
+        DecodedFrame::Bgra { width: self.size.0, height: self.size.1, bgra, transfer: self.transfer, pts: self.pts }
+    }
+}
 
 impl Conversion {
     /// 1 サンプル分の変換を進める。GPU 経路では読み戻しを遅延させるため、
@@ -94,20 +106,22 @@ impl Conversion {
 
     /// 遅延分を 1 枚強制回収する（EOF や入力枯渇時のドレイン用）。
     fn drain_pending(&mut self) -> Option<DecodedFrame> {
-        let (pts, slot, size) = self.pending.pop_front()?;
+        let pending = self.pending.pop_front()?;
         let processor = self.processor.as_mut()?;
-        match processor.reap(slot) {
-            Ok(bgra) => Some(DecodedFrame::Bgra {
-                width: size.0,
-                height: size.1,
-                bgra,
-                transfer: crate::color::Transfer::Sdr,
-                pts,
-            }),
+        match processor.reap(pending.slot) {
+            Ok(bgra) => Some(pending.into_frame(bgra)),
             Err(e) => {
                 log::warn!("Media Foundation: reaping a converted picture failed ({e})");
                 None
             }
+        }
+    }
+
+    /// Drops the delayed pictures without reading them back (after a flush or a size change).
+    fn discard_pending(&mut self) {
+        self.pending.clear();
+        if let Some(p) = self.processor.as_mut() {
+            p.free_all();
         }
     }
 
@@ -154,32 +168,23 @@ impl Conversion {
             // 出力サイズの変更（ウィンドウのリサイズなど）。遅延分は古いサイズの
             // フレームなので回収して捨て、プロセッサを作り直す。ウィンドウの
             // リサイズは連発されるが、回収は GPU の完了を待たずに済む。
-            while let Some((_, slot, _)) = self.pending.pop_front() {
-                if let Some(processor) = self.processor.as_mut() {
-                    let _ = processor.reap(slot);
-                }
-            }
+            // (The processor is replaced, so its slots need no reading back, which would wait.)
+            self.pending.clear();
             self.processor = Some(Processor::new(&gpu.device, src, dst)?);
         }
         let processor = self.processor.as_mut().expect("created above");
         // リングが一杯なら先に最古を回収する（提出から一周分の時間が経っているので
         // 完了待ちは実質発生しない）。
         let mut reaped = None;
-        if self.pending.len() >= PENDING_RING - 1 || !processor.has_free_slot() {
-            if let Some((old_pts, slot, size)) = self.pending.pop_front() {
-                let bgra = processor.reap(slot)?;
-                reaped = Some((old_pts, bgra, size));
-            }
+        if (self.pending.len() >= RING - 1 || !processor.has_free_slot())
+            && let Some(pending) = self.pending.pop_front()
+        {
+            let bgra = processor.reap(pending.slot)?;
+            reaped = Some(pending.into_frame(bgra));
         }
         let slot = processor.submit(sample, &color)?;
-        self.pending.push_back((pts, slot, dst));
-        Ok(reaped.map(|(old_pts, bgra, size)| DecodedFrame::Bgra {
-            width: size.0,
-            height: size.1,
-            bgra,
-            transfer: color.transfer,
-            pts: old_pts,
-        }))
+        self.pending.push_back(Pending { pts, slot, size: dst, transfer: color.transfer });
+        Ok(reaped)
     }
 }
 
@@ -349,11 +354,7 @@ impl VideoDecoder for MfVideoDecoder {
         self.eof_sent = false;
         self.ready.clear();
         // 遅延分は内容が不要なので、スロットを空きに戻すためだけに回収する。
-        while let Some((_, slot, _)) = self.conversion.pending.pop_front() {
-            if let Some(p) = self.conversion.processor.as_mut() {
-                let _ = p.reap(slot);
-            }
-        }
+        self.conversion.discard_pending();
         if let Some(s) = &self.state {
             mft::flush(&s.mft);
             let _ = mft::begin_streaming(&s.mft);
