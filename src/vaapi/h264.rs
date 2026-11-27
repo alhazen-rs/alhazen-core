@@ -1136,6 +1136,9 @@ impl Dpb {
     /// Pictures to show now, in order (C.4.5.3): while more are waiting than may be reordered
     /// (or the buffer's full), the lowest POC goes. `all` empties it (end of stream, IDR).
     pub fn bump(&mut self, reorder: usize, capacity: usize, all: bool) -> Vec<Picture> {
+        // What's neither referenced nor waiting goes first (C.4.4): counted as held, a picture an
+        // MMCO just let go of made the buffer look full and pushed a B-picture out too early.
+        self.prune();
         let mut out = Vec::new();
         loop {
             let waiting = self.pictures.iter().filter(|p| p.output_needed).count();
@@ -1366,5 +1369,34 @@ mod tests {
         }
         shown.extend(dpb.bump(1, 4, true).iter().map(|p| p.poc()));
         assert_eq!(shown, vec![0, 4, 8, 12, 16]);
+    }
+
+    #[test]
+    fn a_released_reference_does_not_count_as_held() {
+        // A B-pyramid where the B-picture's MMCO 1 has just let go of an already shown P (POC 8):
+        // 4 frames held, 2 waiting, nothing is due. B18 and B20 come next and go out before 22.
+        let pic = |poc: i32, reference: Reference, output_needed: bool| Picture {
+            surface: poc as u32,
+            frame_num: 0,
+            top_poc: poc,
+            bottom_poc: poc,
+            reference,
+            long_term_frame_idx: 0,
+            output_needed,
+            non_existing: false,
+            pts: Duration::ZERO,
+        };
+        let mut dpb = Dpb {
+            pictures: vec![
+                pic(8, Reference::None, false),
+                pic(16, Reference::Short, false),
+                pic(12, Reference::Short, false),
+                pic(28, Reference::Short, true),
+                pic(22, Reference::Short, true),
+            ],
+            ..Default::default()
+        };
+        assert!(dpb.bump(3, 4, false).is_empty(), "B22 must wait for B18 and B20");
+        assert_eq!(dpb.pictures.len(), 4, "the released picture is gone");
     }
 }
