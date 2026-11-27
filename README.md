@@ -220,21 +220,22 @@ if let Some(m) = player.metadata() {
 
 ### Video
 
-| Codec | Pure Rust (all platforms) | Windows (Media Foundation) | macOS (VideoToolbox) | Linux, NVIDIA (NVDEC) | User's ffmpeg |
-|---|---|---|---|---|---|
-| AV1 | ✅ rav1d | ✅ GPU¹ | ✅ GPU¹ ³ | ✅ GPU¹ | ✅ |
-| VP9 | ✅ vp9-mt, multi-threaded | ✅ GPU¹ | ✅ GPU¹ ³ | ✅ GPU¹ | ✅ |
-| VP8 | ✅ oximedia-codec | | | ✅ GPU¹ | ✅ |
-| Apple ProRes (422, 4444, interlaced) | ✅ oxideav-prores | | ✅ GPU¹ ³ | | ✅ |
-| H.264 / AVC | | ✅ GPU or software | ✅ GPU | ✅ GPU | ✅ |
-| H.265 / HEVC | | ✅ GPU² | ✅ GPU | ✅ GPU | ✅ |
-| MJPEG, MPEG-4 Part 2, others | | | | | ✅ |
+| Codec | Pure Rust (all platforms) | Windows (Media Foundation) | macOS (VideoToolbox) | Linux, NVIDIA (NVDEC) | Linux, AMD/Intel (VA-API) | User's ffmpeg |
+|---|---|---|---|---|---|---|
+| AV1 | ✅ rav1d | ✅ GPU¹ | ✅ GPU¹ ³ | ✅ GPU¹ | | ✅ |
+| VP9 | ✅ vp9-mt, multi-threaded | ✅ GPU¹ | ✅ GPU¹ ³ | ✅ GPU¹ | | ✅ |
+| VP8 | ✅ oximedia-codec | | | ✅ GPU¹ | | ✅ |
+| Apple ProRes (422, 4444, interlaced) | ✅ oxideav-prores | | ✅ GPU¹ ³ | | | ✅ |
+| H.264 / AVC | | ✅ GPU or software | ✅ GPU | ✅ GPU | ✅ GPU⁴ | ✅ |
+| H.265 / HEVC | | ✅ GPU² | ✅ GPU | ✅ GPU | | ✅ |
+| MJPEG, MPEG-4 Part 2, others | | | | | | ✅ |
 
 ¹ Used when the GPU decodes it and `prefer_hardware` is on (the default); otherwise the pure-Rust
 decoder is used.
 ² Needs the HEVC Video Extensions from the Microsoft Store (preinstalled on many PCs).
 ³ On Macs that decode it in hardware (AV1: M3 and newer; ProRes: M1 Pro/Max/Ultra and newer);
 elsewhere the pure-Rust decoder is used.
+⁴ 8-bit 4:2:0, progressive or MBAFF; field pictures and FMO go to the next backend.
 
 8- and 10-bit video is supported. Frames are delivered as 8-bit BGRA, converted with the
 stream's BT.601/BT.709 matrix and range.
@@ -354,8 +355,9 @@ point. Seeking passes through `Buffering`.
 - **Linux with `audio-output`:** ALSA headers (`libasound2-dev` / `alsa-lib`).
 - **Windows:** Windows 10 or 11. Media Foundation is missing from "N" editions until the
   Media Feature Pack is installed; the engine then falls back to the other backends.
-- **Linux GPU decoding:** an NVIDIA GPU and its proprietary driver; nothing else at build or run
-  time. Without it, playback uses the other backends. (Intel/AMD through VA-API is planned.) The
+- **Linux GPU decoding:** an NVIDIA GPU and its proprietary driver (NVDEC), or an AMD or Intel GPU
+  with its VA-API driver (libva, loaded at runtime); nothing else at build time. Without them,
+  playback uses the other backends. The
   GPU is only woken up once a video needs it, so audio-only playback leaves a laptop's discrete
   GPU asleep.
 - **ffmpeg** (optional, at runtime): 4.0+. CI tests 6–9 on Linux, Windows and macOS.
