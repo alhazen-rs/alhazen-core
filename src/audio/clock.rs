@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::output::{OutputShared, now_ns};
+use super::output::{CONTENT_ONE, OutputShared, now_ns};
 use crate::clock::{Clock, SystemClock};
 
 struct Base {
@@ -13,15 +13,15 @@ struct Base {
     epoch: u64,
     /// Running on wall time (audio failed or ran out).
     wall: bool,
-    /// Playback speed: frames in the ring are time-stretched, so each covers
-    /// `speed / rate` seconds of content instead of `1 / rate`.
-    speed: f64,
 }
 
-/// Time = base + frames heard since `set` / rate, interpolated through the device buffer that is
+/// Time = base + content heard since `set` / rate, interpolated through the device buffer that is
 /// playing (from the callback's anchor), so it moves smoothly rather than in buffer-sized steps.
 /// Freezes while paused and during underruns; reports from callbacks that started before a
-/// seek are ignored. When audio can no longer advance time — the device
+/// seek are ignored. Content, not frames: at a playback speed other than 1 each frame carries the
+/// content it was time-stretched from, counted at the speed it was made at (see `Anchor`), so
+/// a speed change keeps audio and video in sync even for the audio queued before it.
+/// When audio can no longer advance time — the device
 /// failed, or the audio stream ended before the video — it continues on a wall clock from where
 /// audio stopped. A seek returns it to audio time unless the device failed.
 pub struct AudioClock {
@@ -35,7 +35,7 @@ impl AudioClock {
         let epoch = out.epoch();
         Self {
             out,
-            base: Mutex::new(Base { time: Duration::ZERO, epoch, wall: false, speed: 1.0 }),
+            base: Mutex::new(Base { time: Duration::ZERO, epoch, wall: false }),
             fallback: SystemClock::new(),
         }
     }
@@ -45,14 +45,15 @@ impl AudioClock {
         if a.epoch != base.epoch {
             return base.time;
         }
-        let rate = self.out.rate.max(1) as u64;
+        let rate = self.out.rate.max(1) as u128;
         let heard = if a.len == 0 {
-            a.frames_before
+            a.content_before as u128
         } else {
             let into = now_ns().saturating_sub(a.at_ns);
-            a.frames_before + (into as u128 * rate as u128 / 1_000_000_000).min(a.len as u128) as u64
+            let frames = (into as u128 * rate / 1_000_000_000).min(a.len as u128);
+            a.content_before as u128 + a.content_len as u128 * frames / a.len as u128
         };
-        base.time + Duration::from_nanos((heard as f64 * base.speed * 1_000_000_000.0 / rate as f64) as u64)
+        base.time + Duration::from_nanos((heard * 1_000_000_000 / (rate * CONTENT_ONE as u128)) as u64)
     }
 
     fn audio_gone(&self) -> bool {
@@ -100,11 +101,9 @@ impl Clock for AudioClock {
     fn is_paused(&self) -> bool {
         self.out.paused.load(Ordering::Relaxed)
     }
+    /// Audio time follows the speed by itself (the audio thread tags the frames it stretches);
+    /// only the wall clock used when audio is gone needs it.
     fn set_speed(&self, speed: f64) {
-        let now = self.now();
-        self.set(now);
-        let mut base = self.base.lock().unwrap();
-        base.speed = speed;
         self.fallback.set_speed(speed);
     }
 }
@@ -185,7 +184,7 @@ mod tests {
         let before_seek = out.shared.epoch();
         clock.set(Duration::from_secs(5));
         // That callback finishes now and reports 100 ms of (pre-seek) audio.
-        out.shared.publish(Anchor { epoch: before_seek, frames_before: 100, len: 0, at_ns: 0 });
+        out.shared.publish(Anchor { epoch: before_seek, content_before: 100 * CONTENT_ONE, len: 0, content_len: 0, at_ns: 0 });
         assert_eq!(clock.now(), Duration::from_secs(5));
     }
 

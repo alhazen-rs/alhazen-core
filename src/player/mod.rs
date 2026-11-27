@@ -653,13 +653,12 @@ impl Player {
         s.request_pause();
     }
 
-    /// Frame-accurate seek. Takes effect immediately for `position()`; frames follow shortly.
-    /// Playback speed multiplier (0.25–4.0). Audio keeps its pitch (WSOLA
-    /// time-stretching); video follows the audio-driven clock, so sync holds.
-    /// Position reporting can be off by a fraction of a second right after the
-    /// change (audio already queued plays out); the next seek re-bases exactly.
+    /// Sets the playback speed, clamped to 0.25–4.0 (1.0 is normal). Audio keeps its pitch
+    /// (WSOLA time-stretching); video follows the audio clock, so they stay in sync, also
+    /// through the change. The change is heard once the audio already queued (up to ~200 ms)
+    /// has played.
     pub fn set_speed(&self, speed: f64) {
-        let speed = speed.clamp(0.25, 4.0);
+        let speed = if speed.is_finite() { speed.clamp(0.25, 4.0) } else { 1.0 };
         self.shared.speed.store(speed.to_bits(), Ordering::SeqCst);
         self.shared.clock.set_speed(speed);
     }
@@ -669,6 +668,7 @@ impl Player {
         f64::from_bits(self.shared.speed.load(Ordering::SeqCst))
     }
 
+    /// Frame-accurate seek. Takes effect immediately for `position()`; frames follow shortly.
     pub fn seek(&self, to: Duration) {
         let s = &self.shared;
         if s.state().is_error() {

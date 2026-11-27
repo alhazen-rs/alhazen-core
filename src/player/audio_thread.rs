@@ -52,8 +52,13 @@ pub(super) struct AudioLoop {
     producer: rtrb::Producer<f32>,
     out: Arc<OutputShared>,
     resampler: Option<Resampler>,
+    /// Time-stretches for playback speeds other than 1. Created on the first such speed and kept
+    /// from then on (at 1.0 it is transparent): dropping it would drop the audio it holds.
     stretcher: Option<TimeStretcher>,
+    /// The speed the stretcher runs at (1.0 without one).
     stretcher_speed: f64,
+    /// Scratch for the stretcher's output (reused: no allocation per buffer).
+    stretched: Vec<f32>,
     generation: u64,
     /// Where the next sample belongs on the timeline (the seek target right after a seek).
     /// Buffers are trimmed or preceded by silence to match it, so gaps, overlaps and skipped
@@ -77,6 +82,7 @@ impl AudioLoop {
             resampler: None,
             stretcher: None,
             stretcher_speed: 1.0,
+            stretched: Vec::new(),
             generation: 0,
             expected: Duration::ZERO,
             last_pts: None,
@@ -219,7 +225,7 @@ impl AudioLoop {
             // The stream rate changed (or first buffer): finish the old resampler's tail first.
             if let Some(mut old) = self.resampler.take() {
                 let tail = old.flush();
-                if !self.push(shared, &tail) {
+                if !self.push_stretched(shared, &tail) {
                     return false;
                 }
             }
@@ -233,22 +239,27 @@ impl AudioLoop {
         }
         let samples = self.resampler.as_mut().unwrap().process(&samples);
         let speed = f64::from_bits(shared.speed.load(Ordering::SeqCst));
-        if self.stretcher.is_some() || speed != 1.0 {
-            // Once engaged, the stretcher stays in the pipe (at 1.0 it is transparent);
-            // bypassing it again would drop the audio it still holds.
-            if self.stretcher.is_none() {
-                self.stretcher = Some(TimeStretcher::new(ch, self.out.rate, speed));
-            }
-            let cur = self.stretcher_speed;
-            let t = self.stretcher.as_mut().unwrap();
-            if (cur - speed).abs() > 1e-9 {
-                t.set_speed(speed);
-                self.stretcher_speed = speed;
-            }
-            let stretched = t.process(&samples);
-            return self.push(shared, &stretched);
+        if speed != self.stretcher_speed {
+            let t = self.stretcher.get_or_insert_with(|| TimeStretcher::new(ch, self.out.rate, 1.0));
+            t.set_speed(speed);
+            self.stretcher_speed = speed;
+            // Tell the clock from which ring frame on the content runs at the new speed.
+            self.out.note_speed(self.pushed + t.frames_before_speed_change() as u64, speed);
         }
-        self.push(shared, &samples)
+        self.push_stretched(shared, &samples)
+    }
+
+    /// Pushes resampled samples through the stretcher, if there is one.
+    fn push_stretched(&mut self, shared: &Shared, samples: &[f32]) -> bool {
+        let Some(t) = self.stretcher.as_mut() else {
+            return self.push(shared, samples);
+        };
+        let mut out = std::mem::take(&mut self.stretched);
+        out.clear();
+        t.process_into(samples, &mut out);
+        let ok = self.push(shared, &out);
+        self.stretched = out;
+        ok
     }
 
     /// Pushes resampled samples into the ring. Returns `false` on shutdown or device loss.
@@ -297,16 +308,11 @@ impl AudioLoop {
         // The resampler still holds the last few milliseconds.
         if let Some(r) = self.resampler.as_mut() {
             let tail = r.flush();
-            if let Some(t) = self.stretcher.as_mut() {
-                let tail = t.process(&tail);
-                if !self.push(shared, &tail) {
-                    return false;
-                }
-            } else if !self.push(shared, &tail) {
+            if !self.push_stretched(shared, &tail) {
                 return false;
             }
         }
-        // And the stretcher holds its final window.
+        // And the stretcher its last window.
         if let Some(t) = self.stretcher.as_mut() {
             let tail = t.flush();
             if !tail.is_empty() && !self.push(shared, &tail) {

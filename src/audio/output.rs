@@ -23,14 +23,23 @@ pub(crate) fn now_ns() -> u64 {
 pub(crate) struct Anchor {
     /// Seek epoch the callback rendered in; anchors from an older epoch are ignored.
     pub epoch: u64,
-    /// Frames played in this epoch before this buffer.
-    pub frames_before: u64,
-    /// Frames in this buffer, heard progressively from `at_ns` on. 0 = count `frames_before`
+    /// Content played in this epoch before this buffer, in `CONTENT_ONE` units per frame of
+    /// content (a frame time-stretched at speed 2 carries two frames of content).
+    pub content_before: u64,
+    /// Frames in this buffer, heard progressively from `at_ns` on. 0 = count `content_before`
     /// as already heard (no interpolation; used by `NullOutput`).
     pub len: u64,
+    /// Content in this buffer, same units as `content_before`.
+    pub content_len: u64,
     /// `now_ns()` when the buffer's first frame reaches the speaker.
     pub at_ns: u64,
 }
+
+/// Fixed-point scale of content counts: one frame of content at speed 1.
+pub(crate) const CONTENT_ONE: u64 = 1 << 16;
+
+/// Pending speed changes the ring can hold (the producer only records one per change).
+const SPEED_CHANGES: usize = 64;
 
 /// State shared between the producer side (audio decode thread), the clock and the callback.
 #[derive(Debug)]
@@ -48,7 +57,7 @@ pub(crate) struct OutputShared {
     epoch: AtomicU64,
     /// Seqlock-protected latest `Anchor` (single writer: the callback).
     anchor_seq: AtomicU64,
-    anchor: [AtomicU64; 4],
+    anchor: [AtomicU64; 5],
     /// The device reported a fatal error; audio is gone.
     pub failed: AtomicBool,
     /// Audio played everything it had (end of stream); time must go on without it.
@@ -57,10 +66,14 @@ pub(crate) struct OutputShared {
     /// Diagnostics: render calls, and the frames readable in the ring at the last one.
     pub renders: AtomicU64,
     pub ring_frames: AtomicU64,
+    /// Speed changes, as (sequence number of the first ring frame stretched at the new speed,
+    /// speed), oldest first. The callback applies each one when it reaches that frame, so the
+    /// clock counts every frame at the speed it was made at, also the ones queued before.
+    speed_changes: Mutex<Producer<(u64, f64)>>,
 }
 
 impl OutputShared {
-    fn new(rate: u32, channels: u16, volume: Arc<Volume>) -> Self {
+    fn new(rate: u32, channels: u16, volume: Arc<Volume>, speed_changes: Producer<(u64, f64)>) -> Self {
         Self {
             rate,
             channels,
@@ -75,6 +88,14 @@ impl OutputShared {
             exhausted: AtomicBool::new(false),
             renders: AtomicU64::new(0),
             ring_frames: AtomicU64::new(0),
+            speed_changes: Mutex::new(speed_changes),
+        }
+    }
+
+    /// Ring frames from sequence number `at` on were stretched at `speed` (producer side).
+    pub fn note_speed(&self, at: u64, speed: f64) {
+        if self.speed_changes.lock().unwrap().push((at, speed)).is_err() {
+            log::warn!("audio: too many speed changes queued; the clock may be slightly off until the next seek");
         }
     }
 
@@ -92,7 +113,7 @@ impl OutputShared {
         let seq = self.anchor_seq.load(Ordering::Relaxed);
         self.anchor_seq.store(seq.wrapping_add(1), Ordering::Relaxed); // odd: writing
         fence(Ordering::Release);
-        for (slot, v) in self.anchor.iter().zip([a.epoch, a.frames_before, a.len, a.at_ns]) {
+        for (slot, v) in self.anchor.iter().zip([a.epoch, a.content_before, a.len, a.content_len, a.at_ns]) {
             slot.store(v, Ordering::Relaxed);
         }
         self.anchor_seq.store(seq.wrapping_add(2), Ordering::Release); // even: stable
@@ -106,10 +127,10 @@ impl OutputShared {
                 std::hint::spin_loop();
                 continue;
             }
-            let v: [u64; 4] = std::array::from_fn(|i| self.anchor[i].load(Ordering::Relaxed));
+            let v: [u64; 5] = std::array::from_fn(|i| self.anchor[i].load(Ordering::Relaxed));
             fence(Ordering::Acquire);
             if self.anchor_seq.load(Ordering::Relaxed) == s1 {
-                return Anchor { epoch: v[0], frames_before: v[1], len: v[2], at_ns: v[3] };
+                return Anchor { epoch: v[0], content_before: v[1], len: v[2], content_len: v[3], at_ns: v[4] };
             }
         }
     }
@@ -121,12 +142,19 @@ pub(crate) struct Renderer {
     shared: Arc<OutputShared>,
     /// Frames taken out of the ring so far (played or discarded).
     consumed: u64,
-    /// Epoch of the frames below, and frames played in it so far.
+    /// Epoch of the content below, and content played in it so far (`CONTENT_ONE` units).
     epoch: u64,
-    epoch_frames: u64,
+    epoch_content: u64,
+    /// Speed changes from the producer, and the speed of the frame at `consumed`.
+    speed_changes: Consumer<(u64, f64)>,
+    speed: f64,
 }
 
 impl Renderer {
+    fn new(consumer: Consumer<f32>, shared: Arc<OutputShared>, speed_changes: Consumer<(u64, f64)>) -> Self {
+        Self { consumer, shared, consumed: 0, epoch: 0, epoch_content: 0, speed_changes, speed: 1.0 }
+    }
+
     /// Fills `out` and reports it as heard immediately (no interpolation; `NullOutput`).
     pub fn render(&mut self, out: &mut [f32]) {
         self.render_at(out, None);
@@ -142,7 +170,7 @@ impl Renderer {
         let epoch = self.shared.epoch();
         if epoch != self.epoch {
             self.epoch = epoch;
-            self.epoch_frames = 0;
+            self.epoch_content = 0;
         }
         // Drop samples that a seek made stale, even while paused.
         let discard = self.shared.discard_until.load(Ordering::Acquire);
@@ -150,7 +178,7 @@ impl Renderer {
             let frames = ((discard - self.consumed) as usize).min(self.consumer.slots() / ch);
             if let Ok(chunk) = self.consumer.read_chunk(frames * ch) {
                 chunk.commit_all();
-                self.consumed += frames as u64;
+                self.take(frames as u64);
             }
         }
         if self.shared.paused.load(Ordering::Relaxed) || self.consumed < discard {
@@ -171,16 +199,46 @@ impl Renderer {
             out[..n].iter_mut().for_each(|s| *s *= gain);
         }
         out[n..].fill(0.0);
-        self.consumed += frames as u64;
+        let content = self.take(frames as u64);
         self.shared.frames_played.fetch_add(frames as u64, Ordering::Release);
         if frames > 0 {
-            let before = self.epoch_frames;
-            self.epoch_frames += frames as u64;
+            let before = self.epoch_content;
+            self.epoch_content += content;
             self.shared.publish(match delay {
-                Some(d) => Anchor { epoch, frames_before: before, len: frames as u64, at_ns: now_ns() + d.as_nanos() as u64 },
-                None => Anchor { epoch, frames_before: self.epoch_frames, len: 0, at_ns: now_ns() },
+                Some(d) => Anchor {
+                    epoch,
+                    content_before: before,
+                    len: frames as u64,
+                    content_len: content,
+                    at_ns: now_ns() + d.as_nanos() as u64,
+                },
+                None => Anchor { epoch, content_before: self.epoch_content, len: 0, content_len: 0, at_ns: now_ns() },
             });
         }
+    }
+
+    /// Takes the next `frames` ring frames as consumed and returns the content they carry,
+    /// applying the speed changes they cross. No allocation, no locking (real-time safe).
+    fn take(&mut self, frames: u64) -> u64 {
+        let end = self.consumed + frames;
+        let mut content = 0.0;
+        while self.consumed < end {
+            match self.speed_changes.peek().ok().copied() {
+                Some((at, speed)) if at <= self.consumed => {
+                    self.speed = speed;
+                    let _ = self.speed_changes.pop();
+                }
+                Some((at, _)) if at < end => {
+                    content += (at - self.consumed) as f64 * self.speed;
+                    self.consumed = at;
+                }
+                _ => {
+                    content += (end - self.consumed) as f64 * self.speed;
+                    self.consumed = end;
+                }
+            }
+        }
+        (content * CONTENT_ONE as f64).round() as u64
     }
 }
 
@@ -221,10 +279,11 @@ pub(crate) struct OpenedOutput {
 }
 
 fn ring(rate: u32, channels: u16, volume: Arc<Volume>) -> (Arc<OutputShared>, Producer<f32>, Renderer) {
-    let shared = Arc::new(OutputShared::new(rate, channels, volume));
+    let (speed_tx, speed_rx) = RingBuffer::new(SPEED_CHANGES);
+    let shared = Arc::new(OutputShared::new(rate, channels, volume, speed_tx));
     let frames = (rate as u128 * BUFFER.as_millis() / 1000) as usize;
     let (producer, consumer) = RingBuffer::new(frames.max(1) * channels.max(1) as usize);
-    let renderer = Renderer { consumer, shared: shared.clone(), consumed: 0, epoch: 0, epoch_frames: 0 };
+    let renderer = Renderer::new(consumer, shared.clone(), speed_rx);
     (shared, producer, renderer)
 }
 
@@ -517,6 +576,20 @@ mod tests {
     }
 
     #[test]
+    fn frames_count_at_the_speed_they_were_stretched_at() {
+        let (null, mut out, _) = attached();
+        out.shared.paused.store(false, Ordering::Relaxed);
+        // 3 frames made at 1x are already queued when the speed goes to 4x at frame 3.
+        push_frames(&mut out.producer, &out.shared, &[0.1; 6], || true);
+        out.shared.note_speed(3, 4.0);
+        push_frames(&mut out.producer, &out.shared, &[0.2; 4], || true);
+        null.pull(2); // frames 0..2: 2 frames of content
+        assert_eq!(out.shared.anchor().content_before, 2 * CONTENT_ONE);
+        null.pull(3); // frame 2 at 1x, then frames 3..5 at 4x
+        assert_eq!(out.shared.anchor().content_before, (2 + 1 + 2 * 4) * CONTENT_ONE);
+    }
+
+    #[test]
     fn push_gives_up_when_asked_while_full() {
         let (_null, mut out, _) = attached();
         let capacity = out.producer.slots();
@@ -558,7 +631,7 @@ mod tests {
         out.shared.paused.store(false, Ordering::Relaxed);
         push_frames(&mut out.producer, &out.shared, &[0.5; 400], || true);
         let mut renderer =
-            Renderer { consumer: RingBuffer::new(8).1, shared: out.shared.clone(), consumed: 0, epoch: 0, epoch_frames: 0 };
+            Renderer::new(RingBuffer::new(8).1, out.shared.clone(), RingBuffer::new(1).1);
         // Sized for half a second at 1 kHz stereo, like the device setup does.
         let mut conv = Converter::new(1000, 2);
         let before = conv.capacity();
