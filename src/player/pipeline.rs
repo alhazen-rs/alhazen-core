@@ -800,6 +800,7 @@ mod tests {
             ended_generation: AtomicU64::new(u64::MAX),
             commands: crossbeam_channel::unbounded().0,
             seekable: true,
+            speed: AtomicU64::new(1.0f64.to_bits()),
             video_backend: Mutex::new(None),
             max_output_size: AtomicU64::new(0),
             diag: Default::default(),

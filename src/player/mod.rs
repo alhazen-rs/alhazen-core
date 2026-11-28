@@ -203,6 +203,8 @@ pub(crate) struct Shared {
     pub diag: Diag,
     /// `PlayerConfig::frame_formats`.
     pub frame_formats: Vec<FrameFormat>,
+    /// Playback speed as `f64::to_bits` (1.0 = normal); read by the audio thread.
+    pub speed: AtomicU64,
     /// How the last video frame was made ready (`PlayerStats::conversion`).
     pub conversion: Mutex<&'static str>,
     /// The video's transfer function, from the frames decoded (`PlayerStats::hdr`).
@@ -535,6 +537,7 @@ impl Player {
             max_output_size: AtomicU64::new(pack_size(config.max_output_size)),
             diag: Diag::default(),
             frame_formats: config.frame_formats.clone(),
+            speed: AtomicU64::new(1.0f64.to_bits()),
             conversion: Mutex::new("none"),
             hdr: Mutex::new(Transfer::Sdr),
         });
@@ -648,6 +651,21 @@ impl Player {
             return;
         }
         s.request_pause();
+    }
+
+    /// Sets the playback speed, clamped to 0.25–4.0 (1.0 is normal). Audio keeps its pitch
+    /// (WSOLA time-stretching); video follows the audio clock, so they stay in sync, also
+    /// through the change. The change is heard once the audio already queued (up to ~200 ms)
+    /// has played.
+    pub fn set_speed(&self, speed: f64) {
+        let speed = if speed.is_finite() { speed.clamp(0.25, 4.0) } else { 1.0 };
+        self.shared.speed.store(speed.to_bits(), Ordering::SeqCst);
+        self.shared.clock.set_speed(speed);
+    }
+
+    /// The current playback speed multiplier.
+    pub fn speed(&self) -> f64 {
+        f64::from_bits(self.shared.speed.load(Ordering::SeqCst))
     }
 
     /// Frame-accurate seek. Takes effect immediately for `position()`; frames follow shortly.
